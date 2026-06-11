@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+
+# Goal Review Loop - local runtime files
+.agent/state.json
+.agent/run.lock
+.agent/iteration-log.md
+.agent/verification/
+.agent/evidence/
+.agent/history/
+.agent/debug/
