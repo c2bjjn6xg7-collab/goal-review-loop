@@ -7,8 +7,10 @@ allowed_changes:
   - "src/**"
   - "tests/**"
   - "package.json"
+  - "package-lock.json"
   - "tsconfig.json"
   - "vitest.config.ts"
+  - "eslint.config.js"
   - ".gitignore"
   - "review-loop.yaml"
   - "prompts/**"
@@ -87,7 +89,7 @@ verification_commands:
 
 - TypeScript strict mode
 - ESM 模块系统
-- Node.js 20+ 兼容
+- Node.js `^20.19.0 || ^22.13.0 || >=24.0.0` 兼容
 - 不引入重型框架（NestJS、Express 等）
 - 原子写入使用 write-then-rename 模式
 - 状态转换必须经过守卫函数，不允许直接赋值

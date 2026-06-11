@@ -673,6 +673,134 @@ goal_digest: "${VALID_DIGEST}"
 
       expect(() => parseIterationLog(content)).toThrow(/invalid iteration/);
     });
+
+    it('should reject invalid header timestamp (not ISO 8601)', () => {
+      const content = `## definitely-not-iso | Run run-1
+| Time | Iteration | Phase | Event | Result |
+|---|---:|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      expect(() => parseIterationLog(content)).toThrow(/invalid header timestamp/);
+    });
+
+    it('should reject impossible header timestamp (2026-99-99)', () => {
+      const content = `## 2026-99-99T99:99:99Z | Run run-1
+| Time | Iteration | Phase | Event | Result |
+|---|---:|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      expect(() => parseIterationLog(content)).toThrow(/invalid header timestamp/);
+    });
+
+    it('should reject header-only log (no data rows)', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1`;
+
+      expect(() => parseIterationLog(content)).toThrow(/no valid data rows/);
+    });
+
+    it('should reject header + empty table (no data rows)', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result |
+|---|---:|---|---|---|`;
+
+      expect(() => parseIterationLog(content)).toThrow(/no valid data rows/);
+    });
+
+    it('should preserve event containing Time and Phase keywords', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result |
+|---|---:|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |
+| 22:31:00Z | 0 | INITIALIZING | Time Phase checkpoint | PASS |`;
+
+      const entries = parseIterationLog(content);
+      expect(entries).toHaveLength(2);
+      expect(entries[0].event).toBe('preflight');
+      expect(entries[1].event).toBe('Time Phase checkpoint');
+    });
+
+    it('should return entries count equal to data rows', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result |
+|---|---:|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |
+| 22:31:00Z | 0 | PLANNING | planner | PASS |
+| 22:40:00Z | 1 | DEVELOPING | coding | PASS |
+| 22:50:00Z | 1 | VERIFYING | tests | FAIL |`;
+
+      const entries = parseIterationLog(content);
+      expect(entries).toHaveLength(4);
+    });
+
+    it('should not silently skip non-standard header', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Col1 | Col2 | Col3 | Col4 | Col5 |
+|---|---:|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      // Non-standard header should be treated as data row and fail validation
+      // because Col1 !== "Time" etc., so it won't be skipped as table header
+      expect(() => parseIterationLog(content)).toThrow();
+    });
+
+    it('should reject 4-column separator line', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event |
+|---|---:|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      // 4-column separator should not be recognized as valid separator
+      expect(() => parseIterationLog(content)).toThrow();
+    });
+
+    it('should reject 6-column separator line', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result | Extra |
+|---|---:|---|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      // 6-column separator should not be recognized as valid separator
+      expect(() => parseIterationLog(content)).toThrow();
+    });
+
+    it('should accept standard 5-column separator', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result |
+|---|---:|---|---|---|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      const entries = parseIterationLog(content);
+      expect(entries).toHaveLength(1);
+    });
+
+    it('should reject separator with single dash', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result |
+|-|-|-|-|-|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      // Single dash separator should not be recognized as valid
+      expect(() => parseIterationLog(content)).toThrow();
+    });
+
+    it('should reject separator with two dashes', () => {
+      const content = `## 2026-06-10T22:30:12Z | Run run-1
+
+| Time | Iteration | Phase | Event | Result |
+|--|--:|--|--|--|
+| 22:30:12Z | 0 | INITIALIZING | preflight | PASS |`;
+
+      // Two dash separator should not be recognized as valid
+      expect(() => parseIterationLog(content)).toThrow();
+    });
   });
 
   describe('validateIterationLogEntry', () => {
@@ -695,6 +823,43 @@ goal_digest: "${VALID_DIGEST}"
         iteration: 1,
         phase: 'VERIFYING',
         // missing event and result
+      };
+      expect(validateIterationLogEntry(entry)).toBe(false);
+    });
+
+    it('should reject entry with invalid timestamp (also-nope)', () => {
+      const entry = {
+        timestamp: 'also-nope',
+        run_id: 'test',
+        iteration: 1,
+        phase: 'VERIFYING',
+        event: 'unit-tests',
+        result: 'PASS',
+      };
+      expect(validateIterationLogEntry(entry)).toBe(false);
+    });
+
+    it('should reject entry with impossible timestamp (2026-99-99)', () => {
+      const entry = {
+        timestamp: '2026-99-99T99:99:99Z',
+        run_id: 'test',
+        iteration: 1,
+        phase: 'VERIFYING',
+        event: 'unit-tests',
+        result: 'PASS',
+      };
+      expect(validateIterationLogEntry(entry)).toBe(false);
+    });
+
+    it('should reject entry with extra fields', () => {
+      const entry = {
+        timestamp: '2026-06-10T22:30:12Z',
+        run_id: 'test',
+        iteration: 1,
+        phase: 'VERIFYING',
+        event: 'unit-tests',
+        result: 'PASS',
+        extraField: 'should not be allowed',
       };
       expect(validateIterationLogEntry(entry)).toBe(false);
     });

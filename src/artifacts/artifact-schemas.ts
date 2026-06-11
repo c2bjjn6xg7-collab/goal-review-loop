@@ -243,8 +243,30 @@ const VALID_RESULTS = ['PASS', 'FAIL', 'BLOCKED', 'TIMEOUT', 'CANCELLED'] as con
 /** Valid phase values for iteration log entries */
 const VALID_PHASES = ['INITIALIZING', 'PLANNING', 'DEVELOPING', 'VERIFYING', 'AUDITING', 'REWORKING', 'FINALIZING', 'PASSED', 'FAILED', 'BLOCKED', 'CANCELLED'] as const;
 
-/** Time format: HH:mm:ssZ */
-const TIME_PATTERN = /^\d{2}:\d{2}:\d{2}Z$/;
+/** All allowed field names in an iteration log entry */
+const ALLOWED_ENTRY_FIELDS = new Set(['timestamp', 'run_id', 'iteration', 'phase', 'event', 'result', 'detail']);
+
+/**
+ * Strict ISO 8601 timestamp validation.
+ * Accepts: 2026-06-10T22:30:12Z or 2026-06-10T22:30:12.000Z
+ * Rejects: definitely-not-iso, 2026-99-99T99:99:99Z, also-nope
+ */
+function isValidISOTimestamp(value: string): boolean {
+  // Basic format check: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS.mmmZ
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/.test(value)) {
+    return false;
+  }
+  // Parse and validate date is real (not 2026-99-99)
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+  // Verify round-trip: parsed date matches input (catches impossible dates like Feb 30)
+  // toISOString() always returns with .000Z, so compare normalized forms
+  const iso = date.toISOString();
+  const normalizedInput = value.endsWith('.000Z') ? value : `${value.slice(0, -1)}.000Z`;
+  return iso === normalizedInput;
+}
 
 /**
  * Parse result field, supporting "RESULT (detail)" format.
@@ -260,22 +282,57 @@ function parseResultField(raw: string): [string, string | undefined] {
 }
 
 /**
+ * Validate a single iteration log entry.
+ * Checks all required fields, valid values, and rejects extra fields.
+ * This is the single source of truth for entry validation.
+ */
+export function validateIterationLogEntry(entry: unknown): entry is IterationLogEntry {
+  if (!entry || typeof entry !== 'object') return false;
+  const e = entry as Record<string, unknown>;
+
+  // Reject extra fields (strict schema, no additionalProperties)
+  for (const key of Object.keys(e)) {
+    if (!ALLOWED_ENTRY_FIELDS.has(key)) return false;
+  }
+
+  // Required fields with strict type checks
+  if (typeof e.timestamp !== 'string' || !isValidISOTimestamp(e.timestamp)) return false;
+  if (typeof e.run_id !== 'string' || !e.run_id) return false;
+  if (typeof e.iteration !== 'number' || !Number.isInteger(e.iteration) || e.iteration < 0) return false;
+  if (typeof e.event !== 'string' || !e.event) return false;
+
+  // Validate phase enum
+  if (typeof e.phase !== 'string') return false;
+  if (!VALID_PHASES.includes(e.phase as typeof VALID_PHASES[number])) return false;
+
+  // Validate result enum
+  if (typeof e.result !== 'string') return false;
+  if (!VALID_RESULTS.includes(e.result as typeof VALID_RESULTS[number])) return false;
+
+  // Optional detail
+  if (e.detail !== undefined && typeof e.detail !== 'string') return false;
+
+  return true;
+}
+
+/**
  * Parse an iteration-log.md file and extract structured entries.
  * Design doc §8.6:
- * - Header: "## <ISO timestamp> | Run <run_id>"
+ * - Header: "## <ISO 8601 timestamp> | Run <run_id>"
  * - Table: Time | Iteration | Phase | Event | Result
- * - Time format: HH:mm:ssZ
+ * - Row time is HH:mm:ssZ; entry timestamp is combined ISO 8601
  * - Result supports "RESULT (detail)" format
  *
  * Rules:
- * - Empty content returns empty array
- * - Non-empty content MUST contain a valid run header
+ * - Empty/whitespace-only content returns empty array
+ * - Non-empty content MUST contain a valid run header with valid ISO timestamp
+ * - Non-empty content MUST contain at least one valid data row
  * - Table rows MUST have exactly 5 or 6 columns
- * - All fields are strictly validated
+ * - All fields are strictly validated via shared validators
  * - Malformed content throws, never returns silently empty
  */
 export function parseIterationLog(content: string, filePath?: string): IterationLogEntry[] {
-  // Empty content is allowed
+  // Empty/whitespace-only content is allowed
   if (!content.trim()) {
     return [];
   }
@@ -283,18 +340,27 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
   const lines = content.split('\n');
   const entries: IterationLogEntry[] = [];
   let runId = '';
+  let headerTimestamp = '';
   let hasHeader = false;
-  let hasDataRows = false;
   const errors: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineNum = i + 1;
 
-    // Extract run_id from header line: "## <timestamp> | Run <run_id>"
-    const headerMatch = line.match(/^##\s+\S+\s*\|\s*Run\s+(.+)$/);
+    // Extract run_id and timestamp from header line: "## <timestamp> | Run <run_id>"
+    const headerMatch = line.match(/^##\s+(\S+)\s*\|\s*Run\s+(.+)$/);
     if (headerMatch) {
-      runId = headerMatch[1].trim();
+      const ts = headerMatch[1].trim();
+      runId = headerMatch[2].trim();
+
+      // Validate header timestamp is strict ISO 8601
+      if (!isValidISOTimestamp(ts)) {
+        errors.push(`Line ${lineNum}: invalid header timestamp "${ts}", expected ISO 8601 (YYYY-MM-DDTHH:MM:SSZ)`);
+      } else {
+        headerTimestamp = ts;
+      }
+
       if (!runId) {
         errors.push(`Line ${lineNum}: empty run_id in header`);
       }
@@ -305,41 +371,54 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
     // Skip blank lines
     if (!line.trim()) continue;
 
-    // Skip separator lines (|---|---:|---|---|---|)
-    // A separator line starts with |, contains only |, -, :, and spaces, and has at least one ---
-    if (line.startsWith('|') && /^[|\s\-:]+$/.test(line) && line.includes('---')) continue;
-
-    // Skip table header row (contains "Time" and "Phase")
-    if (line.includes('Time') && line.includes('Phase')) continue;
-
     // Non-table lines in non-empty content are an error
     if (!line.startsWith('|')) {
       errors.push(`Line ${lineNum}: unexpected non-table content`);
       continue;
     }
 
-    // Table data row — must have exactly 5 or 6 columns
+    // Parse columns first, then classify
     const cells = line.split('|').map((c) => c.trim()).filter(Boolean);
+
+    // Skip separator lines (|---|---:|---|---|---|)
+    // Must be exactly 5 columns matching markdown separator pattern (at least 3 dashes)
+    if (cells.length === 5 && cells.every(c => /^:?-{3,}:?$/.test(c))) continue;
+
+    // Skip standard table header row: exactly "Time | Iteration | Phase | Event | Result"
+    // Use exact column match, NOT substring search (event could contain "Time" or "Phase")
+    if (cells.length === 5 &&
+        cells[0] === 'Time' &&
+        cells[1] === 'Iteration' &&
+        cells[2] === 'Phase' &&
+        cells[3] === 'Event' &&
+        cells[4] === 'Result') {
+      continue;
+    }
+
+    // Table data row — must have exactly 5 or 6 columns
     if (cells.length < 5 || cells.length > 6) {
       errors.push(`Line ${lineNum}: expected 5-6 columns, got ${cells.length}`);
       continue;
     }
 
-    hasDataRows = true;
-
-    const [timestamp, iterationStr, phase, event, rawResult, rawDetail] = cells;
-
-    // Validate timestamp format: HH:mm:ssZ
-    if (!TIME_PATTERN.test(timestamp)) {
-      errors.push(`Line ${lineNum}: invalid time format "${timestamp}", expected HH:mm:ssZ`);
+    // Skip if we don't have a valid header yet
+    if (!hasHeader || !headerTimestamp) {
+      errors.push(`Line ${lineNum}: data row before valid header`);
       continue;
     }
 
-    // Validate run_id is set
-    if (!runId) {
-      errors.push(`Line ${lineNum}: data row before header (no run_id)`);
+    const [timeStr, iterationStr, phase, event, rawResult, rawDetail] = cells;
+
+    // Validate row time format: HH:mm:ssZ
+    if (!/^\d{2}:\d{2}:\d{2}Z$/.test(timeStr)) {
+      errors.push(`Line ${lineNum}: invalid time format "${timeStr}", expected HH:mm:ssZ`);
       continue;
     }
+
+    // Combine header date with row time to form full ISO timestamp
+    // Header: "2026-06-10T22:30:12Z" → date part: "2026-06-10"
+    const datePart = headerTimestamp.slice(0, 10);
+    const fullTimestamp = `${datePart}T${timeStr}`;
 
     // Parse iteration number
     const iteration = Number(iterationStr);
@@ -365,7 +444,7 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
     const detail = rawDetail || parsedDetail;
 
     const entry: IterationLogEntry = {
-      timestamp,
+      timestamp: fullTimestamp,
       run_id: runId,
       iteration,
       phase: phase as IterationLogEntry['phase'],
@@ -373,6 +452,12 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
       result: mainResult as IterationLogEntry['result'],
       ...(detail ? { detail } : {}),
     };
+
+    // Final validation via shared validator
+    if (!validateIterationLogEntry(entry)) {
+      errors.push(`Line ${lineNum}: entry validation failed`);
+      continue;
+    }
 
     entries.push(entry);
   }
@@ -382,43 +467,15 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
     throw new Error(`Invalid iteration-log: missing run header (## <timestamp> | Run <id>)${filePath ? ` in ${filePath}` : ''}`);
   }
 
-  // Non-empty content with header but no valid data rows is an error
-  if (hasHeader && !hasDataRows && errors.length > 0) {
-    throw new Error(`Invalid iteration-log: header present but no valid data rows${filePath ? ` in ${filePath}` : ''}: ${errors.join('; ')}`);
+  // If we had parsing errors, throw
+  if (errors.length > 0) {
+    throw new Error(`Invalid iteration-log${filePath ? ` in ${filePath}` : ''}: ${errors.join('; ')}`);
   }
 
-  // If we had parsing errors but also valid entries, still throw (partial corruption)
-  if (errors.length > 0) {
-    throw new Error(`Invalid iteration-log entries${filePath ? ` in ${filePath}` : ''}: ${errors.join('; ')}`);
+  // Non-empty content with valid header but no data rows is an error
+  if (entries.length === 0) {
+    throw new Error(`Invalid iteration-log: header present but no valid data rows${filePath ? ` in ${filePath}` : ''}`);
   }
 
   return entries;
-}
-
-/**
- * Validate a single iteration log entry.
- * Checks all required fields and valid values.
- */
-export function validateIterationLogEntry(entry: unknown): entry is IterationLogEntry {
-  if (!entry || typeof entry !== 'object') return false;
-  const e = entry as Record<string, unknown>;
-
-  // Required fields
-  if (typeof e.timestamp !== 'string' || !e.timestamp) return false;
-  if (typeof e.run_id !== 'string' || !e.run_id) return false;
-  if (typeof e.iteration !== 'number' || !Number.isInteger(e.iteration) || e.iteration < 0) return false;
-  if (typeof e.event !== 'string' || !e.event) return false;
-
-  // Validate phase
-  if (typeof e.phase !== 'string') return false;
-  if (!VALID_PHASES.includes(e.phase as typeof VALID_PHASES[number])) return false;
-
-  // Validate result
-  if (typeof e.result !== 'string') return false;
-  if (!VALID_RESULTS.includes(e.result as typeof VALID_RESULTS[number])) return false;
-
-  // Optional detail
-  if (e.detail !== undefined && typeof e.detail !== 'string') return false;
-
-  return true;
 }
