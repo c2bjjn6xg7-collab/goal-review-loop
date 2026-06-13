@@ -21,6 +21,21 @@ import {
 } from '../types.js';
 import { validateTransition, isTerminal } from './state-machine.js';
 
+/**
+ * Map a Phase to its corresponding stage key in state.stages.
+ * Returns undefined for phases that don't have a stage entry.
+ */
+function phaseToStageKey(phase: Phase): string | undefined {
+  switch (phase) {
+    case PhaseEnum.PLANNING: return 'planning';
+    case PhaseEnum.DEVELOPING: return 'developing';
+    case PhaseEnum.VERIFYING: return 'verifying';
+    case PhaseEnum.AUDITING: return 'auditing';
+    case PhaseEnum.FINALIZING: return 'finalizing';
+    default: return undefined;
+  }
+}
+
 // JSON Schema for state.json
 const STATE_SCHEMA = {
   type: 'object',
@@ -135,15 +150,49 @@ export class StateStore {
   /**
    * Transition to a new phase with validation.
    * This is the ONLY way to change the phase field.
+   * F-310 fix: also updates the corresponding stage status.
    */
   async transition(newPhase: Phase): Promise<RunState> {
     const current = await this.read();
     validateTransition(current.phase, newPhase);
 
+    const now = new Date().toISOString();
+
+    // F-310: Update stage status for the new phase
+    const stageKey = phaseToStageKey(newPhase);
+    const updatedStages = { ...current.stages };
+    if (stageKey && updatedStages[stageKey]) {
+      const prev = updatedStages[stageKey];
+      updatedStages[stageKey] = {
+        ...prev,
+        status: isTerminal(newPhase) ? StageStatus.COMPLETED : StageStatus.RUNNING,
+        attempts: prev.attempts + 1,
+        at: now,
+      };
+    }
+
+    // F-310R1 fix: Mark the previous phase's stage based on the transition target.
+    // Normal forward progress → COMPLETED; abnormal/blocked → FAILED.
+    const prevStageKey = phaseToStageKey(current.phase);
+    if (prevStageKey && prevStageKey !== stageKey && updatedStages[prevStageKey]) {
+      const prev = updatedStages[prevStageKey];
+      if (prev.status === StageStatus.RUNNING) {
+        const abnormalTargets: ReadonlySet<Phase> = new Set([
+          PhaseEnum.BLOCKED, PhaseEnum.REWORKING, PhaseEnum.FAILED, PhaseEnum.CANCELLED,
+        ]);
+        updatedStages[prevStageKey] = {
+          ...prev,
+          status: abnormalTargets.has(newPhase) ? StageStatus.FAILED : StageStatus.COMPLETED,
+          at: now,
+        };
+      }
+    }
+
     const newState: RunState = {
       ...current,
       phase: newPhase,
-      updated_at: new Date().toISOString(),
+      updated_at: now,
+      stages: updatedStages,
     };
 
     await this.writeInternal(newState);

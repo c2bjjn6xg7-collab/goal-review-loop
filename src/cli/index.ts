@@ -4,6 +4,7 @@
  */
 import { Command } from 'commander';
 import { initCommand } from './init.js';
+import { createStartCommand } from './start.js';
 
 export function createCLI(): Command {
   const program = new Command();
@@ -14,22 +15,9 @@ export function createCLI(): Command {
     .version('0.1.0');
 
   program.addCommand(initCommand());
+  program.addCommand(createStartCommand());
 
   // Placeholder commands — will be implemented in later phases
-  program
-    .command('start')
-    .description('Start a new Goal Review Loop run')
-    .option('--request <file|string>', 'User requirement source')
-    .option('--task-slug <slug>', 'Optional task short name')
-    .option('--max-iterations <n>', 'Maximum rework iterations', '3')
-    .option('--no-commit', 'Do not auto-commit on pass')
-    .option('--tag', 'Create a tag on pass')
-    .option('--config <path>', 'Configuration file path')
-    .action(() => {
-      console.error('start: Not yet implemented (Phase 3)');
-      process.exit(1);
-    });
-
   program
     .command('resume')
     .description('Resume an interrupted run')

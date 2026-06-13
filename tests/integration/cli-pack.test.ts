@@ -12,15 +12,13 @@ import os from 'os';
 describe('CLI Integration: pack, install, and run', () => {
   const projectRoot = path.resolve(import.meta.dirname, '../..');
   let tmpDir: string;
-  let tarballPath: string;
-
   // Build and pack before tests
   const packResult = execFileSync('npm', ['pack', '--pack-destination=/tmp'], {
     cwd: projectRoot,
     encoding: 'utf8',
     timeout: 60000,
   });
-  tarballPath = path.join('/tmp', packResult.trim().split('\n').pop()!);
+  const tarballPath = path.join('/tmp', packResult.trim().split('\n').pop()!);
 
   afterAll(async () => {
     // Cleanup

@@ -94,6 +94,7 @@ export interface RunState {
 
 /**
  * Agent result — Design doc §9.1
+ * Phase 2 legacy interface; retained for backward compatibility.
  */
 export const AgentResultStatus = {
   SUCCESS: 'success',
@@ -111,6 +112,38 @@ export interface AgentResult {
   stderr_path: string;
   artifact_path: string | null;
   error: string | null;
+}
+
+/**
+ * Phase 3: Agent Run Input — §8.1
+ * Unified input for all three role adapters.
+ */
+export interface AgentRunInput {
+  role: 'planner' | 'developer' | 'auditor';
+  project_root: string;
+  run_id: string;
+  iteration: number;
+  prompt: string;
+  prompt_file?: string;
+  expected_artifacts: string[];
+  timeout_seconds: number;
+  command_template: string[];
+  signal?: AbortSignal;
+}
+
+/**
+ * Phase 3: Agent Run Result — §8.2
+ * Unified output from all three role adapters.
+ */
+export interface AgentRunResult {
+  status: 'success' | 'failed' | 'timeout' | 'cancelled';
+  exit_code: number | null;
+  stdout_path: string;
+  stderr_path: string;
+  artifact_paths: string[];
+  prompt_digest: string;
+  duration_ms: number;
+  error: ReviewLoopError | null;
 }
 
 /**
@@ -197,9 +230,10 @@ export const HandoffStatus = {
 export type HandoffStatus = (typeof HandoffStatus)[keyof typeof HandoffStatus];
 
 /**
- * Verification command definition — Design doc §8.2
+ * GOAL verification command — external protocol format.
+ * Phase 3 §6.1: GOAL.md uses `command` field; normalized to `argv` internally.
  */
-export interface VerificationCommand {
+export interface GoalVerificationCommand {
   id: string;
   command: string[];
   cwd: string;
@@ -208,7 +242,20 @@ export interface VerificationCommand {
 }
 
 /**
+ * Internal verification command — used by Verification Runner.
+ * Phase 3 §6.1: normalized from GoalVerificationCommand via normalizeGoalCommands().
+ */
+export interface VerificationCommand {
+  id: string;
+  argv: string[];
+  cwd: string;
+  required: boolean;
+  timeout_seconds: number;
+}
+
+/**
  * GOAL front matter — Design doc §8.2
+ * Phase 3: verification_commands uses GoalVerificationCommand (with `command` field).
  */
 export interface GoalFrontMatter {
   schema_version: number;
@@ -217,7 +264,7 @@ export interface GoalFrontMatter {
   title: string;
   allowed_changes: string[];
   disallowed_changes: string[];
-  verification_commands: VerificationCommand[];
+  verification_commands: GoalVerificationCommand[];
 }
 
 /**
@@ -369,4 +416,227 @@ export interface VerificationResult {
   duration_ms: number;
   stdout_path: string;
   stderr_path: string;
+  log_io_error?: string;
+}
+
+/**
+ * Phase 2: Process Runner types — Design doc §7.1
+ */
+
+export const ProcessStatus = {
+  SUCCESS: 'success',
+  FAILED: 'failed',
+  TIMEOUT: 'timeout',
+  CANCELLED: 'cancelled',
+} as const;
+
+export type ProcessStatus = (typeof ProcessStatus)[keyof typeof ProcessStatus];
+
+export interface ProcessRunnerInput {
+  argv: string[];
+  cwd: string;
+  timeout_ms: number;
+  stdout_path: string;
+  stderr_path: string;
+  env?: Record<string, string>;
+  signal?: AbortSignal;
+  kill_grace_seconds?: number;
+  max_log_bytes?: number;
+}
+
+export interface ProcessRunnerResult {
+  status: ProcessStatus;
+  exit_code: number | null;
+  signal: string | null;
+  timed_out: boolean;
+  cancelled: boolean;
+  duration_ms: number;
+  stdout_path: string;
+  stderr_path: string;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+  kill_result?: {
+    success: boolean;
+    method: string;
+    timedOut?: boolean;
+  };
+  log_io_error?: string;
+}
+
+/**
+ * Phase 2: Git Manager types — Design doc §7.2, §7.3
+ */
+
+export const PreflightStatus = {
+  OK: 'ok',
+  ERROR: 'error',
+} as const;
+
+export type PreflightStatus = (typeof PreflightStatus)[keyof typeof PreflightStatus];
+
+export interface PreflightResult {
+  status: PreflightStatus;
+  git_root: string | null;
+  head_sha: string | null;
+  branch: string | null;
+  is_clean: boolean | null;
+  tracked_agent_files: string[];
+  error?: PreflightError;
+}
+
+export interface PreflightError {
+  code: 'PREFLIGHT_ERROR';
+  message: string;
+  check: string;
+}
+
+export interface TaskBranchResult {
+  status: 'created' | 'error';
+  branch_name: string;
+  base_commit: string;
+  original_branch: string;
+  error?: {
+    code: 'STATE_CONFLICT' | 'PREFLIGHT_ERROR';
+    message: string;
+  };
+}
+
+/**
+ * Phase 2: Diff Collector types — Design doc §7.4
+ */
+
+export type FileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked';
+
+export interface ChangedFile {
+  path: string;
+  status: FileStatus;
+  old_path?: string;
+  tracked: boolean;
+  additions: number | null;
+  deletions: number | null;
+}
+
+export interface ChangedFilesSchema {
+  schema_version: 1;
+  base_commit: string;
+  files: ChangedFile[];
+}
+
+export interface UntrackedFileEvidence {
+  path: string;
+  size_bytes: number;
+  sha256: string;
+  is_text: boolean;
+  has_content: boolean;
+  content: string | null;
+  omitted_reason?: 'binary' | 'too_large' | 'symlink_escape';
+}
+
+export interface UntrackedFilesSchema {
+  schema_version: 1;
+  files: UntrackedFileEvidence[];
+}
+
+export interface DiffMetadata {
+  schema_version: 1;
+  base_commit: string;
+  generated_at: string;
+  tracked_diff_summary: {
+    files_changed: number;
+    insertions: number;
+    deletions: number;
+  };
+  changed_files_summary: {
+    total: number;
+    added: number;
+    modified: number;
+    deleted: number;
+    renamed: number;
+    untracked: number;
+  };
+  untracked_files_summary: {
+    total: number;
+    text_files: number;
+    binary_files: number;
+  };
+  diff_digest: string;
+}
+
+/**
+ * Phase 2: Scope Guard types — Design doc §7.5
+ */
+
+export const ScopeDenialReason = {
+  SYSTEM_PROTECTED: 'system_protected',
+  DISALLOWED_CHANGE: 'disallowed_change',
+  OUTSIDE_ALLOWED_CHANGES: 'outside_allowed_changes',
+  UNAUTHORIZED_TEST_DELETION: 'unauthorized_test_deletion',
+} as const;
+
+export type ScopeDenialReason = (typeof ScopeDenialReason)[keyof typeof ScopeDenialReason];
+
+export interface ScopeWarning {
+  code: string;
+  message: string;
+  path?: string;
+}
+
+export interface ScopeReportV2 {
+  schema_version: 2;
+  passed: boolean;
+  allowed: string[];
+  excluded_orchestrator_owned: string[];
+  excluded_dependency_cache: string[];
+  denied: Array<{
+    path: string;
+    reason: ScopeDenialReason;
+  }>;
+  warnings: ScopeWarning[];
+}
+
+/**
+ * F-307R2: Orchestrator File Registry — explicit ownership tracking.
+ * The orchestrator registers every file it writes (path + digest).
+ * Pattern-based inference of orchestrator ownership is replaced by this
+ * explicit registry to prevent Developer from forging evidence files.
+ */
+export interface OrchestratorFileRegistryEntry {
+  /** Absolute path of the file. */
+  path: string;
+  /** SHA-256 digest of the file content at registration time. */
+  digest: string;
+  /** ISO timestamp when the file was registered. */
+  registered_at: string;
+}
+
+/**
+ * Result of verifying the orchestrator file registry after Developer call.
+ */
+export interface OrchestratorRegistryVerificationResult {
+  /** Whether all registered files are intact. */
+  valid: boolean;
+  /** Violations found during verification. */
+  violations: OrchestratorRegistryViolation[];
+}
+
+export interface OrchestratorRegistryViolation {
+  /** Path of the violated file. */
+  path: string;
+  /** Type of violation. */
+  violation: 'digest_mismatch' | 'deleted' | 'mode_changed' | 'symlink_created' | 'unregistered_new';
+  /** Human-readable description. */
+  message: string;
+}
+
+/**
+ * Phase 2: Mechanical Finding — Design doc §7.6.3
+ */
+export interface MechanicalFinding {
+  id: string;
+  command_id: string;
+  status: ProcessStatus;
+  exit_code: number | null;
+  stdout_path: string;
+  stderr_path: string;
+  log_io_error?: string;
 }

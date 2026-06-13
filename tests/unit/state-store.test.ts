@@ -3,7 +3,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import os from 'os';
 import { StateStore, StateStoreError } from '../../src/orchestrator/state-store.js';
-import { Phase, type RunState } from '../../src/types.js';
+import { Phase } from '../../src/types.js';
 
 describe('State Store', () => {
   let tmpDir: string;
@@ -166,7 +166,7 @@ describe('State Store', () => {
         max_iterations: 3,
       });
 
-      const updated = await store.update((state) => ({
+      const updated = await store.update((_state) => ({
         goal_digest: 'sha256:abc123',
         last_error: null,
       }));

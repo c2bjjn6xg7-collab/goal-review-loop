@@ -17,6 +17,8 @@ import {
 import type {
   PlanFrontMatter,
   GoalFrontMatter,
+  GoalVerificationCommand,
+  VerificationCommand,
   HandoffFrontMatter,
   AuditReportFrontMatter,
   FinalAuditFrontMatter,
@@ -478,4 +480,103 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
   }
 
   return entries;
+}
+
+// ─── GOAL Command Normalization ──────────────────────────────
+// Phase 3 §6.1: Convert external GoalVerificationCommand (with `command`)
+// to internal VerificationCommand (with `argv`).
+
+/** Destructive argv patterns that must be rejected. */
+const DESTRUCTIVE_ARGV_PATTERNS: ReadonlyArray<readonly string[]> = [
+  ['git', 'push'],
+  ['git', 'reset', '--hard'],
+  ['git', 'clean'],
+  ['rm', '-rf', '/'],
+  ['sudo'],
+  ['shutdown'],
+  ['reboot'],
+];
+
+/**
+ * Check if an argv array matches a destructive pattern.
+ * Compares element-by-element from the start.
+ */
+function isDestructiveArgv(argv: string[]): boolean {
+  for (const pattern of DESTRUCTIVE_ARGV_PATTERNS) {
+    if (argv.length < pattern.length) continue;
+    let match = true;
+    for (let i = 0; i < pattern.length; i++) {
+      if (argv[i] !== pattern[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+/**
+ * Normalize GOAL verification commands from external protocol to internal format.
+ * Phase 3 §6.1:
+ * - External GOAL uses `command` field (string array)
+ * - Internal VerificationCommand uses `argv` field (string array)
+ * - This function performs the 1:1 mapping with validation
+ *
+ * Validates:
+ * - Each command has a non-empty id
+ * - Each command has at least one element in `command` array
+ * - command[0] (program name) is non-empty
+ * - No duplicate IDs
+ * - No destructive argv patterns
+ * - cwd does not contain `..` or absolute paths
+ */
+export function normalizeGoalCommands(
+  goalCommands: GoalVerificationCommand[],
+): VerificationCommand[] {
+  const seenIds = new Set<string>();
+  const result: VerificationCommand[] = [];
+
+  for (const cmd of goalCommands) {
+    // Validate ID
+    if (!cmd.id || typeof cmd.id !== 'string') {
+      throw new Error(`GOAL verification command has invalid or missing id`);
+    }
+    if (seenIds.has(cmd.id)) {
+      throw new Error(`GOAL verification command has duplicate id: "${cmd.id}"`);
+    }
+    seenIds.add(cmd.id);
+
+    // Validate command array
+    if (!Array.isArray(cmd.command) || cmd.command.length === 0) {
+      throw new Error(`GOAL verification command "${cmd.id}" has empty or missing command array`);
+    }
+    if (!cmd.command[0] || typeof cmd.command[0] !== 'string') {
+      throw new Error(`GOAL verification command "${cmd.id}" has empty program name (command[0])`);
+    }
+
+    // Check for destructive patterns
+    if (isDestructiveArgv(cmd.command)) {
+      throw new Error(`GOAL verification command "${cmd.id}" contains destructive command: ${cmd.command.join(' ')}`);
+    }
+
+    // Validate cwd — must not contain .. or be absolute
+    if (cmd.cwd.includes('..')) {
+      throw new Error(`GOAL verification command "${cmd.id}" has cwd containing "..": "${cmd.cwd}"`);
+    }
+    if (cmd.cwd.startsWith('/')) {
+      throw new Error(`GOAL verification command "${cmd.id}" has absolute cwd: "${cmd.cwd}"`);
+    }
+
+    // Normalize: command → argv (1:1 mapping, no shell interpretation)
+    result.push({
+      id: cmd.id,
+      argv: [...cmd.command], // defensive copy
+      cwd: cmd.cwd,
+      required: cmd.required,
+      timeout_seconds: cmd.timeout_seconds,
+    });
+  }
+
+  return result;
 }

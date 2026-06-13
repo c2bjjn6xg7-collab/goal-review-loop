@@ -7,6 +7,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import { ArtifactStore } from '../artifacts/artifact-store.js';
 import { generateSampleConfig } from '../artifacts/config.js';
+import { getBundledTemplatesDir } from '../agents/prompt-builder.js';
 
 export function initCommand(): Command {
   const cmd = new Command('init');
@@ -76,7 +77,21 @@ export async function executeInit(
   await store.updateGitignore();
   console.log('  Updated .gitignore with local runtime file rules.');
 
-  // 5. Check that local-only files are not already tracked by Git
+  // 5. Copy prompt templates to project (if prompts/ doesn't exist)
+  const promptsDir = path.join(projectRoot, 'prompts');
+  if (!(await fs.pathExists(promptsDir))) {
+    const bundledDir = getBundledTemplatesDir();
+    if (await fs.pathExists(bundledDir)) {
+      await fs.copy(bundledDir, promptsDir);
+      console.log('  Created prompts/ directory with default templates.');
+    } else {
+      console.log('  ⚠ No bundled prompt templates found — you may need to create prompts/ manually.');
+    }
+  } else {
+    console.log('  prompts/ directory already exists — skipping template copy.');
+  }
+
+  // 6. Check that local-only files are not already tracked by Git
   if (isGitRepo) {
     await checkLocalFilesNotTracked(projectRoot);
   }

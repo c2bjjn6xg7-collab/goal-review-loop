@@ -54,7 +54,7 @@ describe('Configuration', () => {
 
     it('should throw when max_iterations is out of range', async () => {
       const configPath = path.join(tmpDir, 'review-loop.yaml');
-      const config = { ...DEFAULT_CONFIG, loop: { max_iterations: 100 } };
+      const _config = { ...DEFAULT_CONFIG, loop: { max_iterations: 100 } };
       await fs.writeFile(configPath, generateSampleConfig(), 'utf8');
 
       // We test with a manually crafted invalid config
@@ -184,6 +184,82 @@ runtime:
       expect(DEFAULT_CONFIG.git.require_clean_worktree).toBe(true);
       expect(DEFAULT_CONFIG.git.commit_on_pass).toBe(true);
       expect(DEFAULT_CONFIG.git.create_tag).toBe(false);
+    });
+
+    // SF-2: Default Developer command must use stdin prompt file transmission
+    it('developer command should use {prompt_file} not {prompt} as positional arg', () => {
+      const devCmd = DEFAULT_CONFIG.agents.developer.command;
+      // Must use {prompt_file} (stdin-based), not {prompt} (positional argv)
+      expect(devCmd).toContain('{prompt_file}');
+      expect(devCmd).not.toContain('{prompt}');
+      // Must use sh -lc wrapper for stdin redirection
+      expect(devCmd[0]).toBe('sh');
+      expect(devCmd[1]).toBe('-lc');
+      // The shell command must pipe prompt file via stdin
+      expect(devCmd[2]).toContain('claude');
+      expect(devCmd[2]).toContain('--permission-mode');
+      expect(devCmd[2]).toContain('<');
+    });
+
+    it('planner and auditor commands should use {prompt_file}', () => {
+      expect(DEFAULT_CONFIG.agents.planner.command).toContain('{prompt_file}');
+      expect(DEFAULT_CONFIG.agents.auditor.command).toContain('{prompt_file}');
+    });
+  });
+
+  // SF-2: generateSampleConfig round-trip with new developer command
+  describe('SF-2: default config stdin prompt transmission', () => {
+    it('generateSampleConfig produces YAML that loadConfig can parse', async () => {
+      const yaml = generateSampleConfig();
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      await fs.writeFile(configPath, yaml, 'utf8');
+
+      const config = await loadConfig(configPath);
+      // Developer command must use stdin prompt file
+      expect(config.agents.developer.command).toContain('{prompt_file}');
+      expect(config.agents.developer.command).not.toContain('{prompt}');
+      // Must be a valid sh -lc command
+      expect(config.agents.developer.command[0]).toBe('sh');
+      expect(config.agents.developer.command[1]).toBe('-lc');
+    });
+
+    it('custom model command can still be loaded', async () => {
+      const customYaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["sh", "-lc", "exec my-custom-llm --input < \\"$1\\"", "custom-dev", "{prompt_file}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/{run_id}-{task_slug}"
+  commit_on_pass: true
+  commit_template: "feat(agent): complete {task_slug} [{run_id}]"
+  create_tag: false
+  tag_template: "agent-{run_id}-pass"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+`;
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      await fs.writeFile(configPath, customYaml, 'utf8');
+
+      const config = await loadConfig(configPath);
+      expect(config.agents.developer.command[0]).toBe('sh');
+      expect(config.agents.developer.command).toContain('{prompt_file}');
+      expect(config.agents.developer.command[2]).toContain('my-custom-llm');
     });
   });
 });

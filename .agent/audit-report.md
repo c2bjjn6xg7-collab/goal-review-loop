@@ -1,74 +1,99 @@
 ---
 schema_version: 1
-run_id: "20260610-goal-001"
-iteration: 8
+run_id: "phase3-dev"
+iteration: 5
 author_role: "auditor"
 decision: "PASS"
 audited_goal_digest: "sha256:49c06dc76885b0aa713cc33850ac7e1f8c0d9428c5ea407b11506890ba70121a"
-audited_diff_digest: "sha256:d6ed19ae2f4f2e6c69c7dd70ad493ba38000d853fb3a4cfb569bb4798d5f09e4"
+audited_diff_digest: "sha256:ecba8ae874ed36af65d2e5e18707ed55919ef3d8a00d2b059c8dee247dcac925"
 ---
 
-# Phase 1 Final Audit Report
+# Phase 3 Audit Report - Iteration 5 (F-315R1 Reverification)
 
 ## Decision
 
-**PASS**
+**PASS — Phase 3 正式完成。**
 
-Iteration 8 已关闭全部 Finding。Phase 1 的协议、状态、锁、Artifact、配置和 CLI 基础能力符合 GOAL，Developer handoff 与实际实现和验证结果一致。
+本轮复验确认 F-315R1 已正确收紧：dependency cache 排除仅作用于
+`untracked && tracked === false` 的文件；`.pnp.cjs`、`.yarn/plugins/**`
+等已跟踪文件仍受 `allowed_changes` 范围保护。绕过探针确认：缓存被排除，
+已跟踪配置被拒绝。
+
+Run 5 (`20260613160600-0s08po`) 原始证据确认全链路达到 `FINALIZING`，
+Auditor 为 `PASS`。SC-15 macOS Trial 现为 PASS。
 
 ## Verification Results
 
 | Check | Result |
 |---|---|
-| Node 22.13 `npm install --engine-strict` | PASS |
-| Node 22.13 完整测试 | PASS，190 tests |
-| `npm audit --omit=dev` | PASS，0 vulnerabilities |
 | `npm run typecheck` | PASS |
-| `npm test` | PASS，9 files / 190 tests |
 | `npm run lint` | PASS，0 warnings |
 | `npm run build` | PASS |
-| `npm pack --dry-run` | PASS，53 files |
-| package 与 lockfile engines | PASS，完全一致 |
-| Developer handoff Schema | PASS，iteration 8 / COMPLETED |
-| GOAL Schema | PASS |
+| `npm audit --omit=dev` | PASS，0 vulnerabilities |
 | `git diff --check` | PASS |
-
-## Protocol Probes
-
-iteration-log 已验证：
-
-* 标准五列表头和分隔行可解析。
-* `---`、`---:`、`:---`、`:---:` 均可使用。
-* 单短横线、双短横线、四列和六列分隔行均被拒绝。
-* `Time Phase checkpoint` 等包含表头关键词的事件不会丢失。
-* 非法 header、时间、phase、result、iteration 和额外字段均被拒绝。
-* 设计文档中的 `FAIL (exit 1)` 可解析为 `FAIL` 与 detail。
-
-## Success Criteria
-
-| Criterion | Result |
-|---|---|
-| SC-1：安装成功且无安全漏洞 | PASS |
-| SC-2：TypeScript 零错误 | PASS |
-| SC-3：要求领域测试覆盖并通过 | PASS |
-| SC-4：打包后的 `review-loop init` 可执行 | PASS |
-| SC-5：Artifact 具备严格运行时协议 | PASS |
-
-## Scope Review
-
-产品实现变更位于修订后的 GOAL `allowed_changes` 范围内。GOAL 与审计文件由 Planner/Auditor 按角色维护；旧的额外 iteration 报告已删除，不再作为交付物。
+| scope-guard tests | PASS，30 tests |
+| `npm test` | PASS，28 files / 526 tests |
+| `npm pack --dry-run` | PASS，120 files，113.6 kB |
+| Handoff front matter parse | PASS，iteration 5 / COMPLETED |
 
 ## Closed Findings
 
-F-001 至 F-013 及其返工项均已关闭，包括：
+### F-315R1 - High - CLOSED
 
-* 干净安装和依赖版本一致性。
-* Artifact Schema、Final Audit 枚举和 iteration-log grammar。
-* 状态转换守卫和原子状态写入。
-* Lock 原子获取、所有权校验和损坏锁保护。
-* CLI 打包安装回归测试。
-* Scope 授权和 Node engines 对齐。
+`src/scope/scope-guard.ts` dependency cache 排除条件收紧为
+`file.status === 'untracked' && file.tracked === false && matchesPattern(...)`。
+模式列表移除 `.yarn/**`、`.pnp.cjs`、`.pnp.loader.mjs`，仅保留
+`.yarn/cache/**`、`.yarn/unplugged/**`、`.yarn/install-state.gz`。
+已跟踪的依赖文件修改必须通过 `allowed_changes` 校验，不再被错误排除。
 
-## Residual Risk
+回归测试覆盖 9 个场景：untracked 缓存排除、tracked 缓存拒绝、
+`.pnp.cjs` 拒绝、`.yarn/plugins/**` 拒绝、混合分类等。
 
-当前桌面会话使用 Node 23.11.0，该版本明确不在项目支持范围。项目已在受支持的 Node 22.13.0 环境完成 engine-strict 安装和全部测试，因此不影响本次 PASS。
+### Prior Closed Findings (Iterations 3-4)
+
+- F-314R1 (Critical) — CLOSED: 三层路径包含校验
+- F-307R2 (Critical) — CLOSED: 显式 OrchestratorFileRegistry
+- F-306R2 (High) — CLOSED: Prompt cleanup failure → BLOCKED
+- F-311R2 (High) — CLOSED: 端到端负向路径集成测试
+- F-313R2 (Medium) — CLOSED: eslint config 还原
+- SF-2 (Critical) — CLOSED: stdin prompt transmission
+- SF-3 (Critical) — CLOSED: Developer termination protocol
+- SF-4 (High) — CLOSED: replaceAllTokens
+
+## Success Criteria Review
+
+| Criterion | Result |
+|---|---|
+| SC-1 Unified Agent Adapter | PASS |
+| SC-2 Prompt Safety | PASS |
+| SC-3 Planner | PASS |
+| SC-4 Protocol Normalization | PASS |
+| SC-5 Developer | PASS |
+| SC-6 Role Ownership | PASS |
+| SC-7 Mechanical Verification | PASS |
+| SC-8 Auditor | PASS |
+| SC-9 Mechanical Override | PASS |
+| SC-10 First-round PASS | PASS |
+| SC-11 First-round FAIL / negative paths | PASS |
+| SC-12 BLOCKED | PASS |
+| SC-13 State & Lock | PASS |
+| SC-14 Engineering Quality | PASS |
+| SC-15 macOS Trial | **PASS** — Run 5 全链路 FINALIZING |
+
+## F-312R1 Smoke Test — Run 5
+
+| Item | Value |
+|---|---|
+| Run ID | `20260613160600-0s08po` |
+| All roles | Claude Sonnet |
+| Phase | FINALIZING |
+| Audit decision | PASS |
+
+| Role | Result |
+|---|---|
+| Planner | ✅ Valid plan.md + GOAL.md |
+| Developer | ✅ Correct code, `npm test` once, handoff COMPLETED |
+| Scope guard | ✅ `passed: true`, no false positives |
+| Auditor | ✅ PASS — all 5 success criteria met |
+
+**Phase 3 正式完成，可以进入小规模真实试用。**

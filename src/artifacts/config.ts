@@ -101,7 +101,7 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
       timeout_seconds: 1800,
     },
     developer: {
-      command: ['claude', '-p', '{prompt}'],
+      command: ['sh', '-lc', 'exec claude -p --permission-mode acceptEdits < "$1"', 'claude-developer', '{prompt_file}'],
       timeout_seconds: 3600,
     },
     auditor: {
@@ -168,10 +168,25 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
 /**
  * Load configuration with fallback to defaults.
  * If the config file doesn't exist, returns defaults.
+ * F-309 fix: accepts optional explicit config path from --config CLI flag.
  */
 export async function loadConfigWithDefaults(
   projectRoot: string,
+  explicitConfigPath?: string,
 ): Promise<ReviewLoopConfig> {
+  // If an explicit config path was provided via --config, use it
+  if (explicitConfigPath) {
+    const resolvedPath = path.resolve(explicitConfigPath);
+    // Security: ensure the config path doesn't escape reasonable bounds
+    if (!resolvedPath.endsWith('.yaml') && !resolvedPath.endsWith('.yml')) {
+      throw new ConfigError(`Config file must be a YAML file: ${resolvedPath}`);
+    }
+    if (!(await fs.pathExists(resolvedPath))) {
+      throw new ConfigError(`Config file not found: ${resolvedPath}`);
+    }
+    return loadConfig(resolvedPath);
+  }
+
   const configPath = path.join(projectRoot, 'review-loop.yaml');
 
   if (!(await fs.pathExists(configPath))) {
