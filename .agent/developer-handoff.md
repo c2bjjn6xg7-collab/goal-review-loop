@@ -1,95 +1,79 @@
 ---
 schema_version: 1
 run_id: phase4-dev
-iteration: 6
+iteration: 7
 author_role: developer
 status: COMPLETED
 ---
 
-# Phase 4 Developer Handoff - Iteration 6
+# Phase 4 Developer Handoff - Iteration 7 (F-402R1/R2, F-403R1, F-404R1, F-406R1)
 
 ## Summary
 
-Phase 4 adds the auto-rework loop, resume/cancel/status CLI commands, and
-comprehensive integration test coverage. Six review findings (F-401 through
-F-406) were addressed in this iteration.
+Iteration 7 addresses 5 review findings from the Phase 4 re-verification.
+The key fixes are: cancelled agents now transition to CANCELLED (not BLOCKED),
+verification receives the abort signal, CLI resume throws on consistency failure
+(non-zero exit), and archive idempotency covers evidence/ and verification/
+directories.
 
-The system now automatically reworks failures without user intervention,
-preserving per-iteration evidence. Resume re-enters the orchestrator loop
-at the correct phase. Cancel uses SIGTERM + AbortController for graceful
-shutdown. Archive idempotency is enforced before overwriting history.
+## Fixes Applied (Iteration 7)
 
-## Fixes Applied (Iteration 6)
+### F-402R1 (Critical) — Cancelled agent result transitions to BLOCKED instead of CANCELLED
 
-### F-401 (Critical) — Resume is a no-op
+**Root cause**: `runOrchestrator()` treated all non-`success` agent results as
+failures, transitioning to BLOCKED. When an agent is cancelled (status
+`'cancelled'`, error code `'USER_CANCELLED'`), the correct transition is
+CANCELLED.
 
-**Root cause**: `executeResume()` only printed messages and returned; it never
-called `runOrchestrator()`.
+**Fix**: Added `status === 'cancelled'` checks before the `status !== 'success'`
+checks for Planner, Developer, and Auditor results. Each cancelled result now
+transitions to CANCELLED with exit code 4 and message "Run cancelled by user
+request".
 
-**Fix**: `executeResume()` now builds a `ResumeContext` from the saved state
-and calls `runOrchestrator({ resume_from: context })`. The orchestrator's
-resume path re-acquires the lock, validates consistency, and re-enters the
-iteration loop at the correct phase via `runIterationLoop()`.
+### F-402R2 (High) — Verification stage not wired to cancel signal
 
-### F-402 (Critical) — Cancel can't guarantee CANCELLED state
+**Root cause**: `runVerification()` was called without `signal: combinedSignal`,
+so verification commands could not be cancelled mid-run.
 
-**Root cause**: No SIGTERM handler and no AbortController wiring.
+**Fix**: Added `signal: combinedSignal` to the `runVerification()` call. Also
+added a post-verification `combinedSignal.aborted` check that transitions to
+CANCELLED if verification was interrupted.
 
-**Fix**: Added `AbortController` at the top of `runOrchestrator()`. A SIGTERM
-handler writes `.agent/cancel-request.json` (best-effort) and calls
-`abortController.abort()`. The parent signal is chained into the combined
-signal. All agent calls use `combinedSignal`. The handler is removed in the
-finally block.
+### F-404R1 (High) — No real integration tests for mid-run cancel
 
-### F-403 (High) — Resume consistency checks missing git validation
+**Root cause**: Existing cancel test pre-wrote `cancel-request.json` before
+the orchestrator started, which only tests the pre-iteration cancel check.
+No test covered the actual mid-run abort signal path.
 
-**Root cause**: `validateResumeConsistency()` only checked cwd and GOAL digest.
+**Fix**: Added 4 new integration test scenarios:
+- Scenario 17: AbortController fires during slow Developer → CANCELLED
+- Scenario 18: AbortController fires during slow Verification → CANCELLED
+- Scenario 19: CLI resume with branch mismatch → throws ResumeConsistencyError
+- Scenario 20: Tampered archived evidence/verification → BLOCKED on resume
 
-**Fix**: Added git branch check (`git rev-parse --abbrev-ref HEAD` must match
-`state.branch`) and base_commit check (`git cat-file -t` must succeed). These
-checks are also performed inside `runOrchestrator()`'s resume path for
-defense-in-depth.
+Added `slow-developer` behavior to fake-agent.mjs (sleeps 30s).
 
-### F-404 (High) — Integration tests don't really cover resume/cancel
+### F-406R1 (Medium-High) — Archive idempotency only checks 3 top-level files
 
-**Root cause**: Original scenarios 10-16 were placeholder/fake tests.
+**Root cause**: `verifyArchiveIdempotent()` only compared digests of
+`developer-handoff.md`, `audit-report.md`, and `rework-instructions.md`.
+But `archiveIterationFull()` also copies `verification/` and `evidence/`
+directories, which could be silently overwritten with different content.
 
-**Fix**: Rewrote scenarios 10-16 as real integration tests:
-- Scenario 10: Resume from VERIFYING → re-runs verification → FINALIZING
-- Scenario 11: Resume with branch mismatch → BLOCKED
-- Scenario 12: Resume with GOAL digest mismatch → BLOCKED
-- Scenario 13: Cancel during Developer → CANCELLED
-- Scenario 15: Resume from AUDITING → FINALIZING
-- Scenario 16: Archive digest mismatch → BLOCKED
+**Fix**: Extended `verifyArchiveIdempotent()` with directory-level digest
+comparison. Added `compareDirectoryDigests()` and `collectDirectoryDigests()`
+private methods that recursively compute and compare per-file digests for
+`verification/` and `evidence/` subdirectories. Mismatches in any file
+result in `{ safe: false }`.
 
-### F-405 (Medium) — Developer handoff and audit report not updated
+### F-403R1 (Medium) — CLI resume consistency failure exits with code 0
 
-**Fix**: This document and the audit report are updated for Phase 4.
+**Root cause**: `executeResume()` used `console.error` + `return` for
+consistency failures, which meant the CLI exited with code 0 (success).
 
-### F-406 (Medium) — verifyArchiveIdempotent not wired into main flow
-
-**Root cause**: `verifyArchiveIdempotent()` was implemented but never called.
-
-**Fix**: Added idempotency check before `archiveIterationFull()` in the
-iteration loop. If the archive already exists with different digests, the
-run transitions to BLOCKED.
-
-## Additional Changes
-
-- **`runIterationLoop()` extracted**: The iteration loop body is now a separate
-  function called by both the normal path and the resume path.
-- **`shouldSkipDeveloper` / `shouldSkipVerifying` flags**: When resuming from
-  VERIFYING or AUDITING, the developer and/or verification phases are skipped
-  on the first iteration.
-- **Phase transition guards**: Only transition to VERIFYING/AUDITING if not
-  already in that phase (prevents `Illegal state transition` errors on resume).
-- **REWORKING → DEVELOPING transition**: Added to legal transitions in
-  `src/types.ts` for rework iterations.
-- **Scope guard exclusions**: Added `audit-report.md` and
-  `rework-instructions.md` to `SYSTEM_PROTECTED_PATHS` and
-  `ORCHESTRATOR_OWNED_PATTERNS`.
-- **Orchestrator registry**: Registers audit-report.md after auditor runs,
-  registers history files after archiving.
+**Fix**: Changed all early returns in `executeResume()` to throw a new
+`ResumeConsistencyError` class. The CLI action handler already catches errors
+and calls `process.exit(1)`, so this gives the correct non-zero exit code.
 
 ## Verification Results
 
@@ -97,7 +81,7 @@ run transitions to BLOCKED.
 npm run typecheck: PASS (0 errors)
 npm run lint: PASS (0 errors, 0 warnings)
 npm run build: PASS
-npm test: 601 tests passed (37 files)
+npm test: 605 tests passed (37 files)
 npm pack --dry-run: 137 files, 138.3 kB
 ```
 
@@ -105,7 +89,7 @@ npm pack --dry-run: 137 files, 138.3 kB
 
 | Suite | Tests |
 |---|---|
-| rework-loop (integration) | 16 |
+| rework-loop (integration) | 20 (+4 new) |
 | run-orchestrator (integration) | 19 |
 | orchestrator-registry | 18 |
 | security-regression | 14 |
@@ -127,7 +111,7 @@ npm pack --dry-run: 137 files, 138.3 kB
 | git-manager (integration) | 16 |
 | cli-pack (integration) | 2 |
 | artifact-schemas | 25 |
-| artifact-store | 20 |
+| artifact-store | 11 |
 | front-matter | 14 |
 | lock-manager | 18 |
 | atomic-file | 8 |
@@ -142,7 +126,7 @@ npm pack --dry-run: 137 files, 138.3 kB
 | cancel-request | 8 |
 | error-normalization | 11 |
 | max-iterations | 4 |
-| **Total** | **601** |
+| **Total** | **605** |
 
 ## Acceptance Criteria Status
 
@@ -150,11 +134,11 @@ npm pack --dry-run: 137 files, 138.3 kB
 |---|---|
 | SC-16: Auto-Rework Loop | ✅ Multi-iteration loop with rework instructions |
 | SC-17: Resume Re-entry | ✅ Re-enters orchestrator at correct phase |
-| SC-18: Cancel Guarantee | ✅ SIGTERM + AbortController → CANCELLED |
-| SC-19: Resume Consistency | ✅ Git branch + base_commit + GOAL digest checks |
-| SC-20: Real Integration Coverage | ✅ 16 scenarios including resume/cancel/archive |
-| SC-21: Archive Idempotency | ✅ verifyArchiveIdempotent wired into main flow |
-| SC-14: Engineering Quality | ✅ 601 tests, all gates green |
+| SC-18: Cancel Guarantee | ✅ SIGTERM + AbortController → CANCELLED (not BLOCKED) |
+| SC-19: Resume Consistency | ✅ Git branch + base_commit + GOAL digest checks, non-zero exit |
+| SC-20: Real Integration Coverage | ✅ 20 scenarios including mid-run cancel |
+| SC-21: Archive Idempotency | ✅ Covers evidence/ and verification/ directories |
+| SC-14: Engineering Quality | ✅ 605 tests, all gates green |
 
 ## Risks
 

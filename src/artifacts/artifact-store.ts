@@ -213,6 +213,9 @@ export class ArtifactStore {
    * key files match. If they don't, archiving would overwrite different
    * content, which is unsafe.
    *
+   * Checks both top-level files (handoff, audit-report, rework-instructions)
+   * and subdirectories (verification/, evidence/) for digest mismatches.
+   *
    * Returns { safe: true } if no previous archive exists, or if
    * existing archive digests match current files.
    * Returns { safe: false, reason } if digests mismatch.
@@ -231,7 +234,7 @@ export class ArtifactStore {
       return { safe: true };
     }
 
-    // Compare digests of archived files against current files
+    // Compare digests of archived top-level files against current files
     for (const [fileName, expectedDigest] of Object.entries(currentDigests)) {
       const archivedPath = path.join(historyDir, fileName);
       if (await fs.pathExists(archivedPath)) {
@@ -246,7 +249,93 @@ export class ArtifactStore {
       }
     }
 
+    // Compare archived verification/ directory against current verification/
+    const iterStr = String(iteration).padStart(2, '0');
+    const currentVerificationDir = path.join(this.agentDir, ARTIFACT_DIRS.VERIFICATION, `iteration-${iterStr}`);
+    const archivedVerificationDir = path.join(historyDir, ARTIFACT_DIRS.VERIFICATION);
+    const verificationMismatch = await this.compareDirectoryDigests(
+      currentVerificationDir, archivedVerificationDir, `${ARTIFACT_DIRS.VERIFICATION}/iteration-${iterStr}`,
+    );
+    if (verificationMismatch) {
+      return { safe: false, reason: verificationMismatch };
+    }
+
+    // Compare archived evidence/ directory against current evidence/
+    const currentEvidenceDir = path.join(this.agentDir, ARTIFACT_DIRS.EVIDENCE, `iteration-${iterStr}`);
+    const archivedEvidenceDir = path.join(historyDir, ARTIFACT_DIRS.EVIDENCE);
+    const evidenceMismatch = await this.compareDirectoryDigests(
+      currentEvidenceDir, archivedEvidenceDir, `${ARTIFACT_DIRS.EVIDENCE}/iteration-${iterStr}`,
+    );
+    if (evidenceMismatch) {
+      return { safe: false, reason: evidenceMismatch };
+    }
+
     return { safe: true };
+  }
+
+  /**
+   * Compare a current directory against an archived directory by computing
+   * per-file digests. Returns a reason string if there's a mismatch, or
+   * null if they match.
+   */
+  private async compareDirectoryDigests(
+    currentDir: string,
+    archivedDir: string,
+    label: string,
+  ): Promise<string | null> {
+    const currentFiles = await this.collectDirectoryDigests(currentDir);
+    const archivedFiles = await this.collectDirectoryDigests(archivedDir);
+
+    // Check all archived files still exist with same digest in current
+    for (const [relPath, archivedDigest] of Object.entries(archivedFiles)) {
+      const currentDigest = currentFiles[relPath];
+      if (currentDigest === undefined) {
+        return `Archived ${label}/${relPath} no longer exists in current directory. Archiving would lose this file.`;
+      }
+      if (currentDigest !== archivedDigest) {
+        return `Archived ${label}/${relPath} digest (${archivedDigest}) does not match current digest (${currentDigest}). Archiving would overwrite different content.`;
+      }
+    }
+
+    // Check no new files in current that aren't in archive (would be silently added)
+    for (const relPath of Object.keys(currentFiles)) {
+      if (archivedFiles[relPath] === undefined) {
+        return `Current ${label}/${relPath} does not exist in archive. Archiving would add new file not present in previous archive.`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Recursively collect file digests for a directory.
+   * Returns a map of relative paths (posix) to sha256 digests.
+   */
+  private async collectDirectoryDigests(dirPath: string): Promise<Record<string, string>> {
+    const result: Record<string, string> = {};
+    if (!(await fs.pathExists(dirPath))) {
+      return result;
+    }
+
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        const subDigests = await this.collectDirectoryDigests(fullPath);
+        for (const [subPath, digest] of Object.entries(subDigests)) {
+          result[`${entry.name}/${subPath}`] = digest;
+        }
+      } else if (entry.isFile()) {
+        try {
+          const content = await fs.readFile(fullPath, 'utf8');
+          result[entry.name] = computeFileDigest(content);
+        } catch {
+          // Skip unreadable files (binary, etc.)
+        }
+      }
+    }
+
+    return result;
   }
 
   /**

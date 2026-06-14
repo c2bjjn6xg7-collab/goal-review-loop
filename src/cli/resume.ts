@@ -41,6 +41,17 @@ export function createResumeCommand(): Command {
   return cmd;
 }
 
+export class ResumeConsistencyError extends Error {
+  constructor(
+    message: string,
+    public readonly reason?: string,
+    public readonly suggestion?: string,
+  ) {
+    super(message);
+    this.name = 'ResumeConsistencyError';
+  }
+}
+
 export async function executeResume(params: {
   project_root: string;
   recover_lock?: boolean;
@@ -51,40 +62,35 @@ export async function executeResume(params: {
 
   // 1. Check .agent directory exists
   if (!existsSync(agentDir)) {
-    console.error('No .agent directory found. No run to resume.');
-    return;
+    throw new ResumeConsistencyError('No .agent directory found. No run to resume.');
   }
 
   // 2. Read state
   const stateStore = new StateStore(agentDir);
   if (!await stateStore.exists()) {
-    console.error('No state.json found. No run to resume.');
-    return;
+    throw new ResumeConsistencyError('No state.json found. No run to resume.');
   }
 
   let state: RunState;
   try {
     state = await stateStore.read();
   } catch (err) {
-    console.error(`Failed to read state: ${err instanceof Error ? err.message : String(err)}`);
-    return;
+    throw new ResumeConsistencyError(`Failed to read state: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   // 3. Check if already in terminal state
   if (isTerminal(state.phase)) {
-    console.log(`Run ${state.run_id} is already in terminal state: ${state.phase}`);
-    console.log('Cannot resume a completed run.');
-    return;
+    throw new ResumeConsistencyError(`Run ${state.run_id} is already in terminal state: ${state.phase}. Cannot resume a completed run.`);
   }
 
   // 4. Consistency checks
   const consistencyResult = await validateResumeConsistency(state, projectRoot);
   if (!consistencyResult.valid) {
-    console.error(`Resume consistency check failed: ${consistencyResult.reason}`);
-    if (consistencyResult.suggestion) {
-      console.error(`Suggestion: ${consistencyResult.suggestion}`);
-    }
-    return;
+    throw new ResumeConsistencyError(
+      `Resume consistency check failed: ${consistencyResult.reason}`,
+      consistencyResult.reason,
+      consistencyResult.suggestion,
+    );
   }
 
   // 5. Handle lock
@@ -101,8 +107,7 @@ export async function executeResume(params: {
     }
 
     if (isAlive && !params.recover_lock) {
-      console.error(`Run is locked by active process (PID ${lock.pid}). Use --recover-lock to override.`);
-      return;
+      throw new ResumeConsistencyError(`Run is locked by active process (PID ${lock.pid}). Use --recover-lock to override.`);
     }
 
     if (!isAlive || params.recover_lock) {
@@ -111,8 +116,7 @@ export async function executeResume(params: {
         await lockManager.release(lock.run_id);
         console.log('Released stale lock.');
       } catch {
-        console.error('Failed to release lock. Try removing .agent/run.lock manually.');
-        return;
+        throw new ResumeConsistencyError('Failed to release lock. Try removing .agent/run.lock manually.');
       }
     }
   }
@@ -121,14 +125,11 @@ export async function executeResume(params: {
   const recoveryAction = determineRecoveryAction(state);
 
   if (recoveryAction.action === 'blocked') {
-    console.error(`Cannot resume from ${state.phase}: ${recoveryAction.reason}`);
-    return;
+    throw new ResumeConsistencyError(`Cannot resume from ${state.phase}: ${recoveryAction.reason}`);
   }
 
   if (recoveryAction.action === 'restart') {
-    console.error(`Run ${state.run_id} needs to be restarted from scratch: ${recoveryAction.reason}`);
-    console.error('Use `review-loop start` with the same request to restart the run.');
-    return;
+    throw new ResumeConsistencyError(`Run ${state.run_id} needs to be restarted from scratch: ${recoveryAction.reason}. Use \`review-loop start\` with the same request to restart the run.`);
   }
 
   // 7. Re-enter the orchestrator loop

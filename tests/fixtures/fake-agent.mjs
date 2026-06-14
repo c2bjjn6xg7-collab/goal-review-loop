@@ -24,6 +24,7 @@
  *   break-prompt-cleanup - Developer: make debug dir read-only
  *   rework-success   - Developer: write valid handoff for rework (iteration > 1)
  *   rework-fail      - Developer: still fails after rework
+ *   slow-developer   - Developer: sleep 30s (for mid-run cancel testing)
  *   no-artifact      - Don't write any artifact
  *   timeout          - Sleep until timeout
  *   exit-error       - Exit with non-zero code
@@ -386,6 +387,19 @@ try {
         case 'rework-fail':
           // Phase 4: Developer in rework mode — still can't fix the issue
           writeBlockedHandoff();
+          break;
+        case 'slow-developer':
+          // Phase 4: Sleep for 30 seconds to allow mid-run cancel testing.
+          // Write handoff first so if the process is killed before completing,
+          // the orchestrator can detect the cancellation.
+          writeCompletedHandoff();
+          if (!existsSync(join(projectRoot, 'src'))) {
+            mkdirSync(join(projectRoot, 'src'), { recursive: true });
+          }
+          writeFileSync(join(projectRoot, 'src', 'test-impl.ts'), '// Test implementation\nexport const testFn = () => true;\n', 'utf8');
+          await new Promise((resolve) => {
+            setTimeout(resolve, 30000);
+          });
           break;
         case 'no-artifact':
           break;

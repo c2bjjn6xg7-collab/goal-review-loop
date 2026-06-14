@@ -383,6 +383,17 @@ export async function runOrchestrator(params: {
       return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${plannerCleanupResult.error}`, 'STATE_CONFLICT', originalBranch);
     }
 
+    if (plannerResult.result.status === 'cancelled') {
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'CANCELLED', plannerResult.result.error?.message);
+      return makeResult(
+        runId, PhaseEnum.CANCELLED, 4, originalBranch, null, [],
+        'Run cancelled by user request',
+        `Planner cancelled: ${plannerResult.result.error?.message ?? 'unknown'}`,
+        plannerResult.result.error,
+      );
+    }
+
     if (plannerResult.result.status !== 'success') {
       await transitionToBlocked(stateStore, `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`);
       await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'FAIL', plannerResult.result.error?.message);
@@ -780,6 +791,17 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${developerCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
       }
 
+      if (developerResult.status === 'cancelled') {
+        await stateStore.transition(PhaseEnum.CANCELLED);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'CANCELLED', developerResult.error?.message);
+        return makeResult(
+          runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+          'Run cancelled by user request',
+          `Developer cancelled: ${developerResult.error?.message ?? 'unknown'}`,
+          developerResult.error,
+        );
+      }
+
       if (developerResult.status !== 'success') {
         await transitionToBlocked(stateStore, `Developer failed: ${developerResult.error?.message ?? 'unknown'}`);
         await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'FAIL', developerResult.error?.message);
@@ -896,7 +918,20 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       projectRoot,
       runId,
       iteration,
+      signal: combinedSignal,
     });
+
+    // If verification was cancelled, transition to CANCELLED
+    if (combinedSignal.aborted) {
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', 'CANCELLED');
+      return makeResult(
+        runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+        'Run cancelled by user request',
+        'Verification cancelled by abort signal',
+        null,
+      );
+    }
 
     registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
 
@@ -1069,6 +1104,17 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     if (auditorCleanupResult && !auditorCleanupResult.success) {
       await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
       return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
+    }
+
+    if (auditorResult.status === 'cancelled') {
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'CANCELLED', auditorResult.error?.message);
+      return makeResult(
+        runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+        'Run cancelled by user request',
+        `Auditor cancelled: ${auditorResult.error?.message ?? 'unknown'}`,
+        auditorResult.error,
+      );
     }
 
     if (auditorResult.status !== 'success') {

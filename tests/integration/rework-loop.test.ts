@@ -12,7 +12,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
 import { executeStatus } from '../../src/cli/status.js';
-import { executeResume } from '../../src/cli/resume.js';
+import { executeResume, ResumeConsistencyError } from '../../src/cli/resume.js';
 
 /** Write review-loop.yaml config that uses the fake agent. */
 function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, string>, maxIterations = 3): void {
@@ -552,6 +552,161 @@ describe('Phase 4 Rework Loop integration', () => {
     });
 
     // Should be BLOCKED because archive digests don't match
+    expect(resumeResult.phase).toBe('BLOCKED');
+  });
+
+  // ─── Scenario 17: Cancel during running Developer (abort signal) → CANCELLED ──
+  it('17: abort signal during running developer leads to CANCELLED', async () => {
+    repoDir = createTestRepo('s17', { developer: 'slow-developer' }, 3);
+
+    // Add .agent to .gitignore so cancel-request.json doesn't dirty the worktree
+    writeFileSync(join(repoDir, '.gitignore'), '.agent/\n', 'utf8');
+    execSync('git add .gitignore && git commit -m "add gitignore"', { cwd: repoDir });
+
+    // Create an AbortController and schedule abort after 2 seconds
+    // (slow-developer sleeps 30s, so 2s is enough to catch it mid-run)
+    const abortController = new AbortController();
+    setTimeout(() => abortController.abort(), 2000);
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add feature',
+      max_iterations: 3,
+      signal: abortController.signal,
+    });
+
+    expect(result.phase).toBe('CANCELLED');
+    expect(result.exit_code).toBe(4);
+
+    // Verify state.json reflects CANCELLED
+    const statePath = join(repoDir, '.agent', 'state.json');
+    expect(existsSync(statePath)).toBe(true);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.phase).toBe('CANCELLED');
+  }, 60000);
+
+  // ─── Scenario 18: Cancel during Verification (abort signal) → CANCELLED ──
+  it('18: abort signal during verification leads to CANCELLED', async () => {
+    // Use a normal developer but a slow verification command
+    repoDir = createTestRepo('s18', {}, 3);
+
+    // Add .agent to .gitignore
+    writeFileSync(join(repoDir, '.gitignore'), '.agent/\n', 'utf8');
+
+    // Override the package.json test script to sleep for a long time
+    const pkg = JSON.parse(readFileSync(join(repoDir, 'package.json'), 'utf8'));
+    pkg.scripts.test = 'sleep 60';
+    writeFileSync(join(repoDir, 'package.json'), JSON.stringify(pkg, null, 2));
+
+    execSync('git add -A && git commit -m "slow test"', { cwd: repoDir });
+
+    // Create an AbortController and schedule abort after 3 seconds
+    // (verification will be running `sleep 60`, so 3s catches it mid-run)
+    const abortController = new AbortController();
+    setTimeout(() => abortController.abort(), 3000);
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add feature',
+      max_iterations: 3,
+      signal: abortController.signal,
+    });
+
+    expect(result.phase).toBe('CANCELLED');
+    expect(result.exit_code).toBe(4);
+
+    // Verify state.json reflects CANCELLED
+    const statePath = join(repoDir, '.agent', 'state.json');
+    expect(existsSync(statePath)).toBe(true);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.phase).toBe('CANCELLED');
+  }, 90000);
+
+  // ─── Scenario 19: CLI resume branch mismatch → throws (non-zero exit) ──
+  it('19: CLI resume with branch mismatch throws ResumeConsistencyError', async () => {
+    repoDir = createTestRepo('s19');
+
+    // Run a full orchestrator first
+    await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add feature',
+    });
+
+    // Switch to a different branch
+    execSync('git checkout -b wrong-branch', { cwd: repoDir });
+
+    // Remove lock
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // executeResume should throw ResumeConsistencyError
+    await expect(executeResume({
+      project_root: repoDir,
+    })).rejects.toThrow(ResumeConsistencyError);
+
+    await expect(executeResume({
+      project_root: repoDir,
+    })).rejects.toThrow(/branch/i);
+  });
+
+  // ─── Scenario 20: Tamper archived evidence/verification → BLOCKED on resume ──
+  it('20: tampered archived evidence/verification leads to BLOCKED on resume', async () => {
+    repoDir = createTestRepo('s20', { auditor: 'audit-fail-then-pass' }, 3);
+
+    // Run the orchestrator — it will do iteration 1 (audit FAIL) then iteration 2 (audit PASS)
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add feature',
+      max_iterations: 3,
+    });
+    expect(result.phase).toBe('FINALIZING');
+
+    // Verify iteration 1 was archived with evidence
+    const historyDir = join(repoDir, '.agent', 'history', 'iteration-01');
+    expect(existsSync(historyDir)).toBe(true);
+
+    // Tamper with an archived evidence file
+    const archivedEvidenceDir = join(historyDir, 'evidence');
+    if (existsSync(archivedEvidenceDir)) {
+      // Find any file in the evidence directory and tamper with it
+      const { readdirSync } = await import('node:fs');
+      const files = readdirSync(archivedEvidenceDir, { recursive: true });
+      for (const f of files) {
+        const fullPath = join(archivedEvidenceDir, String(f));
+        try {
+          const content = readFileSync(fullPath, 'utf8');
+          writeFileSync(fullPath, content + '\n// TAMPERED\n', 'utf8');
+          break; // Only need to tamper one file
+        } catch { /* skip binary/unreadable */ }
+      }
+    }
+
+    // Modify state to simulate being at iteration 1 with a rework needed
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'REWORKING';
+    state.iteration = 1;
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    // Remove lock
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // Resume should detect the idempotency violation in evidence/ and BLOCKED
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: 2,
+        phase: 'REWORKING',
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    // Should be BLOCKED because archived evidence digests don't match
     expect(resumeResult.phase).toBe('BLOCKED');
   });
 });
