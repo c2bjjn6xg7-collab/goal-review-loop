@@ -4,6 +4,7 @@
  */
 import fs from 'fs-extra';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { atomicWriteFile } from '../runtime/atomic-file.js';
 
 export class ArtifactStoreError extends Error {
@@ -25,6 +26,7 @@ export const ARTIFACT_FILES = {
   ITERATION_LOG: 'iteration-log.md',
   STATE: 'state.json',
   RUN_LOCK: 'run.lock',
+  REWORK_INSTRUCTIONS: 'rework-instructions.md',
 } as const;
 
 /**
@@ -148,6 +150,106 @@ export class ArtifactStore {
   }
 
   /**
+   * Comprehensive iteration archiving — Phase 4 §7.
+   * Copies handoff, audit-report, rework-instructions (if exists),
+   * plus the full verification/ and evidence/ directories for this iteration.
+   */
+  async archiveIterationFull(iteration: number): Promise<void> {
+    const historyDir = path.join(
+      this.agentDir,
+      ARTIFACT_DIRS.HISTORY,
+      `iteration-${String(iteration).padStart(2, '0')}`,
+    );
+    await fs.ensureDir(historyDir);
+
+    // Archive handoff
+    const handoffPath = this.artifactPath(ARTIFACT_FILES.HANDOFF);
+    if (await fs.pathExists(handoffPath)) {
+      await fs.copy(handoffPath, path.join(historyDir, ARTIFACT_FILES.HANDOFF));
+    }
+
+    // Archive audit report
+    const auditPath = this.artifactPath(ARTIFACT_FILES.AUDIT_REPORT);
+    if (await fs.pathExists(auditPath)) {
+      await fs.copy(auditPath, path.join(historyDir, ARTIFACT_FILES.AUDIT_REPORT));
+    }
+
+    // Archive rework instructions (if exists — only for iteration >= 2)
+    const reworkPath = this.artifactPath(ARTIFACT_FILES.REWORK_INSTRUCTIONS);
+    if (await fs.pathExists(reworkPath)) {
+      await fs.copy(reworkPath, path.join(historyDir, ARTIFACT_FILES.REWORK_INSTRUCTIONS));
+    }
+
+    // Archive verification directory for this iteration
+    const verificationDir = this.verificationDir(iteration);
+    if (await fs.pathExists(verificationDir)) {
+      const destVerificationDir = path.join(historyDir, ARTIFACT_DIRS.VERIFICATION);
+      await fs.copy(verificationDir, destVerificationDir);
+    }
+
+    // Archive evidence directory for this iteration
+    const evidenceDir = this.evidenceDir(iteration);
+    if (await fs.pathExists(evidenceDir)) {
+      const destEvidenceDir = path.join(historyDir, ARTIFACT_DIRS.EVIDENCE);
+      await fs.copy(evidenceDir, destEvidenceDir);
+    }
+  }
+
+  /**
+   * Check if a history directory for a given iteration already exists.
+   */
+  async isIterationArchived(iteration: number): Promise<boolean> {
+    const historyDir = path.join(
+      this.agentDir,
+      ARTIFACT_DIRS.HISTORY,
+      `iteration-${String(iteration).padStart(2, '0')}`,
+    );
+    return fs.pathExists(historyDir);
+  }
+
+  /**
+   * Verify that archiving an iteration is idempotent and safe.
+   * If the iteration is already archived, check that the digests of
+   * key files match. If they don't, archiving would overwrite different
+   * content, which is unsafe.
+   *
+   * Returns { safe: true } if no previous archive exists, or if
+   * existing archive digests match current files.
+   * Returns { safe: false, reason } if digests mismatch.
+   */
+  async verifyArchiveIdempotent(
+    iteration: number,
+    currentDigests: Record<string, string>,
+  ): Promise<{ safe: boolean; reason?: string }> {
+    const historyDir = path.join(
+      this.agentDir,
+      ARTIFACT_DIRS.HISTORY,
+      `iteration-${String(iteration).padStart(2, '0')}`,
+    );
+
+    if (!(await fs.pathExists(historyDir))) {
+      return { safe: true };
+    }
+
+    // Compare digests of archived files against current files
+    for (const [fileName, expectedDigest] of Object.entries(currentDigests)) {
+      const archivedPath = path.join(historyDir, fileName);
+      if (await fs.pathExists(archivedPath)) {
+        const content = await fs.readFile(archivedPath, 'utf8');
+        const actualDigest = computeFileDigest(content);
+        if (actualDigest !== expectedDigest) {
+          return {
+            safe: false,
+            reason: `Archived ${fileName} digest (${actualDigest}) does not match current digest (${expectedDigest}). Archiving would overwrite different content.`,
+          };
+        }
+      }
+    }
+
+    return { safe: true };
+  }
+
+  /**
    * Append to the iteration log.
    * Design doc §8.6: "只允许 Artifact Store 追加，不允许模型重写"
    */
@@ -212,4 +314,11 @@ export class ArtifactStore {
       await fs.appendFile(gitignorePath, addition, 'utf8');
     }
   }
+}
+
+/**
+ * Compute SHA-256 digest of a string, prefixed with "sha256:".
+ */
+function computeFileDigest(content: string): string {
+  return `sha256:${createHash('sha256').update(content).digest('hex')}`;
 }

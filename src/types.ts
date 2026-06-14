@@ -41,7 +41,7 @@ export const LEGAL_TRANSITIONS: ReadonlyMap<Phase, ReadonlySet<Phase>> = new Map
   [Phase.DEVELOPING, new Set([Phase.VERIFYING, Phase.BLOCKED, Phase.CANCELLED])],
   [Phase.VERIFYING, new Set([Phase.AUDITING, Phase.REWORKING, Phase.BLOCKED, Phase.CANCELLED])],
   [Phase.AUDITING, new Set([Phase.FINALIZING, Phase.REWORKING, Phase.BLOCKED, Phase.CANCELLED])],
-  [Phase.REWORKING, new Set([Phase.VERIFYING, Phase.BLOCKED, Phase.FAILED, Phase.CANCELLED])],
+  [Phase.REWORKING, new Set([Phase.DEVELOPING, Phase.VERIFYING, Phase.BLOCKED, Phase.FAILED, Phase.CANCELLED])],
   [Phase.FINALIZING, new Set([Phase.PASSED, Phase.BLOCKED])],
   // Terminal phases — no outgoing transitions
   [Phase.PASSED, new Set()],
@@ -89,6 +89,8 @@ export interface RunState {
   started_at: string;
   updated_at: string;
   last_error: string | null;
+  /** ISO timestamp when cancel was requested, or null. */
+  cancel_requested_at: string | null;
   stages: Record<string, StageInfo>;
 }
 
@@ -158,9 +160,12 @@ export const ErrorCategory = {
   SCOPE_VIOLATION: 'SCOPE_VIOLATION',
   VERIFICATION_FAILED: 'VERIFICATION_FAILED',
   AUDIT_FAILED: 'AUDIT_FAILED',
+  AUDIT_BLOCKED: 'AUDIT_BLOCKED',
   STATE_CONFLICT: 'STATE_CONFLICT',
+  LOCK_CONFLICT: 'LOCK_CONFLICT',
   GIT_COMMIT_ERROR: 'GIT_COMMIT_ERROR',
   USER_CANCELLED: 'USER_CANCELLED',
+  INFRASTRUCTURE_ERROR: 'INFRASTRUCTURE_ERROR',
 } as const;
 
 export type ErrorCategory = (typeof ErrorCategory)[keyof typeof ErrorCategory];
@@ -177,20 +182,35 @@ export const ERROR_CATEGORY_DEFAULT_RESULT: ReadonlyMap<ErrorCategory, Phase> = 
   [ErrorCategory.SCOPE_VIOLATION, Phase.FAILED],
   [ErrorCategory.VERIFICATION_FAILED, Phase.FAILED],
   [ErrorCategory.AUDIT_FAILED, Phase.FAILED],
+  [ErrorCategory.AUDIT_BLOCKED, Phase.BLOCKED],
   [ErrorCategory.STATE_CONFLICT, Phase.BLOCKED],
+  [ErrorCategory.LOCK_CONFLICT, Phase.BLOCKED],
   [ErrorCategory.GIT_COMMIT_ERROR, Phase.BLOCKED],
   [ErrorCategory.USER_CANCELLED, Phase.CANCELLED],
+  [ErrorCategory.INFRASTRUCTURE_ERROR, Phase.BLOCKED],
 ]);
 
 /**
- * Structured error record
+ * Structured error record — Phase 4 §12
+ * Extended with phase, iteration, evidence_paths, and suggested_next_action.
  */
 export interface ReviewLoopError {
   code: ErrorCategory;
   message: string;
   exit_code?: number;
   log_path?: string;
+  /** Phase where the error occurred. */
+  phase?: Phase;
+  /** Iteration when the error occurred. */
+  iteration?: number;
+  /** Whether the error is retryable (e.g. transient infra failure). */
+  retryable?: boolean;
   resumable: boolean;
+  /** Paths to evidence files related to this error. */
+  evidence_paths?: string[];
+  /** Suggested next action for the user. */
+  suggested_next_action?: string;
+  /** @deprecated Use suggested_next_action instead. */
   suggested_action: string;
 }
 
@@ -350,6 +370,10 @@ export interface ReviewLoopConfig {
   };
   loop: {
     max_iterations: number;
+    /** Whether to archive per-iteration history. Default: true. */
+    archive_history: boolean;
+    /** Whether to stop on infrastructure errors instead of retrying. Default: true. */
+    stop_on_infrastructure_error: boolean;
   };
   git: GitConfig;
   runtime: RuntimeConfig;
@@ -376,6 +400,8 @@ export interface RuntimeConfig {
   kill_grace_seconds: number;
   max_log_bytes: number;
   lock_stale_seconds: number;
+  /** Grace period in seconds for cancel to take effect before force-killing. Default: 10. */
+  cancel_grace_seconds: number;
 }
 
 /**
@@ -639,4 +665,72 @@ export interface MechanicalFinding {
   stdout_path: string;
   stderr_path: string;
   log_io_error?: string;
+}
+
+/**
+ * Phase 4: Rework Instructions front matter — §7.1
+ * Written by Orchestrator, read-only for Developer.
+ */
+export interface ReworkInstructionsFrontMatter {
+  schema_version: number;
+  run_id: string;
+  iteration: number;
+  author_role: 'orchestrator';
+  source: 'scope' | 'verification' | 'audit' | 'artifact';
+  status: 'REWORK_REQUIRED';
+}
+
+/**
+ * Phase 4: Rework Finding — §7.2
+ * Each finding describes a specific issue that must be fixed.
+ */
+export interface ReworkFinding {
+  id: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  source: 'scope' | 'verification' | 'audit' | 'artifact';
+  path: string;
+  evidence: string;
+  required_fix: string;
+  /** Verification-specific fields. */
+  command_id?: string;
+  argv?: string[];
+  exit_code?: number | null;
+  stdout_path?: string;
+  stderr_path?: string;
+  timed_out?: boolean;
+  /** Scope-specific fields. */
+  denial_reason?: string;
+  scope_report_path?: string;
+}
+
+/**
+ * Phase 4: Cancel Request — §11.2
+ * Written by `review-loop cancel`, checked by Orchestrator.
+ */
+export interface CancelRequest {
+  schema_version: number;
+  run_id: string;
+  requested_at: string;
+  requested_by: string;
+}
+
+/**
+ * Phase 4: Status Output — §10
+ * Structured output for `review-loop status --json`.
+ */
+export interface StatusOutput {
+  run_id: string;
+  phase: Phase;
+  iteration: number;
+  max_iterations: number;
+  branch: string;
+  base_commit: string;
+  goal_digest: string | null;
+  audited_diff_digest: string | null;
+  last_error: ReviewLoopError | null;
+  lock_status: 'held' | 'stale' | 'none';
+  lock_info: LockInfo | null;
+  started_at: string;
+  updated_at: string;
+  next_step: string;
 }

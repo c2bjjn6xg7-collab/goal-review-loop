@@ -20,6 +20,10 @@
  *   blocked-handoff  - Developer: write BLOCKED handoff
  *   modify-goal      - Developer: modify GOAL.md
  *   scope-violation  - Developer: modify a disallowed file
+ *   forge-evidence   - Developer: forge a file in .agent/evidence/
+ *   break-prompt-cleanup - Developer: make debug dir read-only
+ *   rework-success   - Developer: write valid handoff for rework (iteration > 1)
+ *   rework-fail      - Developer: still fails after rework
  *   no-artifact      - Don't write any artifact
  *   timeout          - Sleep until timeout
  *   exit-error       - Exit with non-zero code
@@ -28,6 +32,7 @@
  *   audit-blocked    - Auditor: write BLOCKED
  *   audit-bad-digest - Auditor: write PASS with wrong digest
  *   audit-tamper     - Auditor: modify a business file during audit
+ *   audit-fail-then-pass - Auditor: FAIL on iteration 1, PASS on iteration 2+
  */
 
 import { writeFileSync, mkdirSync, existsSync, readFileSync, appendFileSync, chmodSync } from 'node:fs';
@@ -61,6 +66,18 @@ function readDigestFromState(field) {
     }
   } catch { /* ok */ }
   return undefined;
+}
+
+/** Read the current iteration number from state.json. */
+function readIterationFromState() {
+  try {
+    const statePath = join(agentDir, 'state.json');
+    if (existsSync(statePath)) {
+      const state = JSON.parse(readFileSync(statePath, 'utf8'));
+      return state.iteration || 1;
+    }
+  } catch { /* ok */ }
+  return 1;
 }
 
 // Ensure .agent directory exists
@@ -357,6 +374,19 @@ try {
             try { chmodSync(debugDir, 0o555); } catch { /* ok */ }
           }
           break;
+        case 'rework-success':
+          // Phase 4: Developer in rework mode — write valid handoff
+          writeCompletedHandoff();
+          // Fix the issue by creating/updating the test file
+          if (!existsSync(join(projectRoot, 'src'))) {
+            mkdirSync(join(projectRoot, 'src'), { recursive: true });
+          }
+          writeFileSync(join(projectRoot, 'src', 'test-impl.ts'), '// Fixed implementation\nexport const testFn = () => true;\n', 'utf8');
+          break;
+        case 'rework-fail':
+          // Phase 4: Developer in rework mode — still can't fix the issue
+          writeBlockedHandoff();
+          break;
         case 'no-artifact':
           break;
         case 'timeout':
@@ -393,6 +423,16 @@ try {
           // Modify a business file during audit (violation)
           if (existsSync(join(projectRoot, 'src', 'test-impl.ts'))) {
             appendFileSync(join(projectRoot, 'src', 'test-impl.ts'), '\n// Auditor tampered\n', 'utf8');
+          }
+          break;
+        case 'audit-fail-then-pass':
+          // Phase 4: FAIL on iteration 1, PASS on iteration 2+
+          // Read iteration from state.json to determine behavior
+          const currentIteration = readIterationFromState();
+          if (currentIteration <= 1) {
+            writeAuditReport('FAIL', goalDigest, diffDigest);
+          } else {
+            writeAuditReport('PASS', goalDigest, diffDigest);
           }
           break;
         case 'no-artifact':

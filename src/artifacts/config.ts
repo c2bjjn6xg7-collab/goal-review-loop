@@ -28,6 +28,8 @@ const CONFIG_SCHEMA = {
       required: ['max_iterations'],
       properties: {
         max_iterations: { type: 'number', minimum: 1, maximum: 10 },
+        archive_history: { type: 'boolean' },
+        stop_on_infrastructure_error: { type: 'boolean' },
       },
       additionalProperties: false,
     },
@@ -58,6 +60,7 @@ const CONFIG_SCHEMA = {
         kill_grace_seconds: { type: 'number', minimum: 1 },
         max_log_bytes: { type: 'number', minimum: 1024 },
         lock_stale_seconds: { type: 'number', minimum: 60 },
+        cancel_grace_seconds: { type: 'number', minimum: 1 },
       },
       additionalProperties: false,
     },
@@ -111,6 +114,8 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
   },
   loop: {
     max_iterations: 3,
+    archive_history: true,
+    stop_on_infrastructure_error: true,
   },
   git: {
     require_repository: true,
@@ -127,6 +132,7 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     kill_grace_seconds: 10,
     max_log_bytes: 10485760, // 10MB
     lock_stale_seconds: 86400, // 24h
+    cancel_grace_seconds: 10,
   },
 };
 
@@ -154,6 +160,17 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     }
 
     const config = data as ReviewLoopConfig;
+
+    // Phase 4 backward compat: fill in new fields with defaults if missing
+    if (config.loop.archive_history === undefined) {
+      config.loop.archive_history = DEFAULT_CONFIG.loop.archive_history;
+    }
+    if (config.loop.stop_on_infrastructure_error === undefined) {
+      config.loop.stop_on_infrastructure_error = DEFAULT_CONFIG.loop.stop_on_infrastructure_error;
+    }
+    if (config.runtime.cancel_grace_seconds === undefined) {
+      config.runtime.cancel_grace_seconds = DEFAULT_CONFIG.runtime.cancel_grace_seconds;
+    }
 
     // Enforce MVP constraints — Design doc §5.1
     validateMvpConstraints(config);

@@ -170,18 +170,18 @@ describe('Run Orchestrator integration', () => {
     expect(result.exit_code).toBe(3);
   });
 
-  // ─── Scenario 10: Auditor FAIL → REWORKING ─────────────────
-  it('enters REWORKING when Auditor returns FAIL', async () => {
+  // ─── Scenario 10: Auditor FAIL → FAILED (when max_iterations=1) ───
+  it('enters FAILED when Auditor returns FAIL and max_iterations reached', async () => {
     repoDir = createTestRepo('audit-fail', { auditor: 'audit-fail' });
 
     const result = await runOrchestrator({
       project_root: repoDir,
       request: 'Add feature',
+      max_iterations: 1, // Force max_iterations=1 so it fails immediately
     });
 
-    expect(result.phase).toBe('REWORKING');
+    expect(result.phase).toBe('FAILED');
     expect(result.exit_code).toBe(2);
-    expect(result.audit_decision).toBe('FAIL');
   });
 
   // ─── Scenario 11: Auditor BLOCKED → BLOCKED ───────────────

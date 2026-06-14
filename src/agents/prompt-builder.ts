@@ -136,6 +136,25 @@ export function buildDeveloperPrompt(
 }
 
 /**
+ * Build a prompt for the Rework (Developer) role.
+ * Phase 4 §7: Developer in rework mode reads GOAL + rework-instructions.
+ */
+export function buildReworkPrompt(
+  template: string,
+  context: ReworkPromptContext,
+): string {
+  let result = template;
+  result = replaceAllTokens(result, '{{RUN_ID}}', context.run_id);
+  result = replaceAllTokens(result, '{{ITERATION}}', String(context.iteration));
+  result = replaceAllTokens(result, '{{PROJECT_ROOT}}', context.project_root);
+  result = replaceAllTokens(result, '{{GOAL_PATH}}', context.goal_path);
+  result = replaceAllTokens(result, '{{REWORK_INSTRUCTIONS_PATH}}', context.rework_instructions_path);
+  result = replaceAllTokens(result, '{{HANDOFF_PATH}}', context.handoff_path);
+  result = replaceAllTokens(result, '{{TEMPLATE_VERSION}}', String(PROMPT_TEMPLATE_VERSION));
+  return result;
+}
+
+/**
  * Build a prompt for the Auditor role.
  * Phase 3 §10.3: Auditor reads evidence only, must not trust Developer self-assessment.
  */
@@ -184,6 +203,16 @@ export interface DeveloperPromptContext {
   project_root: string;
   plan_path: string;
   goal_path: string;
+  handoff_path: string;
+}
+
+/** Context for Rework prompt. Phase 4 §7. */
+export interface ReworkPromptContext {
+  run_id: string;
+  iteration: number;
+  project_root: string;
+  goal_path: string;
+  rework_instructions_path: string;
   handoff_path: string;
 }
 

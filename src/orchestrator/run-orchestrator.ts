@@ -1,13 +1,16 @@
 /**
- * Run Orchestrator — first-round orchestration loop.
- * Phase 3 §12: INITIALIZING → PLANNING → DEVELOPING → VERIFYING → AUDITING → FINALIZING/REWORKING/BLOCKED
+ * Run Orchestrator — multi-round orchestration loop with auto-rework.
+ * Phase 4 §12: INITIALIZING → PLANNING → [DEVELOPING → VERIFYING → AUDITING]* → FINALIZING/FAILED/BLOCKED/CANCELLED
  *
- * Phase 3 constraints:
- * - Only executes iteration 1 (no auto-rework)
- * - No resume, cancel, commit, tag, or push
- * - All external commands through Process Runner
- * - All Git operations through Git Manager
- * - Mechanical checks override Agent self-assessment
+ * Phase 4 capabilities:
+ * - Automatic multi-round rework loop (up to max_iterations)
+ * - Per-iteration history archiving
+ * - Cancel request detection
+ * - Rework instructions generation
+ *
+ * Phase 4 constraints (NOT Phase 5/6):
+ * - No final audit, no auto commit/tag/push
+ * - No GUI, no plugin packaging, no destructive git cleanup
  */
 
 import { join, resolve, sep } from 'node:path';
@@ -17,17 +20,19 @@ import { StateStore } from './state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { ArtifactStore } from '../artifacts/artifact-store.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
-import type { ReviewLoopConfig } from '../types.js';
+import type { ReviewLoopConfig, ReworkFinding, CancelRequest } from '../types.js';
 import { preflight, createTaskBranch } from '../git/git-manager.js';
 import { collectDiff, writeDiffArtifacts } from '../git/diff-collector.js';
 import { checkScope, writeScopeReport } from '../scope/scope-guard.js';
 import { runVerification } from '../verification/verification-runner.js';
 import { computeDigest as computeDigestLib, type Digest } from '../runtime/digest.js';
-import { buildPlannerPrompt, buildDeveloperPrompt, buildAuditorPrompt, buildPrompt, deletePromptFile, type PromptCleanupResult } from '../agents/prompt-builder.js';
+import { buildPlannerPrompt, buildDeveloperPrompt, buildReworkPrompt, buildAuditorPrompt, buildPrompt, deletePromptFile, type PromptCleanupResult } from '../agents/prompt-builder.js';
 import { buildPlannerInput, validatePlannerOutput, snapshotWorkspaceBeforePlanner, validatePlannerWorkspaceOwnership } from '../agents/planner-adapter.js';
 import { buildDeveloperInput, validateDeveloperOutput } from '../agents/developer-adapter.js';
 import { buildAuditorInput, validateAuditorOutput } from '../agents/auditor-adapter.js';
 import { runAgent } from '../agents/agent-adapter.js';
+import { buildReworkInstructions, writeReworkInstructions, buildReworkFindingsFromScope, buildReworkFindingsFromVerification, buildReworkFindingsFromAudit } from './rework-instructions.js';
+import { validateCancelRequest } from '../artifacts/json-schemas.js';
 import type {
   Phase,
   ReviewLoopError,
@@ -36,6 +41,8 @@ import type {
   OrchestratorFileRegistryEntry,
   OrchestratorRegistryVerificationResult,
   OrchestratorRegistryViolation,
+  ScopeReportV2,
+  VerificationManifest,
 } from '../types.js';
 import { Phase as PhaseEnum } from '../types.js';
 
@@ -288,566 +295,599 @@ export async function runOrchestrator(params: {
     await appendLog(artifactStore, runId, 1, 'DEVELOPING', 'developer start', 'PASS');
 
     // ═══════════════════════════════════════════════════════════
-    // §12.3 DEVELOPING
+    // §12.3–12.5 ITERATION LOOP (Phase 4: auto-rework)
     // ═══════════════════════════════════════════════════════════
 
-    // Record plan/GOAL digests before Developer
-    const preDevPlanDigest = computeDigest(readFileSync(join(projectRoot, '.agent/plan.md'), 'utf8'));
-    const preDevGoalDigest = computeDigest(readFileSync(join(projectRoot, '.agent/GOAL.md'), 'utf8'));
-
-    // F-307R2 fix: Snapshot ALL system-protected paths before Developer call.
-    // This replaces the F-307R1 digest guard with a comprehensive registry-based approach.
-    // After Developer returns, we verify:
-    // 1. All registered orchestrator files are intact (digest match)
-    // 2. All pre-existing system-protected files are unchanged
-    // 3. No new unregistered files in system-protected directories
-    // 4. No symlink replacements of registered files
-    // Only .agent/developer-handoff.md may be written by Developer.
-    const preDevSystemPaths = new Map<string, { digest: string; mode: number; isSymlink: boolean }>();
-
-    // Register static protected files (state.json, run.lock, iteration-log.md, plan.md, GOAL.md)
-    const staticProtectedFiles = [
-      join(agentDir, 'state.json'),
-      join(agentDir, 'run.lock'),
-      join(agentDir, 'iteration-log.md'),
-      join(agentDir, 'plan.md'),
-      join(agentDir, 'GOAL.md'),
-    ];
-    for (const filePath of staticProtectedFiles) {
-      if (existsSync(filePath)) {
-        try {
-          const stat = lstatSync(filePath);
-          if (!stat.isDirectory()) {
-            const digest = computeDigest(readFileSync(filePath, 'utf8'));
-            preDevSystemPaths.set(filePath, {
-              digest,
-              mode: stat.mode,
-              isSymlink: stat.isSymbolicLink(),
-            });
-          }
-        } catch { /* skip unreadable */ }
-      }
-    }
-
-    // Register all files in system-protected directories
-    const protectedDirs = [
-      join(agentDir, 'evidence'),
-      join(agentDir, 'verification'),
-      join(agentDir, 'history'),
-      join(agentDir, 'debug'),
-    ];
-    for (const dir of protectedDirs) {
-      if (!existsSync(dir)) continue;
-      try {
-        const entries = readdirSync(dir, { recursive: true, withFileTypes: false });
-        for (const entry of entries) {
-          const fullPath = join(dir, String(entry));
-          try {
-            const stat = lstatSync(fullPath);
-            if (stat.isDirectory()) continue;
-            const digest = computeDigest(readFileSync(fullPath, 'utf8'));
-            preDevSystemPaths.set(fullPath, {
-              digest,
-              mode: stat.mode,
-              isSymlink: stat.isSymbolicLink(),
-            });
-          } catch { /* skip unreadable */ }
-        }
-      } catch { /* skip unreadable directory */ }
-    }
-
-    // Build Developer prompt
-    let developerPrompt: string;
-    let developerPromptFile: string | undefined;
-    try {
-      const promptResult = await buildPrompt(
-        projectRoot,
-        'developer.md',
-        (template) => buildDeveloperPrompt(template, {
-          run_id: runId,
-          iteration: 1,
-          project_root: projectRoot,
-          plan_path: join(projectRoot, '.agent/plan.md'),
-          goal_path: join(projectRoot, '.agent/GOAL.md'),
-          handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
-        }),
-        { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'developer' },
-      );
-      developerPrompt = promptResult.prompt;
-      developerPromptFile = promptResult.prompt_file_path ?? undefined;
-    } catch (err) {
-      await transitionToBlocked(stateStore, `Developer prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
-      return makeBlockedResult(runId, projectRoot, 'Developer prompt build failed', 'CONFIG_ERROR', branchResult.branch_name);
-    }
-
-    // F-306R1 fix: Wrap Developer execution in try/finally for prompt cleanup
-    // F-306R2 fix: Check cleanup result — prompt deletion failure must BLOCKED.
-    let developerResult;
-    let developerCleanupResult: PromptCleanupResult | undefined;
-    try {
-      const developerInput = buildDeveloperInput({
-        run_id: runId,
-        iteration: 1,
-        project_root: projectRoot,
-        command_template: config.agents.developer.command,
-        timeout_seconds: config.agents.developer.timeout_seconds,
-        prompt: developerPrompt,
-        prompt_file: developerPromptFile,
-        signal: params.signal,
-      });
-
-      developerResult = await runAgent(developerInput, projectRoot);
-    } finally {
-      if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
-    }
-
-    // F-306R2: Prompt cleanup failure is a security boundary — must BLOCKED
-    if (developerCleanupResult && !developerCleanupResult.success) {
-      await transitionToBlocked(stateStore, `Developer prompt cleanup failed: ${developerCleanupResult.error}`);
-      return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${developerCleanupResult.error}`, 'STATE_CONFLICT', branchResult.branch_name);
-    }
-
-    if (developerResult.status !== 'success') {
-      await transitionToBlocked(stateStore, `Developer failed: ${developerResult.error?.message ?? 'unknown'}`);
-      await appendLog(artifactStore, runId, 1, 'DEVELOPING', 'developer completed', 'FAIL', developerResult.error?.message);
-      return makeResult(runId, PhaseEnum.BLOCKED, 3, branchResult.branch_name, null, [], 'Fix Developer configuration or check agent availability', `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, developerResult.error);
-    }
-
-    // F-307R2: Register Developer agent log files in the orchestrator registry.
-    // These are created by the Process Runner infrastructure, not by the Developer agent itself.
-    if (developerResult.stdout_path && existsSync(developerResult.stdout_path)) {
-      const stdoutDigest = computeDigest(readFileSync(developerResult.stdout_path, 'utf8'));
-      orchestratorRegistry.register(developerResult.stdout_path, stdoutDigest);
-    }
-    if (developerResult.stderr_path && existsSync(developerResult.stderr_path)) {
-      const stderrDigest = computeDigest(readFileSync(developerResult.stderr_path, 'utf8'));
-      orchestratorRegistry.register(developerResult.stderr_path, stderrDigest);
-    }
-
-    // F-307R2 fix: Verify all system-protected paths after Developer call.
-    // This replaces the F-307R1 digest guard with comprehensive registry-based verification.
-    const registryVerification = await verifySystemProtectedPaths(
-      projectRoot,
-      orchestratorRegistry,
-      preDevSystemPaths,
-    );
-
-    if (!registryVerification.valid) {
-      const violationMsgs = registryVerification.violations.map(v => v.message).join('; ');
-      await transitionToBlocked(stateStore, `Developer tampered with system-protected paths: ${violationMsgs}`);
-      await appendLog(artifactStore, runId, 1, 'DEVELOPING', 'system path integrity', 'FAIL', violationMsgs);
-      return makeBlockedResult(
-        runId, projectRoot,
-        `Developer tampered with system-protected paths: ${violationMsgs}`,
-        'STATE_CONFLICT',
-        branchResult.branch_name,
-      );
-    }
-
-    // Validate Developer output
-    const developerValidation = validateDeveloperOutput(
-      projectRoot,
-      runId,
-      1,
-      preDevPlanDigest,
-      preDevGoalDigest,
-    );
-
-    if (!developerValidation.valid) {
-      await transitionToBlocked(stateStore, `Developer output validation failed: ${developerValidation.errors.join('; ')}`);
-      await appendLog(artifactStore, runId, 1, 'DEVELOPING', 'developer completed', 'FAIL', developerValidation.errors.join('; '));
-      return makeBlockedResult(runId, projectRoot, `Developer output invalid: ${developerValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', branchResult.branch_name);
-    }
-
-    // Developer BLOCKED → run enters BLOCKED
-    if (developerValidation.isBlocked) {
-      await transitionToBlocked(stateStore, 'Developer reported BLOCKED');
-      await appendLog(artifactStore, runId, 1, 'DEVELOPING', 'developer completed', 'BLOCKED', 'Developer reported BLOCKED');
-      return makeResult(runId, PhaseEnum.BLOCKED, 3, branchResult.branch_name, null, [], 'Resolve Developer BLOCKED issue and retry', 'Developer reported BLOCKED', null);
-    }
-
-    await appendLog(artifactStore, runId, 1, 'DEVELOPING', 'developer completed', 'PASS');
-
-    // Transition to VERIFYING
-    await stateStore.transition(PhaseEnum.VERIFYING);
-    await appendLog(artifactStore, runId, 1, 'VERIFYING', 'verification start', 'PASS');
-
-    // ═══════════════════════════════════════════════════════════
-    // §12.4 MECHANICAL CHECKS AND VERIFICATION
-    // ═══════════════════════════════════════════════════════════
-
-    // 1. Collect cumulative diff from base commit
-    const diffResult = await collectDiff({
-      projectRoot,
-      baseCommit,
-      iteration: 1,
-    });
-
-    // 2. Write iteration-01 evidence
-    await writeDiffArtifacts(projectRoot, 1, diffResult);
-
-    // F-307R2: Register evidence files in the orchestrator registry
-    const evidenceDir = join(agentDir, 'evidence', 'iteration-01');
-    if (existsSync(evidenceDir)) {
-      try {
-        const evidenceEntries = readdirSync(evidenceDir, { recursive: true, withFileTypes: false });
-        for (const entry of evidenceEntries) {
-          const fullPath = join(evidenceDir, String(entry));
-          try {
-            const stat = lstatSync(fullPath);
-            if (!stat.isDirectory()) {
-              const digest = computeDigest(readFileSync(fullPath, 'utf8'));
-              orchestratorRegistry.register(fullPath, digest);
-            }
-          } catch { /* skip unreadable */ }
-        }
-      } catch { /* skip unreadable directory */ }
-    }
-
-    // 3. Execute Scope Guard
+    const currentBranch = branchResult.branch_name;
     const goalFm = plannerValidation.goalFrontMatter!;
-    // F-307R2 fix: Use explicit registry paths instead of pattern-based inference.
-    // Only files the orchestrator has actually written are considered orchestrator-owned.
-    const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
-    const scopeResult = checkScope({
-      allowedChanges: goalFm.allowed_changes,
-      disallowedChanges: goalFm.disallowed_changes,
-      changedFiles: diffResult.changedFiles,
-      orchestratorOwnedFiles,
-    });
-
-    await writeScopeReport(projectRoot, 1, scopeResult.report);
-
-    // F-307R2: Register scope report in the orchestrator registry
-    const scopeReportPath = join(agentDir, 'evidence', 'iteration-01', 'scope-report.json');
-    if (existsSync(scopeReportPath)) {
-      const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
-      orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
-    }
-
-    if (!scopeResult.passed) {
-      await stateStore.transition(PhaseEnum.REWORKING);
-      const deniedPaths = scopeResult.report.denied.map(d => d.path).join(', ');
-      await appendLog(artifactStore, runId, 1, 'VERIFYING', 'scope result', 'FAIL', `Denied: ${deniedPaths}`);
-      return makeResult(
-        runId, PhaseEnum.REWORKING, 2, branchResult.branch_name, null, [],
-        'Phase 4 or manual rework needed — scope violation detected',
-        `Scope violation: ${scopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ')}`,
-        null,
-      );
-    }
-
-    await appendLog(artifactStore, runId, 1, 'VERIFYING', 'scope result', 'PASS');
-
-    // 4. Execute GOAL verification commands
     const verificationCommands = plannerValidation.verificationCommands!;
-    const verificationResult = await runVerification({
-      commands: verificationCommands,
-      projectRoot,
-      runId,
-      iteration: 1,
-    });
+    const goalDigest = plannerValidation.goalDigest!;
 
-    // F-307R2: Register verification log files in the orchestrator registry.
-    // These are created by the verification runner in .agent/verification/iteration-NN/.
-    const verificationLogDir = join(agentDir, 'verification', 'iteration-01');
-    if (existsSync(verificationLogDir)) {
-      try {
-        const logEntries = readdirSync(verificationLogDir, { recursive: true, withFileTypes: false });
-        for (const entry of logEntries) {
-          const fullPath = join(verificationLogDir, String(entry));
-          try {
-            const stat = lstatSync(fullPath);
-            if (!stat.isDirectory()) {
-              const digest = computeDigest(readFileSync(fullPath, 'utf8'));
-              orchestratorRegistry.register(fullPath, digest);
-            }
-          } catch { /* skip unreadable */ }
-        }
-      } catch { /* skip unreadable directory */ }
-    }
-
-    const requiredPassed = verificationResult.manifest.commands
-      .filter(c => c.required)
-      .every(c => c.status === 'success');
-
-    if (!requiredPassed) {
-      await stateStore.transition(PhaseEnum.REWORKING);
-      const failedCmds = verificationResult.manifest.commands
-        .filter(c => c.required && c.status !== 'success')
-        .map(c => c.id);
-      await appendLog(artifactStore, runId, 1, 'VERIFYING', 'verification result', 'FAIL', `Failed: ${failedCmds.join(', ')}`);
-      return makeResult(
-        runId, PhaseEnum.REWORKING, 2, branchResult.branch_name, null, [],
-        'Phase 4 or manual rework needed — required verification failed',
-        `Required verification failed: ${failedCmds.join(', ')}`,
-        null,
-      );
-    }
-
-    const allPassed = verificationResult.passed;
-    await appendLog(artifactStore, runId, 1, 'VERIFYING', 'verification result', allPassed ? 'PASS' : 'FAIL');
-
-    // F-307R2: Register verification manifest in the orchestrator registry
-    const verificationManifestPath = join(agentDir, 'verification', 'manifest.json');
-    if (existsSync(verificationManifestPath)) {
-      const manifestDigest = computeDigest(readFileSync(verificationManifestPath, 'utf8'));
-      orchestratorRegistry.register(verificationManifestPath, manifestDigest);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // §12.5 AUDITING
-    // ═══════════════════════════════════════════════════════════
-
-    // F-304 fix: Re-collect diff AFTER verification, because verification
-    // commands (e.g. npm test) may create or modify files. The Auditor must
-    // see the true final workspace state.
-    const postVerificationDiffResult = await collectDiff({
-      projectRoot,
-      baseCommit,
-      iteration: 1,
-    });
-    await writeDiffArtifacts(projectRoot, 1, postVerificationDiffResult);
-
-    // F-307R2: Register post-verification evidence files in the orchestrator registry
-    // (writeDiffArtifacts may have overwritten or created new evidence files)
-    if (existsSync(evidenceDir)) {
-      try {
-        const evidenceEntries = readdirSync(evidenceDir, { recursive: true, withFileTypes: false });
-        for (const entry of evidenceEntries) {
-          const fullPath = join(evidenceDir, String(entry));
-          try {
-            const stat = lstatSync(fullPath);
-            if (!stat.isDirectory()) {
-              const digest = computeDigest(readFileSync(fullPath, 'utf8'));
-              orchestratorRegistry.register(fullPath, digest);
-            }
-          } catch { /* skip unreadable */ }
-        }
-      } catch { /* skip unreadable directory */ }
-    }
-
-    // Re-run Scope Guard on the post-verification diff
-    // F-307R2 fix: Use explicit registry paths instead of pattern-based inference.
-    const postVerificationOrchestratorOwned = orchestratorRegistry.getRelativePaths(projectRoot);
-
-    const postVerificationScopeResult = checkScope({
-      allowedChanges: goalFm.allowed_changes,
-      disallowedChanges: goalFm.disallowed_changes,
-      changedFiles: postVerificationDiffResult.changedFiles,
-      orchestratorOwnedFiles: postVerificationOrchestratorOwned,
-    });
-    await writeScopeReport(projectRoot, 1, postVerificationScopeResult.report);
-
-    // F-307R2: Register post-verification scope report in the orchestrator registry
-    if (existsSync(scopeReportPath)) {
-      const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
-      orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
-    }
-
-    if (!postVerificationScopeResult.passed) {
-      await stateStore.transition(PhaseEnum.REWORKING);
-      const deniedPaths = postVerificationScopeResult.report.denied.map(d => d.path).join(', ');
-      await appendLog(artifactStore, runId, 1, 'VERIFYING', 'post-verification scope', 'FAIL', `Denied: ${deniedPaths}`);
-      return makeResult(
-        runId, PhaseEnum.REWORKING, 2, branchResult.branch_name, null, [],
-        'Phase 4 or manual rework needed — post-verification scope violation',
-        `Post-verification scope violation: ${deniedPaths}`,
-        null,
-      );
-    }
-
-    // Use the post-verification diff for the rest of the pipeline
-    const diffDigest = `sha256:${postVerificationDiffResult.diffDigest}` as Digest;
-    await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
-
-    // 3. Transition to AUDITING
-    await stateStore.transition(PhaseEnum.AUDITING);
-    await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor start', 'PASS');
-
-    // Record workspace state before Auditor
-    // F-303 fix: snapshot ALL workspace files, not just Developer-changed files,
-    // so that Auditor additions and deletions are detected.
-    const preAuditWorkspaceDigests = new Map<string, Digest>();
-    try {
-      const { execFileSync } = await import('child_process');
-      // Get all tracked files
-      const trackedResult = execFileSync('git', ['ls-files', '-z'], {
-        cwd: projectRoot,
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      const trackedFiles = trackedResult.split('\0').filter(Boolean);
-      for (const relPath of trackedFiles) {
-        const fullPath = join(projectRoot, relPath);
-        if (existsSync(fullPath)) {
-          try {
-            preAuditWorkspaceDigests.set(fullPath, computeDigest(readFileSync(fullPath, 'utf8')));
-          } catch { /* skip unreadable */ }
-        }
-      }
-      // Get untracked files too
-      const untrackedResult = execFileSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {
-        cwd: projectRoot,
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      const untrackedFiles = untrackedResult.split('\0').filter(Boolean);
-      for (const relPath of untrackedFiles) {
-        const fullPath = join(projectRoot, relPath);
-        if (existsSync(fullPath)) {
-          try {
-            preAuditWorkspaceDigests.set(fullPath, computeDigest(readFileSync(fullPath, 'utf8')));
-          } catch { /* skip unreadable */ }
-        }
-      }
-    } catch {
-      // Fallback: use only Developer-changed files (less complete but better than nothing)
-      const businessFiles = diffResult.changedFiles.files.map(f => join(projectRoot, f.path));
-      for (const filePath of businessFiles) {
-        if (existsSync(filePath)) {
-          preAuditWorkspaceDigests.set(filePath, computeDigest(readFileSync(filePath, 'utf8')));
-        }
-      }
-    }
-
-    // Build Auditor prompt
-    let auditorPrompt: string;
-    let auditorPromptFile: string | undefined;
-    try {
-      const promptResult = await buildPrompt(
-        projectRoot,
-        'auditor.md',
-        (template) => buildAuditorPrompt(template, {
-          run_id: runId,
-          iteration: 1,
-          project_root: projectRoot,
-          plan_path: join(projectRoot, '.agent/plan.md'),
-          goal_path: join(projectRoot, '.agent/GOAL.md'),
-          handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
-          verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
-          changed_files_path: join(agentDir, 'evidence', 'iteration-01', 'changed-files.json'),
-          untracked_files_path: join(agentDir, 'evidence', 'iteration-01', 'untracked-files.json'),
-          scope_report_path: join(agentDir, 'evidence', 'iteration-01', 'scope-report.json'),
-          tracked_diff_path: join(agentDir, 'evidence', 'iteration-01', 'tracked.diff'),
-          diff_metadata_path: join(agentDir, 'evidence', 'iteration-01', 'diff-metadata.json'),
-          audit_report_path: join(projectRoot, '.agent/audit-report.md'),
-          goal_digest: plannerValidation.goalDigest!,
-          diff_digest: diffDigest,
-        }),
-        { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
-      );
-      auditorPrompt = promptResult.prompt;
-      auditorPromptFile = promptResult.prompt_file_path ?? undefined;
-    } catch (err) {
-      await transitionToBlocked(stateStore, `Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
-      return makeBlockedResult(runId, projectRoot, 'Auditor prompt build failed', 'CONFIG_ERROR', branchResult.branch_name);
-    }
-
-    // F-306R1 fix: Wrap Auditor execution in try/finally for prompt cleanup
-    // F-306R2 fix: Check cleanup result — prompt deletion failure must BLOCKED.
-    let auditorResult;
-    let auditorCleanupResult: PromptCleanupResult | undefined;
-    try {
-      const auditorInput = buildAuditorInput({
-        run_id: runId,
-        iteration: 1,
-        project_root: projectRoot,
-        command_template: config.agents.auditor.command,
-        timeout_seconds: config.agents.auditor.timeout_seconds,
-        prompt: auditorPrompt,
-        prompt_file: auditorPromptFile,
-        signal: params.signal,
-      });
-
-      auditorResult = await runAgent(auditorInput, projectRoot);
-    } finally {
-      if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
-    }
-
-    // F-306R2: Prompt cleanup failure is a security boundary — must BLOCKED
-    if (auditorCleanupResult && !auditorCleanupResult.success) {
-      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
-      return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', branchResult.branch_name);
-    }
-
-    if (auditorResult.status !== 'success') {
-      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
-      await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor completed', 'FAIL', auditorResult.error?.message);
-      return makeResult(runId, PhaseEnum.BLOCKED, 3, branchResult.branch_name, null, [], 'Fix Auditor configuration or check agent availability', `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, auditorResult.error);
-    }
-
-    // F-307R2: Register Auditor agent log files in the orchestrator registry.
-    // These are created by the Process Runner infrastructure, not by the Auditor agent itself.
-    if (auditorResult.stdout_path && existsSync(auditorResult.stdout_path)) {
-      const stdoutDigest = computeDigest(readFileSync(auditorResult.stdout_path, 'utf8'));
-      orchestratorRegistry.register(auditorResult.stdout_path, stdoutDigest);
-    }
-    if (auditorResult.stderr_path && existsSync(auditorResult.stderr_path)) {
-      const stderrDigest = computeDigest(readFileSync(auditorResult.stderr_path, 'utf8'));
-      orchestratorRegistry.register(auditorResult.stderr_path, stderrDigest);
-    }
-
-    // Validate Auditor output
-    const auditValidation = await validateAuditorOutput(
-      projectRoot,
-      runId,
-      1,
-      plannerValidation.goalDigest!,
-      diffDigest,
-      preAuditWorkspaceDigests,
-    );
-
-    if (!auditValidation.valid) {
-      // Mechanical check failure overrides Auditor PASS
-      if (auditValidation.decision === 'PASS') {
-        await stateStore.transition(PhaseEnum.REWORKING);
-        await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor completed', 'FAIL', `Mechanical check failure overrides PASS: ${auditValidation.errors.join('; ')}`);
+    for (let iteration = 1; iteration <= maxIterations; iteration++) {
+      // ── Cancel check at top of iteration ──
+      const cancelReq = await checkCancelRequest(agentDir);
+      if (cancelReq) {
+        await stateStore.update(() => ({ cancel_requested_at: cancelReq.requested_at }));
+        await stateStore.transition(PhaseEnum.CANCELLED);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'cancel requested', 'CANCELLED');
         return makeResult(
-          runId, PhaseEnum.REWORKING, 2, branchResult.branch_name, null, [],
-          'Phase 4 or manual rework needed — mechanical check overrides Auditor PASS',
-          `Mechanical check failure: ${auditValidation.errors.join('; ')}`,
+          runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+          'Run cancelled by user request',
+          `Cancel requested at ${cancelReq.requested_at}`,
           null,
         );
       }
-      await transitionToBlocked(stateStore, `Auditor output validation failed: ${auditValidation.errors.join('; ')}`);
-      await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor completed', 'FAIL', auditValidation.errors.join('; '));
-      return makeBlockedResult(runId, projectRoot, `Auditor output invalid: ${auditValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', branchResult.branch_name);
-    }
 
-    // Process audit decision
-    const decision = auditValidation.effectiveDecision ?? auditValidation.decision;
+      // ── DEVELOPING (or REWORKING for iteration > 1) ──
 
-    if (decision === 'PASS') {
-      await stateStore.transition(PhaseEnum.FINALIZING);
-      await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor completed', 'PASS');
+      if (iteration > 1) {
+        // Archive previous iteration history
+        if (config.loop.archive_history) {
+          await artifactStore.archiveIterationFull(iteration - 1);
+
+          // Register all archived files in the orchestrator registry
+          // so the scope guard knows they are orchestrator-owned
+          const prevIterStr = String(iteration - 1).padStart(2, '0');
+          const historyIterDir = join(agentDir, 'history', `iteration-${prevIterStr}`);
+          registerDirectoryFiles(historyIterDir, orchestratorRegistry);
+        }
+
+        // Build rework findings from the previous iteration's failures
+        // We collect findings from scope, verification, and audit
+        const reworkFindings: ReworkFinding[] = [];
+        const evidencePaths: string[] = [];
+        const reworkVerificationCommands: string[] = [];
+
+        // Read previous scope report if it exists
+        const prevScopeReportPath = join(agentDir, 'evidence', `iteration-${String(iteration - 1).padStart(2, '0')}`, 'scope-report.json');
+        if (existsSync(prevScopeReportPath)) {
+          try {
+            const scopeReportData = JSON.parse(readFileSync(prevScopeReportPath, 'utf8'));
+            if (validateScopeReportData(scopeReportData)) {
+              reworkFindings.push(...buildReworkFindingsFromScope(scopeReportData as ScopeReportV2, iteration, projectRoot));
+              evidencePaths.push(prevScopeReportPath);
+            }
+          } catch { /* skip invalid scope report */ }
+        }
+
+        // Read previous verification manifest if it exists
+        const prevManifestPath = join(agentDir, 'verification', 'manifest.json');
+        if (existsSync(prevManifestPath)) {
+          try {
+            const manifestData = JSON.parse(readFileSync(prevManifestPath, 'utf8'));
+            reworkFindings.push(...buildReworkFindingsFromVerification(manifestData as VerificationManifest, iteration));
+            evidencePaths.push(prevManifestPath);
+          } catch { /* skip invalid manifest */ }
+        }
+
+        // Read previous audit report if it exists
+        const prevAuditPath = join(agentDir, 'audit-report.md');
+        if (existsSync(prevAuditPath)) {
+          try {
+            const auditContent = readFileSync(prevAuditPath, 'utf8');
+            reworkFindings.push(...buildReworkFindingsFromAudit(auditContent, iteration));
+            evidencePaths.push(prevAuditPath);
+          } catch { /* skip invalid audit report */ }
+        }
+
+        // Add verification commands to rework instructions
+        for (const cmd of verificationCommands) {
+          reworkVerificationCommands.push(cmd.argv.join(' '));
+        }
+
+        // Determine rework source
+        const reworkSource = reworkFindings.length > 0
+          ? reworkFindings[0].source
+          : 'audit' as const;
+
+        // Build and write rework instructions
+        const reworkContent = buildReworkInstructions({
+          run_id: runId,
+          iteration,
+          source: reworkSource,
+          findings: reworkFindings,
+          goal_path: join(projectRoot, '.agent/GOAL.md'),
+          evidence_paths: evidencePaths,
+          verification_commands: reworkVerificationCommands,
+          project_root: projectRoot,
+        });
+        await writeReworkInstructions(projectRoot, reworkContent);
+
+        // Register rework-instructions.md in the orchestrator registry
+        const reworkInstrPath = join(agentDir, 'rework-instructions.md');
+        if (existsSync(reworkInstrPath)) {
+          const reworkDigest = computeDigest(readFileSync(reworkInstrPath, 'utf8'));
+          orchestratorRegistry.register(reworkInstrPath, reworkDigest);
+        }
+
+        // Update state for new iteration
+        await stateStore.update(() => ({ iteration }));
+
+        // Transition to REWORKING only if not already in that phase.
+        // When coming from audit FAIL, the phase is already REWORKING.
+        const currentState = await stateStore.read();
+        if (currentState.phase !== PhaseEnum.REWORKING) {
+          await stateStore.transition(PhaseEnum.REWORKING);
+          await appendLog(artifactStore, runId, iteration, 'REWORKING', 'rework start', 'PASS');
+        }
+
+        // Transition to DEVELOPING for the rework iteration
+        await stateStore.transition(PhaseEnum.DEVELOPING);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer rework start', 'PASS');
+      }
+
+      // Record plan/GOAL digests before Developer
+      const preDevPlanDigest = computeDigest(readFileSync(join(projectRoot, '.agent/plan.md'), 'utf8'));
+      const preDevGoalDigest = computeDigest(readFileSync(join(projectRoot, '.agent/GOAL.md'), 'utf8'));
+
+      // Snapshot system-protected paths before Developer
+      const preDevSystemPaths = snapshotSystemPaths(agentDir);
+
+      // Build Developer prompt (initial or rework)
+      let developerPrompt: string;
+      let developerPromptFile: string | undefined;
+      try {
+        if (iteration === 1) {
+          // Initial development prompt
+          const promptResult = await buildPrompt(
+            projectRoot,
+            'developer.md',
+            (template) => buildDeveloperPrompt(template, {
+              run_id: runId,
+              iteration,
+              project_root: projectRoot,
+              plan_path: join(projectRoot, '.agent/plan.md'),
+              goal_path: join(projectRoot, '.agent/GOAL.md'),
+              handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+            }),
+            { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'developer' },
+          );
+          developerPrompt = promptResult.prompt;
+          developerPromptFile = promptResult.prompt_file_path ?? undefined;
+        } else {
+          // Rework prompt
+          const promptResult = await buildPrompt(
+            projectRoot,
+            'rework.md',
+            (template) => buildReworkPrompt(template, {
+              run_id: runId,
+              iteration,
+              project_root: projectRoot,
+              goal_path: join(projectRoot, '.agent/GOAL.md'),
+              rework_instructions_path: join(projectRoot, '.agent/rework-instructions.md'),
+              handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+            }),
+            { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'developer-rework' },
+          );
+          developerPrompt = promptResult.prompt;
+          developerPromptFile = promptResult.prompt_file_path ?? undefined;
+        }
+      } catch (err) {
+        await transitionToBlocked(stateStore, `Developer prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+        return makeBlockedResult(runId, projectRoot, 'Developer prompt build failed', 'CONFIG_ERROR', currentBranch);
+      }
+
+      // Cancel check before Developer agent call
+      const preDevCancel = await checkCancelRequest(agentDir);
+      if (preDevCancel) {
+        await stateStore.update(() => ({ cancel_requested_at: preDevCancel.requested_at }));
+        await stateStore.transition(PhaseEnum.CANCELLED);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'cancel requested', 'CANCELLED');
+        return makeResult(
+          runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+          'Run cancelled by user request',
+          `Cancel requested at ${preDevCancel.requested_at}`,
+          null,
+        );
+      }
+
+      // Execute Developer agent
+      let developerResult;
+      let developerCleanupResult: PromptCleanupResult | undefined;
+      try {
+        const developerInput = buildDeveloperInput({
+          run_id: runId,
+          iteration,
+          project_root: projectRoot,
+          command_template: config.agents.developer.command,
+          timeout_seconds: config.agents.developer.timeout_seconds,
+          prompt: developerPrompt,
+          prompt_file: developerPromptFile,
+          signal: params.signal,
+        });
+
+        developerResult = await runAgent(developerInput, projectRoot);
+      } finally {
+        if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
+      }
+
+      if (developerCleanupResult && !developerCleanupResult.success) {
+        await transitionToBlocked(stateStore, `Developer prompt cleanup failed: ${developerCleanupResult.error}`);
+        return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${developerCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
+      }
+
+      if (developerResult.status !== 'success') {
+        await transitionToBlocked(stateStore, `Developer failed: ${developerResult.error?.message ?? 'unknown'}`);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'FAIL', developerResult.error?.message);
+        return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Developer configuration or check agent availability', `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, developerResult.error);
+      }
+
+      // Register Developer agent log files
+      registerAgentLogs(developerResult, orchestratorRegistry);
+
+      // Verify system-protected paths after Developer
+      const registryVerification = await verifySystemProtectedPaths(
+        projectRoot,
+        orchestratorRegistry,
+        preDevSystemPaths,
+      );
+
+      if (!registryVerification.valid) {
+        const violationMsgs = registryVerification.violations.map(v => v.message).join('; ');
+        await transitionToBlocked(stateStore, `Developer tampered with system-protected paths: ${violationMsgs}`);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'system path integrity', 'FAIL', violationMsgs);
+        return makeBlockedResult(
+          runId, projectRoot,
+          `Developer tampered with system-protected paths: ${violationMsgs}`,
+          'STATE_CONFLICT',
+          currentBranch,
+        );
+      }
+
+      // Validate Developer output
+      const developerValidation = validateDeveloperOutput(
+        projectRoot,
+        runId,
+        iteration,
+        preDevPlanDigest,
+        preDevGoalDigest,
+      );
+
+      if (!developerValidation.valid) {
+        await transitionToBlocked(stateStore, `Developer output validation failed: ${developerValidation.errors.join('; ')}`);
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'FAIL', developerValidation.errors.join('; '));
+        return makeBlockedResult(runId, projectRoot, `Developer output invalid: ${developerValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', currentBranch);
+      }
+
+      if (developerValidation.isBlocked) {
+        await transitionToBlocked(stateStore, 'Developer reported BLOCKED');
+        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'BLOCKED', 'Developer reported BLOCKED');
+        return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Resolve Developer BLOCKED issue and retry', 'Developer reported BLOCKED', null);
+      }
+
+      await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'PASS');
+
+      // ── VERIFYING ──
+
+      await stateStore.transition(PhaseEnum.VERIFYING);
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification start', 'PASS');
+
+      // 1. Collect diff from base commit
+      const diffResult = await collectDiff({
+        projectRoot,
+        baseCommit,
+        iteration,
+      });
+
+      // 2. Write iteration evidence
+      await writeDiffArtifacts(projectRoot, iteration, diffResult);
+
+      // Register evidence files
+      registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
+
+      // 3. Execute Scope Guard
+      const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
+      const scopeResult = checkScope({
+        allowedChanges: goalFm.allowed_changes,
+        disallowedChanges: goalFm.disallowed_changes,
+        changedFiles: diffResult.changedFiles,
+        orchestratorOwnedFiles,
+      });
+
+      await writeScopeReport(projectRoot, iteration, scopeResult.report);
+
+      // Register scope report
+      const scopeReportPath = join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`, 'scope-report.json');
+      if (existsSync(scopeReportPath)) {
+        const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
+        orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
+      }
+
+      if (!scopeResult.passed) {
+        await stateStore.transition(PhaseEnum.REWORKING);
+        const deniedPaths = scopeResult.report.denied.map(d => d.path).join(', ');
+        await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'FAIL', `Denied: ${deniedPaths}`);
+
+        // If max iterations reached, transition to FAILED
+        if (iteration >= maxIterations) {
+          await stateStore.transition(PhaseEnum.FAILED);
+          return makeResult(
+            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+            'Max iterations reached — scope violation persists',
+            `Scope violation after ${maxIterations} iterations: ${scopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ')}`,
+            null,
+          );
+        }
+
+        // Continue to next iteration for rework
+        continue;
+      }
+
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'PASS');
+
+      // 4. Execute GOAL verification commands
+      const verificationResult = await runVerification({
+        commands: verificationCommands,
+        projectRoot,
+        runId,
+        iteration,
+      });
+
+      // Register verification log files
+      registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
+
+      const requiredPassed = verificationResult.manifest.commands
+        .filter(c => c.required)
+        .every(c => c.status === 'success');
+
+      if (!requiredPassed) {
+        await stateStore.transition(PhaseEnum.REWORKING);
+        const failedCmds = verificationResult.manifest.commands
+          .filter(c => c.required && c.status !== 'success')
+          .map(c => c.id);
+        await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', 'FAIL', `Failed: ${failedCmds.join(', ')}`);
+
+        if (iteration >= maxIterations) {
+          await stateStore.transition(PhaseEnum.FAILED);
+          return makeResult(
+            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+            'Max iterations reached — required verification still fails',
+            `Required verification failed after ${maxIterations} iterations: ${failedCmds.join(', ')}`,
+            null,
+          );
+        }
+
+        continue;
+      }
+
+      const allPassed = verificationResult.passed;
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', allPassed ? 'PASS' : 'FAIL');
+
+      // Register verification manifest
+      const verificationManifestPath = join(agentDir, 'verification', 'manifest.json');
+      if (existsSync(verificationManifestPath)) {
+        const manifestDigest = computeDigest(readFileSync(verificationManifestPath, 'utf8'));
+        orchestratorRegistry.register(verificationManifestPath, manifestDigest);
+      }
+
+      // ── AUDITING ──
+
+      // Re-collect diff AFTER verification
+      const postVerificationDiffResult = await collectDiff({
+        projectRoot,
+        baseCommit,
+        iteration,
+      });
+      await writeDiffArtifacts(projectRoot, iteration, postVerificationDiffResult);
+
+      // Register post-verification evidence
+      registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
+
+      // Re-run Scope Guard on post-verification diff
+      const postVerificationOrchestratorOwned = orchestratorRegistry.getRelativePaths(projectRoot);
+      const postVerificationScopeResult = checkScope({
+        allowedChanges: goalFm.allowed_changes,
+        disallowedChanges: goalFm.disallowed_changes,
+        changedFiles: postVerificationDiffResult.changedFiles,
+        orchestratorOwnedFiles: postVerificationOrchestratorOwned,
+      });
+      await writeScopeReport(projectRoot, iteration, postVerificationScopeResult.report);
+
+      if (existsSync(scopeReportPath)) {
+        const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
+        orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
+      }
+
+      if (!postVerificationScopeResult.passed) {
+        await stateStore.transition(PhaseEnum.REWORKING);
+        const deniedPaths = postVerificationScopeResult.report.denied.map(d => d.path).join(', ');
+        await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'post-verification scope', 'FAIL', `Denied: ${deniedPaths}`);
+
+        if (iteration >= maxIterations) {
+          await stateStore.transition(PhaseEnum.FAILED);
+          return makeResult(
+            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+            'Max iterations reached — post-verification scope violation persists',
+            `Post-verification scope violation after ${maxIterations} iterations: ${deniedPaths}`,
+            null,
+          );
+        }
+
+        continue;
+      }
+
+      const diffDigest = `sha256:${postVerificationDiffResult.diffDigest}` as Digest;
+      await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
+
+      // Transition to AUDITING
+      await stateStore.transition(PhaseEnum.AUDITING);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor start', 'PASS');
+
+      // Record workspace state before Auditor
+      const preAuditWorkspaceDigests = await snapshotWorkspaceDigests(projectRoot, diffResult);
+
+      // Build Auditor prompt
+      let auditorPrompt: string;
+      let auditorPromptFile: string | undefined;
+      try {
+        const iterStr = String(iteration).padStart(2, '0');
+        const promptResult = await buildPrompt(
+          projectRoot,
+          'auditor.md',
+          (template) => buildAuditorPrompt(template, {
+            run_id: runId,
+            iteration,
+            project_root: projectRoot,
+            plan_path: join(projectRoot, '.agent/plan.md'),
+            goal_path: join(projectRoot, '.agent/GOAL.md'),
+            handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+            verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
+            changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
+            untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
+            scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
+            tracked_diff_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'tracked.diff'),
+            diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
+            audit_report_path: join(projectRoot, '.agent/audit-report.md'),
+            goal_digest: goalDigest,
+            diff_digest: diffDigest,
+          }),
+          { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
+        );
+        auditorPrompt = promptResult.prompt;
+        auditorPromptFile = promptResult.prompt_file_path ?? undefined;
+      } catch (err) {
+        await transitionToBlocked(stateStore, `Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+        return makeBlockedResult(runId, projectRoot, 'Auditor prompt build failed', 'CONFIG_ERROR', currentBranch);
+      }
+
+      // Cancel check before Auditor agent call
+      const preAuditCancel = await checkCancelRequest(agentDir);
+      if (preAuditCancel) {
+        await stateStore.update(() => ({ cancel_requested_at: preAuditCancel.requested_at }));
+        await stateStore.transition(PhaseEnum.CANCELLED);
+        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'cancel requested', 'CANCELLED');
+        return makeResult(
+          runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+          'Run cancelled by user request',
+          `Cancel requested at ${preAuditCancel.requested_at}`,
+          null,
+        );
+      }
+
+      // Execute Auditor agent
+      let auditorResult;
+      let auditorCleanupResult: PromptCleanupResult | undefined;
+      try {
+        const auditorInput = buildAuditorInput({
+          run_id: runId,
+          iteration,
+          project_root: projectRoot,
+          command_template: config.agents.auditor.command,
+          timeout_seconds: config.agents.auditor.timeout_seconds,
+          prompt: auditorPrompt,
+          prompt_file: auditorPromptFile,
+          signal: params.signal,
+        });
+
+        auditorResult = await runAgent(auditorInput, projectRoot);
+      } finally {
+        if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
+      }
+
+      if (auditorCleanupResult && !auditorCleanupResult.success) {
+        await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
+        return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
+      }
+
+      if (auditorResult.status !== 'success') {
+        await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
+        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditorResult.error?.message);
+        return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Auditor configuration or check agent availability', `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, auditorResult.error);
+      }
+
+      // Register Auditor agent log files
+      registerAgentLogs(auditorResult, orchestratorRegistry);
+
+      // Register audit-report.md in the orchestrator registry
+      // (written by the Auditor agent, but orchestrator-owned for scope purposes)
+      const auditReportPath = join(agentDir, 'audit-report.md');
+      if (existsSync(auditReportPath)) {
+        const auditReportDigest = computeDigest(readFileSync(auditReportPath, 'utf8'));
+        orchestratorRegistry.register(auditReportPath, auditReportDigest);
+      }
+
+      // Validate Auditor output
+      const auditValidation = await validateAuditorOutput(
+        projectRoot,
+        runId,
+        iteration,
+        goalDigest,
+        diffDigest,
+        preAuditWorkspaceDigests,
+      );
+
+      if (!auditValidation.valid) {
+        if (auditValidation.decision === 'PASS') {
+          await stateStore.transition(PhaseEnum.REWORKING);
+          await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', `Mechanical check failure overrides PASS: ${auditValidation.errors.join('; ')}`);
+
+          if (iteration >= maxIterations) {
+            await stateStore.transition(PhaseEnum.FAILED);
+            return makeResult(
+              runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+              'Max iterations reached — mechanical check overrides Auditor PASS',
+              `Mechanical check failure after ${maxIterations} iterations: ${auditValidation.errors.join('; ')}`,
+              null,
+            );
+          }
+
+          continue;
+        }
+        await transitionToBlocked(stateStore, `Auditor output validation failed: ${auditValidation.errors.join('; ')}`);
+        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditValidation.errors.join('; '));
+        return makeBlockedResult(runId, projectRoot, `Auditor output invalid: ${auditValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', currentBranch);
+      }
+
+      // Process audit decision
+      const decision = auditValidation.effectiveDecision ?? auditValidation.decision;
+
+      if (decision === 'PASS') {
+        await stateStore.transition(PhaseEnum.FINALIZING);
+        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'PASS');
+        return makeResult(
+          runId, PhaseEnum.FINALIZING, 0, currentBranch, 'PASS',
+          ['.agent/plan.md', '.agent/GOAL.md', '.agent/developer-handoff.md', '.agent/audit-report.md'],
+          'Audit PASSED. Not yet committed — Phase 5 will handle finalization.',
+          'Audit PASSED. Not yet committed.',
+          null,
+        );
+      }
+
+      if (decision === 'FAIL') {
+        await stateStore.transition(PhaseEnum.REWORKING);
+        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL');
+
+        if (iteration >= maxIterations) {
+          await stateStore.transition(PhaseEnum.FAILED);
+          return makeResult(
+            runId, PhaseEnum.FAILED, 2, currentBranch, 'FAIL', [],
+            'Max iterations reached — Auditor still returns FAIL',
+            `Auditor FAIL after ${maxIterations} iterations. Not yet committed.`,
+            null,
+          );
+        }
+
+        // Continue to next iteration for rework
+        continue;
+      }
+
+      // BLOCKED — no rework
+      await transitionToBlocked(stateStore, 'Auditor returned BLOCKED');
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'BLOCKED');
       return makeResult(
-        runId, PhaseEnum.FINALIZING, 0, branchResult.branch_name, 'PASS',
-        ['.agent/plan.md', '.agent/GOAL.md', '.agent/developer-handoff.md', '.agent/audit-report.md'],
-        'Audit PASSED. Not yet committed — Phase 5 will handle finalization.',
-        'Audit PASSED. Not yet committed.',
+        runId, PhaseEnum.BLOCKED, 3, currentBranch, 'BLOCKED', [],
+        'Resolve BLOCKED issue and retry',
+        'Auditor returned BLOCKED.',
         null,
       );
-    }
+    } // end iteration loop
 
-    if (decision === 'FAIL') {
-      await stateStore.transition(PhaseEnum.REWORKING);
-      await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor completed', 'FAIL');
-      return makeResult(
-        runId, PhaseEnum.REWORKING, 2, branchResult.branch_name, 'FAIL', [],
-        'Phase 4 or manual rework needed — Auditor FAIL',
-        'Auditor returned FAIL. Not yet committed.',
-        null,
-      );
-    }
-
-    // BLOCKED
-    await transitionToBlocked(stateStore, 'Auditor returned BLOCKED');
-    await appendLog(artifactStore, runId, 1, 'AUDITING', 'auditor completed', 'BLOCKED');
+    // If we exit the loop without returning, max iterations was reached
+    await stateStore.transition(PhaseEnum.FAILED);
     return makeResult(
-      runId, PhaseEnum.BLOCKED, 3, branchResult.branch_name, 'BLOCKED', [],
-      'Resolve BLOCKED issue and retry',
-      'Auditor returned BLOCKED.',
+      runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+      `Max iterations (${maxIterations}) reached without passing audit`,
+      `Failed after ${maxIterations} iterations`,
       null,
     );
 
@@ -1201,11 +1241,12 @@ function makeResult(
 
 function makeBlockedResult(
   runId: string,
-  _projectRoot: string,
+  projectRoot: string,
   message: string,
   code: ErrorCategory,
   branch?: string,
 ): OrchestratorResult {
+  void projectRoot; // kept for API consistency — may be used in logging/future features
   return makeResult(
     runId,
     PhaseEnum.BLOCKED,
@@ -1222,4 +1263,190 @@ function makeBlockedResult(
       suggested_action: 'Check configuration and try again',
     },
   );
+}
+
+// ─── Phase 4 Helper Functions ────────────────────────────────
+
+/**
+ * Check for a cancel request in .agent/cancel-request.json.
+ * Returns the parsed CancelRequest if present and valid, or null.
+ */
+async function checkCancelRequest(agentDir: string): Promise<CancelRequest | null> {
+  const cancelPath = join(agentDir, 'cancel-request.json');
+  if (!existsSync(cancelPath)) return null;
+
+  try {
+    const raw = readFileSync(cancelPath, 'utf8');
+    const data = JSON.parse(raw);
+    if (validateCancelRequest(data)) {
+      return data as CancelRequest;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Snapshot all system-protected paths before Developer call.
+ * Returns a Map of absolute paths to their digest, mode, and symlink status.
+ */
+function snapshotSystemPaths(
+  agentDir: string,
+): Map<string, { digest: string; mode: number; isSymlink: boolean }> {
+  const paths = new Map<string, { digest: string; mode: number; isSymlink: boolean }>();
+
+  // Static protected files
+  const staticProtectedFiles = [
+    join(agentDir, 'state.json'),
+    join(agentDir, 'run.lock'),
+    join(agentDir, 'iteration-log.md'),
+    join(agentDir, 'plan.md'),
+    join(agentDir, 'GOAL.md'),
+  ];
+  for (const filePath of staticProtectedFiles) {
+    if (existsSync(filePath)) {
+      try {
+        const stat = lstatSync(filePath);
+        if (!stat.isDirectory()) {
+          const digest = computeDigest(readFileSync(filePath, 'utf8'));
+          paths.set(filePath, {
+            digest,
+            mode: stat.mode,
+            isSymlink: stat.isSymbolicLink(),
+          });
+        }
+      } catch { /* skip unreadable */ }
+    }
+  }
+
+  // All files in system-protected directories
+  const protectedDirs = [
+    join(agentDir, 'evidence'),
+    join(agentDir, 'verification'),
+    join(agentDir, 'history'),
+    join(agentDir, 'debug'),
+  ];
+  for (const dir of protectedDirs) {
+    if (!existsSync(dir)) continue;
+    try {
+      const entries = readdirSync(dir, { recursive: true, withFileTypes: false });
+      for (const entry of entries) {
+        const fullPath = join(dir, String(entry));
+        try {
+          const stat = lstatSync(fullPath);
+          if (stat.isDirectory()) continue;
+          const digest = computeDigest(readFileSync(fullPath, 'utf8'));
+          paths.set(fullPath, {
+            digest,
+            mode: stat.mode,
+            isSymlink: stat.isSymbolicLink(),
+          });
+        } catch { /* skip unreadable */ }
+      }
+    } catch { /* skip unreadable directory */ }
+  }
+
+  return paths;
+}
+
+/**
+ * Register agent stdout/stderr log files in the orchestrator registry.
+ */
+function registerAgentLogs(
+  agentResult: { stdout_path?: string; stderr_path?: string },
+  registry: OrchestratorFileRegistry,
+): void {
+  if (agentResult.stdout_path && existsSync(agentResult.stdout_path)) {
+    const stdoutDigest = computeDigest(readFileSync(agentResult.stdout_path, 'utf8'));
+    registry.register(agentResult.stdout_path, stdoutDigest);
+  }
+  if (agentResult.stderr_path && existsSync(agentResult.stderr_path)) {
+    const stderrDigest = computeDigest(readFileSync(agentResult.stderr_path, 'utf8'));
+    registry.register(agentResult.stderr_path, stderrDigest);
+  }
+}
+
+/**
+ * Register all files in a directory in the orchestrator registry.
+ */
+function registerDirectoryFiles(dirPath: string, registry: OrchestratorFileRegistry): void {
+  if (!existsSync(dirPath)) return;
+  try {
+    const entries = readdirSync(dirPath, { recursive: true, withFileTypes: false });
+    for (const entry of entries) {
+      const fullPath = join(dirPath, String(entry));
+      try {
+        const stat = lstatSync(fullPath);
+        if (stat.isDirectory()) continue;
+        const digest = computeDigest(readFileSync(fullPath, 'utf8'));
+        registry.register(fullPath, digest);
+      } catch { /* skip unreadable */ }
+    }
+  } catch { /* skip unreadable directory */ }
+}
+
+/**
+ * Basic validation that a parsed object looks like a ScopeReportV2.
+ */
+function validateScopeReportData(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false;
+  const obj = data as Record<string, unknown>;
+  return typeof obj.schema_version === 'number'
+    && typeof obj.passed === 'boolean'
+    && Array.isArray(obj.denied);
+}
+
+/**
+ * Snapshot workspace digests before Auditor call.
+ * Uses git ls-files to enumerate all tracked and untracked files,
+ * then computes digests for each.
+ */
+async function snapshotWorkspaceDigests(
+  projectRoot: string,
+  diffResult: { changedFiles: { files: Array<{ path: string }> } },
+): Promise<Map<string, Digest>> {
+  const digests = new Map<string, Digest>();
+  try {
+    const { execFileSync } = await import('child_process');
+    // Get all tracked files
+    const trackedResult = execFileSync('git', ['ls-files', '-z'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const trackedFiles = trackedResult.split('\0').filter(Boolean);
+    for (const relPath of trackedFiles) {
+      const fullPath = join(projectRoot, relPath);
+      if (existsSync(fullPath)) {
+        try {
+          digests.set(fullPath, computeDigest(readFileSync(fullPath, 'utf8')));
+        } catch { /* skip unreadable */ }
+      }
+    }
+    // Get untracked files too
+    const untrackedResult = execFileSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const untrackedFiles = untrackedResult.split('\0').filter(Boolean);
+    for (const relPath of untrackedFiles) {
+      const fullPath = join(projectRoot, relPath);
+      if (existsSync(fullPath)) {
+        try {
+          digests.set(fullPath, computeDigest(readFileSync(fullPath, 'utf8')));
+        } catch { /* skip unreadable */ }
+      }
+    }
+  } catch {
+    // Fallback: use only Developer-changed files
+    const businessFiles = diffResult.changedFiles.files.map(f => join(projectRoot, f.path));
+    for (const filePath of businessFiles) {
+      if (existsSync(filePath)) {
+        digests.set(filePath, computeDigest(readFileSync(filePath, 'utf8')));
+      }
+    }
+  }
+  return digests;
 }

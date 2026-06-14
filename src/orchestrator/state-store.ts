@@ -29,6 +29,7 @@ function phaseToStageKey(phase: Phase): string | undefined {
   switch (phase) {
     case PhaseEnum.PLANNING: return 'planning';
     case PhaseEnum.DEVELOPING: return 'developing';
+    case PhaseEnum.REWORKING: return 'developing'; // rework is part of the developing stage
     case PhaseEnum.VERIFYING: return 'verifying';
     case PhaseEnum.AUDITING: return 'auditing';
     case PhaseEnum.FINALIZING: return 'finalizing';
@@ -43,7 +44,7 @@ const STATE_SCHEMA = {
     'schema_version', 'run_id', 'task_slug', 'phase', 'iteration',
     'max_iterations', 'project_root', 'base_commit', 'branch',
     'goal_digest', 'audited_diff_digest', 'started_at', 'updated_at',
-    'last_error', 'stages',
+    'last_error', 'cancel_requested_at', 'stages',
   ],
   properties: {
     schema_version: { type: 'number', const: 1 },
@@ -63,6 +64,7 @@ const STATE_SCHEMA = {
     started_at: { type: 'string' },
     updated_at: { type: 'string' },
     last_error: { type: ['string', 'null'] },
+    cancel_requested_at: { type: ['string', 'null'] },
     stages: {
       type: 'object',
       additionalProperties: {
@@ -267,6 +269,7 @@ export class StateStore {
       started_at: now,
       updated_at: now,
       last_error: null,
+      cancel_requested_at: null,
       stages: defaultStages,
     };
   }

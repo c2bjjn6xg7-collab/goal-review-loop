@@ -23,6 +23,7 @@ import type {
   AuditReportFrontMatter,
   FinalAuditFrontMatter,
   IterationLogEntry,
+  ReworkInstructionsFrontMatter,
 } from '../types.js';
 
 const ajv = new Ajv({ allErrors: true, strict: false });
@@ -480,6 +481,52 @@ export function parseIterationLog(content: string, filePath?: string): Iteration
   }
 
   return entries;
+}
+
+// ─── Rework Instructions Schema ───────────────────────────────
+// Phase 4 §7: Orchestrator-authored rework instructions for Developer.
+
+const REWORK_INSTRUCTIONS_SCHEMA = {
+  type: 'object',
+  required: ['schema_version', 'run_id', 'iteration', 'author_role', 'source', 'status'],
+  properties: {
+    schema_version: { type: 'number', const: 1 },
+    run_id: { type: 'string', minLength: 1 },
+    iteration: { type: 'number', minimum: 2, multipleOf: 1 },
+    author_role: { type: 'string', const: 'orchestrator' },
+    source: { type: 'string', enum: ['scope', 'verification', 'audit', 'artifact'] },
+    status: { type: 'string', const: 'REWORK_REQUIRED' },
+  },
+  additionalProperties: true,
+} as const;
+
+const validateReworkInstructionsFM = ajv.compile(REWORK_INSTRUCTIONS_SCHEMA);
+
+export function parseReworkInstructions(content: string, filePath?: string): FrontMatterResult<ReworkInstructionsFrontMatter> {
+  const { frontMatter, body } = parseFrontMatter<Record<string, unknown>>(content, filePath);
+
+  if (!validateReworkInstructionsFM(frontMatter)) {
+    const errors = validateReworkInstructionsFM.errors
+      ?.map((e: { instancePath: string; message?: string }) => `${e.instancePath}: ${e.message}`)
+      .join('; ');
+    throw new Error(`Invalid rework-instructions.md front matter: ${errors}`);
+  }
+
+  validateRequiredFields(
+    frontMatter,
+    ['schema_version', 'run_id', 'iteration', 'author_role', 'source', 'status'],
+    filePath,
+  );
+  validateEnumField(frontMatter, 'author_role', ['orchestrator'], filePath);
+  validateEnumField(frontMatter, 'source', ['scope', 'verification', 'audit', 'artifact'], filePath);
+  validateEnumField(frontMatter, 'status', ['REWORK_REQUIRED'], filePath);
+
+  const iteration = (frontMatter as Record<string, unknown>).iteration;
+  if (typeof iteration === 'number' && iteration < 2) {
+    throw new Error(`rework-instructions.md iteration must be >= 2${filePath ? ` in ${filePath}` : ''}`);
+  }
+
+  return { frontMatter: frontMatter as unknown as ReworkInstructionsFrontMatter, body };
 }
 
 // ─── GOAL Command Normalization ──────────────────────────────

@@ -255,3 +255,57 @@ export const validateUntrackedFiles = ajv.compile(untrackedFilesSchema);
 export const validateDiffMetadata = ajv.compile(diffMetadataSchema);
 export const validateScopeReport = ajv.compile(scopeReportSchema);
 export const validateVerificationManifest = ajv.compile(verificationManifestSchema);
+
+// ─── Phase 4 Schemas ──────────────────────────────────────────
+
+export const cancelRequestSchema: Schema = {
+  type: 'object',
+  properties: {
+    schema_version: { type: 'number', const: 1 },
+    run_id: { type: 'string', minLength: 1 },
+    requested_at: { type: 'string', format: 'iso8601' },
+    requested_by: { type: 'string', minLength: 1 },
+  },
+  required: ['schema_version', 'run_id', 'requested_at', 'requested_by'],
+  additionalProperties: false,
+};
+
+export const reworkInstructionsFrontMatterSchema: Schema = {
+  type: 'object',
+  properties: {
+    schema_version: { type: 'number', const: 1 },
+    run_id: { type: 'string', minLength: 1 },
+    iteration: { type: 'integer', minimum: 2 },
+    author_role: { type: 'string', const: 'orchestrator' },
+    source: { type: 'string', enum: ['scope', 'verification', 'audit', 'artifact'] },
+    status: { type: 'string', const: 'REWORK_REQUIRED' },
+  },
+  required: ['schema_version', 'run_id', 'iteration', 'author_role', 'source', 'status'],
+  additionalProperties: false,
+};
+
+export const statusOutputSchema: Schema = {
+  type: 'object',
+  properties: {
+    run_id: { type: 'string', minLength: 1 },
+    phase: { type: 'string' },
+    iteration: { type: 'number', minimum: 0 },
+    max_iterations: { type: 'number', minimum: 1 },
+    branch: { type: 'string' },
+    base_commit: { type: 'string' },
+    goal_digest: { type: ['string', 'null'] },
+    audited_diff_digest: { type: ['string', 'null'] },
+    last_error: { type: ['object', 'null'] },
+    lock_status: { type: 'string', enum: ['held', 'stale', 'none'] },
+    lock_info: { type: ['object', 'null'] },
+    started_at: { type: 'string' },
+    updated_at: { type: 'string' },
+    next_step: { type: 'string', minLength: 1 },
+  },
+  required: ['run_id', 'phase', 'iteration', 'max_iterations', 'branch', 'base_commit', 'goal_digest', 'audited_diff_digest', 'last_error', 'lock_status', 'lock_info', 'started_at', 'updated_at', 'next_step'],
+  additionalProperties: false,
+};
+
+export const validateCancelRequest = ajv.compile(cancelRequestSchema);
+export const validateReworkInstructionsFrontMatter = ajv.compile(reworkInstructionsFrontMatterSchema);
+export const validateStatusOutput = ajv.compile(statusOutputSchema);

@@ -99,8 +99,8 @@ describe('State Machine', () => {
       }
     });
 
-    it('should reject REWORKING → DEVELOPING (must go to VERIFYING)', () => {
-      expect(isLegalTransition(Phase.REWORKING, Phase.DEVELOPING)).toBe(false);
+    it('should allow REWORKING → DEVELOPING (rework iteration)', () => {
+      expect(isLegalTransition(Phase.REWORKING, Phase.DEVELOPING)).toBe(true);
     });
 
     it('should allow REWORKING → FAILED (max iterations reached)', () => {
