@@ -1,52 +1,95 @@
 ---
 schema_version: 1
-run_id: phase3-dev
-iteration: 5
+run_id: phase4-dev
+iteration: 6
 author_role: developer
 status: COMPLETED
 ---
 
-# Phase 3 Developer Handoff - Iteration 5
+# Phase 4 Developer Handoff - Iteration 6
 
 ## Summary
 
-F-315R1: Tightened scope guard dependency cache exclusion to **untracked-only**.
-Prior F-315 excluded all `node_modules/**` / `.yarn/**` / `.pnp.cjs` regardless of
-tracking status — a tracked-and-modified `.pnp.cjs` or `.yarn/plugins/...` would
-bypass `allowed_changes` and yield `passed: true`. This iteration restricts the
-exclusion to `file.status === 'untracked' && file.tracked === false` and narrows
-`.yarn/**` to explicit cache sub-paths only.
+Phase 4 adds the auto-rework loop, resume/cancel/status CLI commands, and
+comprehensive integration test coverage. Six review findings (F-401 through
+F-406) were addressed in this iteration.
 
-Run 5 (`20260613160600-0s08po`) confirmed the full Planner → Developer → Auditor →
-FINALIZING chain with real Claude Sonnet. SC-15 now PASS.
+The system now automatically reworks failures without user intervention,
+preserving per-iteration evidence. Resume re-enters the orchestrator loop
+at the correct phase. Cancel uses SIGTERM + AbortController for graceful
+shutdown. Archive idempotency is enforced before overwriting history.
 
-## Fixes Applied (Iteration 5)
+## Fixes Applied (Iteration 6)
 
-### F-315R1 — Scope guard dependency cache exclusion bypass
+### F-401 (Critical) — Resume is a no-op
 
-**Root cause**: `checkScope()` excluded files matching `DEPENDENCY_CACHE_PATTERNS`
-regardless of tracking status. A tracked-and-modified `.pnp.cjs` or
-`.yarn/plugins/@yarnpkg/plugin-interactive-tools.cjs` would be placed in
-`excluded_dependency_cache` and bypass `allowed_changes`, yielding `passed: true`.
+**Root cause**: `executeResume()` only printed messages and returned; it never
+called `runOrchestrator()`.
 
-**Fix** (3 changes in `src/scope/scope-guard.ts`):
+**Fix**: `executeResume()` now builds a `ResumeContext` from the saved state
+and calls `runOrchestrator({ resume_from: context })`. The orchestrator's
+resume path re-acquires the lock, validates consistency, and re-enters the
+iteration loop at the correct phase via `runIterationLoop()`.
 
-1. **Guard condition**: Changed from path-only match to
-   `file.status === 'untracked' && file.tracked === false && matchesPattern(...)`.
-   Tracked dependency files must now pass `allowed_changes` like any other file.
+### F-402 (Critical) — Cancel can't guarantee CANCELLED state
 
-2. **Narrowed patterns**: Removed `.yarn/**` (too broad), `.pnp.cjs`, `.pnp.loader.mjs`
-   (these are tracked project source in Yarn PnP repos). Replaced with explicit
-   cache sub-paths:
-   - `.yarn/cache/**`
-   - `.yarn/unplugged/**`
-   - `.yarn/install-state.gz`
+**Root cause**: No SIGTERM handler and no AbortController wiring.
 
-3. **Comment updated**: F-315 → F-315R1, explains untracked-only rationale.
+**Fix**: Added `AbortController` at the top of `runOrchestrator()`. A SIGTERM
+handler writes `.agent/cancel-request.json` (best-effort) and calls
+`abortController.abort()`. The parent signal is chained into the combined
+signal. All agent calls use `combinedSignal`. The handler is removed in the
+finally block.
 
-**Files changed**:
-- `src/scope/scope-guard.ts` — pattern list + guard condition + comment
-- `tests/unit/scope-guard.test.ts` — 9 F-315R1 regression tests (replaced 7 F-315 tests)
+### F-403 (High) — Resume consistency checks missing git validation
+
+**Root cause**: `validateResumeConsistency()` only checked cwd and GOAL digest.
+
+**Fix**: Added git branch check (`git rev-parse --abbrev-ref HEAD` must match
+`state.branch`) and base_commit check (`git cat-file -t` must succeed). These
+checks are also performed inside `runOrchestrator()`'s resume path for
+defense-in-depth.
+
+### F-404 (High) — Integration tests don't really cover resume/cancel
+
+**Root cause**: Original scenarios 10-16 were placeholder/fake tests.
+
+**Fix**: Rewrote scenarios 10-16 as real integration tests:
+- Scenario 10: Resume from VERIFYING → re-runs verification → FINALIZING
+- Scenario 11: Resume with branch mismatch → BLOCKED
+- Scenario 12: Resume with GOAL digest mismatch → BLOCKED
+- Scenario 13: Cancel during Developer → CANCELLED
+- Scenario 15: Resume from AUDITING → FINALIZING
+- Scenario 16: Archive digest mismatch → BLOCKED
+
+### F-405 (Medium) — Developer handoff and audit report not updated
+
+**Fix**: This document and the audit report are updated for Phase 4.
+
+### F-406 (Medium) — verifyArchiveIdempotent not wired into main flow
+
+**Root cause**: `verifyArchiveIdempotent()` was implemented but never called.
+
+**Fix**: Added idempotency check before `archiveIterationFull()` in the
+iteration loop. If the archive already exists with different digests, the
+run transitions to BLOCKED.
+
+## Additional Changes
+
+- **`runIterationLoop()` extracted**: The iteration loop body is now a separate
+  function called by both the normal path and the resume path.
+- **`shouldSkipDeveloper` / `shouldSkipVerifying` flags**: When resuming from
+  VERIFYING or AUDITING, the developer and/or verification phases are skipped
+  on the first iteration.
+- **Phase transition guards**: Only transition to VERIFYING/AUDITING if not
+  already in that phase (prevents `Illegal state transition` errors on resume).
+- **REWORKING → DEVELOPING transition**: Added to legal transitions in
+  `src/types.ts` for rework iterations.
+- **Scope guard exclusions**: Added `audit-report.md` and
+  `rework-instructions.md` to `SYSTEM_PROTECTED_PATHS` and
+  `ORCHESTRATOR_OWNED_PATTERNS`.
+- **Orchestrator registry**: Registers audit-report.md after auditor runs,
+  registers history files after archiving.
 
 ## Verification Results
 
@@ -54,14 +97,16 @@ regardless of tracking status. A tracked-and-modified `.pnp.cjs` or
 npm run typecheck: PASS (0 errors)
 npm run lint: PASS (0 errors, 0 warnings)
 npm run build: PASS
-npm test: 526 tests passed (28 files)
-npm pack --dry-run: 120 files, 113.6 kB
+npm test: 601 tests passed (37 files)
+npm pack --dry-run: 137 files, 138.3 kB
 ```
 
 ### Test Breakdown
 
 | Suite | Tests |
 |---|---|
+| rework-loop (integration) | 16 |
+| run-orchestrator (integration) | 19 |
 | orchestrator-registry | 18 |
 | security-regression | 14 |
 | command-renderer | 15 |
@@ -70,7 +115,6 @@ npm pack --dry-run: 120 files, 113.6 kB
 | planner-adapter | 8 |
 | developer-adapter | 8 |
 | auditor-adapter | 8 |
-| run-orchestrator (integration) | 19 |
 | git-parsers | 18 |
 | json-schemas | 22 |
 | config | 17 |
@@ -78,7 +122,7 @@ npm pack --dry-run: 120 files, 113.6 kB
 | process-runner | 29 |
 | verification-runner | 15 |
 | stream-redactor | 57 |
-| scope-guard | **30** (+9 F-315R1, -7 F-315) |
+| scope-guard | 30 |
 | diff-collector (integration) | 14 |
 | git-manager (integration) | 16 |
 | cli-pack (integration) | 2 |
@@ -90,39 +134,28 @@ npm pack --dry-run: 120 files, 113.6 kB
 | state-machine | 12 |
 | digest | 8 |
 | goal-normalization | 6 |
-| **Total** | **526** |
-
-## F-312R1 Smoke Status
-
-**PASS — Full chain completed.**
-
-Run `20260613160600-0s08po` with Claude Sonnet:
-- Planner: ✅ Valid plan.md + GOAL.md
-- Developer: ✅ Correct `hello.js`, `npm test` ran once, handoff COMPLETED
-- Scope guard: ✅ `passed: true`, `denied: []`, `excluded_dependency_cache: []`
-- Auditor: ✅ PASS — all 5 success criteria met
-- Final phase: ✅ FINALIZING
+| rework-instructions | 16 |
+| rework-prompt | 8 |
+| history-archive | 10 |
+| status-formatter | 12 |
+| resume-decision | 14 |
+| cancel-request | 8 |
+| error-normalization | 11 |
+| max-iterations | 4 |
+| **Total** | **601** |
 
 ## Acceptance Criteria Status
 
 | Criterion | Status |
 |---|---|
-| SC-1: Unified Agent Adapter | ✅ Three-layer path containment (F-314R1 closed) |
-| SC-2: Prompt Safety | ✅ Cleanup failure → BLOCKED (F-306R2 closed) |
-| SC-3: Planner | ✅ Real model verified (Sonnet) |
-| SC-4: Protocol Normalization | ✅ Unchanged |
-| SC-5: Developer | ✅ Real model verified (Sonnet, no loop) |
-| SC-6: Role Ownership | ✅ Explicit registry replaces pattern inference |
-| SC-7: Mechanical Verification | ✅ Evidence source now trustworthy |
-| SC-8: Auditor | ✅ Real model verified (Sonnet, PASS decision) |
-| SC-9: Mechanical Override | ✅ Unchanged |
-| SC-10: First-round PASS | ✅ Fake Agent → FINALIZING |
-| SC-11: First-round FAIL | ✅ E2e negative-path tests added (F-311R2 closed) |
-| SC-12: BLOCKED | ✅ Real timeout test (60s) |
-| SC-13: State & Lock | ✅ Lock released even on state corruption |
-| SC-14: Engineering Quality | ✅ 526 tests, all gates green |
-| SC-15: macOS Trial | ✅ Full chain: Planner → Developer → Auditor → FINALIZING |
+| SC-16: Auto-Rework Loop | ✅ Multi-iteration loop with rework instructions |
+| SC-17: Resume Re-entry | ✅ Re-enters orchestrator at correct phase |
+| SC-18: Cancel Guarantee | ✅ SIGTERM + AbortController → CANCELLED |
+| SC-19: Resume Consistency | ✅ Git branch + base_commit + GOAL digest checks |
+| SC-20: Real Integration Coverage | ✅ 16 scenarios including resume/cancel/archive |
+| SC-21: Archive Idempotency | ✅ verifyArchiveIdempotent wired into main flow |
+| SC-14: Engineering Quality | ✅ 601 tests, all gates green |
 
 ## Risks
 
-- No remaining known risks for Phase 3 acceptance.
+- No remaining known risks for Phase 4 acceptance.

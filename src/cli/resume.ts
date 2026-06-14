@@ -9,9 +9,11 @@
 import { Command } from 'commander';
 import { resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { computeDigest } from '../runtime/digest.js';
+import { runOrchestrator, type ResumeContext } from '../orchestrator/run-orchestrator.js';
 import type { RunState } from '../types.js';
 import { Phase as PhaseEnum } from '../types.js';
 import { isTerminal } from '../orchestrator/state-machine.js';
@@ -123,13 +125,43 @@ export async function executeResume(params: {
     return;
   }
 
-  console.log(`Run ${state.run_id} can be resumed from ${state.phase} (iteration ${state.iteration}).`);
+  if (recoveryAction.action === 'restart') {
+    console.error(`Run ${state.run_id} needs to be restarted from scratch: ${recoveryAction.reason}`);
+    console.error('Use `review-loop start` with the same request to restart the run.');
+    return;
+  }
+
+  // 7. Re-enter the orchestrator loop
+  console.log(`Resuming run ${state.run_id} from ${state.phase} (iteration ${state.iteration})...`);
   console.log(`Recovery: ${recoveryAction.reason}`);
 
-  if (recoveryAction.action === 'restart') {
-    console.log('Use `review-loop start` with the same request to restart the run.');
+  const resumeContext: ResumeContext = {
+    run_id: state.run_id,
+    iteration: state.iteration,
+    phase: state.phase,
+    branch: state.branch,
+    base_commit: state.base_commit,
+    task_slug: state.task_slug,
+    goal_digest: state.goal_digest,
+  };
+
+  const result = await runOrchestrator({
+    project_root: projectRoot,
+    config_path: params.config_path,
+    resume_from: resumeContext,
+  });
+
+  // Report the result
+  if (result.phase === 'FINALIZING') {
+    console.log(`Run ${state.run_id} completed successfully. Audit PASSED.`);
+  } else if (result.phase === 'CANCELLED') {
+    console.log(`Run ${state.run_id} was cancelled.`);
+  } else if (result.phase === 'FAILED') {
+    console.error(`Run ${state.run_id} failed: ${result.message}`);
+  } else if (result.phase === 'BLOCKED') {
+    console.error(`Run ${state.run_id} is blocked: ${result.message}`);
   } else {
-    console.log('The orchestrator will continue from the current phase on next start.');
+    console.log(`Run ${state.run_id} ended in phase ${result.phase}: ${result.message}`);
   }
 }
 
@@ -193,6 +225,44 @@ async function validateResumeConsistency(
       reason: 'plan.md is missing from .agent/',
       suggestion: 'Ensure the .agent directory is intact.',
     };
+  }
+
+  // Check current Git branch matches state.branch
+  try {
+    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd: projectRoot,
+      encoding: 'utf8',
+    }).trim();
+    if (currentBranch !== state.branch) {
+      return {
+        valid: false,
+        reason: `Current Git branch (${currentBranch}) does not match state.branch (${state.branch})`,
+        suggestion: `Switch to branch '${state.branch}' before resuming: git checkout ${state.branch}`,
+      };
+    }
+  } catch {
+    return {
+      valid: false,
+      reason: 'Cannot determine current Git branch. Is this a Git repository?',
+      suggestion: 'Ensure the project root is a valid Git repository.',
+    };
+  }
+
+  // Check base_commit still exists in the repository
+  if (state.base_commit) {
+    try {
+      execSync(`git cat-file -t ${state.base_commit}`, {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: 'pipe',
+      });
+    } catch {
+      return {
+        valid: false,
+        reason: `base_commit ${state.base_commit} no longer exists in the repository`,
+        suggestion: 'The original base commit may have been garbage-collected or the repository was rewritten.',
+      };
+    }
   }
 
   return { valid: true };

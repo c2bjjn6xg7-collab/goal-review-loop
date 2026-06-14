@@ -14,11 +14,12 @@
  */
 
 import { join, resolve, sep } from 'node:path';
-import { existsSync, readFileSync, readdirSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, lstatSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
-import { ArtifactStore } from '../artifacts/artifact-store.js';
+import { ArtifactStore, ARTIFACT_FILES } from '../artifacts/artifact-store.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
 import type { ReviewLoopConfig, ReworkFinding, CancelRequest } from '../types.js';
 import { preflight, createTaskBranch } from '../git/git-manager.js';
@@ -62,21 +63,62 @@ export interface OrchestratorResult {
 /**
  * Run the first-round orchestration loop.
  */
+/** Resume context — passed when resuming an interrupted run. */
+export interface ResumeContext {
+  run_id: string;
+  iteration: number;
+  phase: Phase;
+  branch: string;
+  base_commit: string;
+  task_slug: string;
+  goal_digest: string | null;
+}
+
 export async function runOrchestrator(params: {
   project_root: string;
-  request: string;
+  request?: string;
   task_slug?: string;
   max_iterations?: number;
   config_path?: string;
   no_commit?: boolean;
   tag?: boolean;
   signal?: AbortSignal;
+  resume_from?: ResumeContext;
 }): Promise<OrchestratorResult> {
   const projectRoot = resolve(params.project_root);
   const agentDir = join(projectRoot, '.agent');
   let lockManager: LockManager | null = null;
   let stateStore: StateStore | null = null;
   let runId = ''; // Declared at function scope so finally block can access it
+
+  // F-402: Create AbortController for SIGTERM handling.
+  // When SIGTERM is received, we write cancel-request.json and abort the signal,
+  // which propagates to all agent calls. The orchestrator loop will then detect
+  // the cancel request and transition to CANCELLED cleanly.
+  const abortController = new AbortController();
+  const combinedSignal = abortController.signal;
+
+  // If the caller provided an external signal, chain it
+  if (params.signal) {
+    params.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+  }
+
+  const sigtermHandler = () => {
+    // Write cancel-request.json so the orchestrator loop can detect it
+    try {
+      const cancelRequest: CancelRequest = {
+        schema_version: 1,
+        run_id: runId || 'unknown',
+        requested_at: new Date().toISOString(),
+        requested_by: `signal:SIGTERM:${process.pid}`,
+      };
+      const cancelPath = join(agentDir, 'cancel-request.json');
+      writeFileSync(cancelPath, JSON.stringify(cancelRequest, null, 2), 'utf8');
+    } catch { /* best effort */ }
+    abortController.abort();
+  };
+
+  process.on('SIGTERM', sigtermHandler);
 
   try {
     // ═══════════════════════════════════════════════════════════
@@ -88,7 +130,6 @@ export async function runOrchestrator(params: {
     }
 
     // 2. Load configuration
-    // F-309 fix: pass explicit config_path from --config CLI flag
     let config: ReviewLoopConfig;
     try {
       config = await loadConfigWithDefaults(projectRoot, params.config_path);
@@ -101,6 +142,135 @@ export async function runOrchestrator(params: {
     if (!await artifactStore.exists()) {
       await artifactStore.init();
     }
+
+    // ── Resume path ──────────────────────────────────────────
+    // F-401: When resume_from is provided, skip INITIALIZING/PLANNING
+    // and re-enter the iteration loop from the saved phase/iteration.
+    if (params.resume_from) {
+      const resume = params.resume_from;
+
+      // Acquire lock for the resumed run
+      lockManager = new LockManager(agentDir);
+      runId = resume.run_id;
+      try {
+        await lockManager.acquire(runId);
+      } catch (err) {
+        return makeBlockedResult(runId, projectRoot, `Lock acquisition failed on resume: ${err instanceof Error ? err.message : String(err)}`, 'STATE_CONFLICT');
+      }
+
+      // Load existing state
+      stateStore = new StateStore(agentDir);
+
+      // F-403: Resume consistency checks — verify git branch and GOAL digest
+      // Check current Git branch matches state.branch
+      try {
+        const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+          cwd: projectRoot,
+          encoding: 'utf8',
+        }).trim();
+        if (currentBranch !== resume.branch) {
+          await transitionToBlocked(stateStore, `Resume branch mismatch: current=${currentBranch}, expected=${resume.branch}`);
+          return makeBlockedResult(runId, projectRoot, `Current Git branch (${currentBranch}) does not match state.branch (${resume.branch})`, 'STATE_CONFLICT');
+        }
+      } catch {
+        return makeBlockedResult(runId, projectRoot, 'Cannot determine current Git branch', 'PREFLIGHT_ERROR');
+      }
+
+      // Check base_commit still exists
+      try {
+        execSync(`git cat-file -t ${resume.base_commit}`, { cwd: projectRoot, encoding: 'utf8', stdio: 'pipe' });
+      } catch {
+        await transitionToBlocked(stateStore, `base_commit ${resume.base_commit} no longer exists`);
+        return makeBlockedResult(runId, projectRoot, `base_commit ${resume.base_commit} no longer exists`, 'STATE_CONFLICT');
+      }
+
+      // Check GOAL.md digest matches
+      const goalPath = join(agentDir, 'GOAL.md');
+      if (!existsSync(goalPath)) {
+        await transitionToBlocked(stateStore, 'GOAL.md missing — cannot resume');
+        return makeBlockedResult(runId, projectRoot, 'GOAL.md missing — cannot resume', 'ARTIFACT_ERROR');
+      }
+
+      if (resume.goal_digest) {
+        try {
+          const goalContent = readFileSync(goalPath, 'utf8');
+          const currentDigest = computeDigest(goalContent);
+          if (currentDigest !== resume.goal_digest) {
+            await transitionToBlocked(stateStore, 'GOAL.md digest mismatch on resume');
+            return makeBlockedResult(runId, projectRoot, 'GOAL.md digest does not match state.goal_digest', 'STATE_CONFLICT');
+          }
+        } catch {
+          return makeBlockedResult(runId, projectRoot, 'Cannot read GOAL.md to verify digest', 'ARTIFACT_ERROR');
+        }
+      }
+
+      const goalValidation = validatePlannerOutput(projectRoot, runId);
+      if (!goalValidation.valid) {
+        await transitionToBlocked(stateStore, `GOAL.md validation failed on resume: ${goalValidation.errors.join('; ')}`);
+        return makeBlockedResult(runId, projectRoot, `GOAL.md invalid on resume: ${goalValidation.errors.join('; ')}`, 'ARTIFACT_ERROR');
+      }
+
+      const goalFm = goalValidation.goalFrontMatter!;
+      const verificationCommands = goalValidation.verificationCommands!;
+      const goalDigest = goalValidation.goalDigest ?? resume.goal_digest ?? '';
+      const currentBranch = resume.branch;
+      const baseCommit = resume.base_commit;
+      const maxIterations = params.max_iterations ?? config.loop.max_iterations;
+
+      // Rebuild orchestrator registry from existing files
+      const orchestratorRegistry = new OrchestratorFileRegistry();
+      const registryDirs = [
+        agentDir,
+        join(agentDir, 'evidence'),
+        join(agentDir, 'verification'),
+        join(agentDir, 'history'),
+        join(agentDir, 'debug'),
+      ];
+      for (const dir of registryDirs) {
+        registerDirectoryFiles(dir, orchestratorRegistry);
+      }
+      // Register key individual files
+      for (const f of ['state.json', 'run.lock', 'plan.md', 'GOAL.md', 'iteration-log.md', 'audit-report.md', 'rework-instructions.md', 'developer-handoff.md']) {
+        const fp = join(agentDir, f);
+        if (existsSync(fp)) {
+          try {
+            const d = computeDigest(readFileSync(fp, 'utf8'));
+            orchestratorRegistry.register(fp, d);
+          } catch { /* skip */ }
+        }
+      }
+
+      // Determine the starting iteration based on the phase
+      const startIteration = resume.iteration;
+      // If we're resuming from VERIFYING or AUDITING, we re-run the current iteration
+      // If from DEVELOPING/REWORKING, we also re-run the current iteration's developer
+      // The loop will handle the phase-specific logic
+
+      await appendLog(artifactStore, runId, startIteration, 'RESUMING', 'resume start', 'PASS', `Resuming from ${resume.phase} at iteration ${startIteration}`);
+
+      // Enter the iteration loop at the recovered point
+      // We skip the first `iteration > 1` rework setup since we're resuming mid-iteration
+      return await runIterationLoop({
+        projectRoot,
+        agentDir,
+        runId,
+        stateStore,
+        artifactStore,
+        orchestratorRegistry,
+        config,
+        currentBranch,
+        baseCommit,
+        goalFm,
+        verificationCommands,
+        goalDigest,
+        maxIterations,
+        startIteration,
+        resumePhase: resume.phase,
+        combinedSignal,
+      });
+    }
+
+    // ── Normal (non-resume) path ─────────────────────────────
 
     // 4. Execute Git preflight
     const preflightResult = await preflight(projectRoot);
@@ -121,7 +291,7 @@ export async function runOrchestrator(params: {
     }
 
     // 6. Generate task_slug
-    const taskSlug = params.task_slug || sanitizeSlug(params.request);
+    const taskSlug = params.task_slug || sanitizeSlug(params.request ?? 'resume');
 
     // 7. Create initial state
     stateStore = new StateStore(agentDir);
@@ -169,7 +339,7 @@ export async function runOrchestrator(params: {
         projectRoot,
         'planner.md',
         (template) => buildPlannerPrompt(template, {
-          user_request: params.request,
+          user_request: params.request ?? '',
           run_id: runId,
           project_root: projectRoot,
           base_commit: baseCommit,
@@ -199,7 +369,7 @@ export async function runOrchestrator(params: {
         timeout_seconds: config.agents.planner.timeout_seconds,
         prompt: plannerPrompt,
         prompt_file: plannerPromptFile,
-        signal: params.signal,
+        signal: combinedSignal,
       });
 
       plannerResult = { result: await runAgent(plannerInput, projectRoot), prePlannerSnapshot };
@@ -303,124 +473,232 @@ export async function runOrchestrator(params: {
     const verificationCommands = plannerValidation.verificationCommands!;
     const goalDigest = plannerValidation.goalDigest!;
 
-    for (let iteration = 1; iteration <= maxIterations; iteration++) {
-      // ── Cancel check at top of iteration ──
-      const cancelReq = await checkCancelRequest(agentDir);
-      if (cancelReq) {
-        await stateStore.update(() => ({ cancel_requested_at: cancelReq.requested_at }));
-        await stateStore.transition(PhaseEnum.CANCELLED);
-        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'cancel requested', 'CANCELLED');
-        return makeResult(
-          runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
-          'Run cancelled by user request',
-          `Cancel requested at ${cancelReq.requested_at}`,
-          null,
-        );
-      }
+    return await runIterationLoop({
+      projectRoot,
+      agentDir,
+      runId,
+      stateStore,
+      artifactStore,
+      orchestratorRegistry,
+      config,
+      currentBranch,
+      baseCommit,
+      goalFm,
+      verificationCommands,
+      goalDigest,
+      maxIterations: params.max_iterations ?? config.loop.max_iterations,
+      startIteration: 1,
+      resumePhase: undefined,
+      combinedSignal,
+    });
 
-      // ── DEVELOPING (or REWORKING for iteration > 1) ──
+  } catch (err) {
+    if (stateStore) {
+      try {
+        await transitionToBlocked(stateStore, `Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+      } catch { /* best effort */ }
+    }
+    return makeBlockedResult(
+      '', projectRoot,
+      `Unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+      'AGENT_ERROR',
+    );
+  } finally {
+    // F-402: Remove SIGTERM handler to avoid leaking listeners
+    process.off('SIGTERM', sigtermHandler);
 
-      if (iteration > 1) {
-        // Archive previous iteration history
-        if (config.loop.archive_history) {
-          await artifactStore.archiveIterationFull(iteration - 1);
+    if (lockManager) {
+      try {
+        // Try to read state for run_id, but fall back to the runId variable
+        // which is always available in this scope. This ensures lock release
+        // even when state.json is corrupted or deleted by a malicious agent.
+        let releaseRunId = runId;
+        try {
+          const state = stateStore ? await stateStore.read() : null;
+          if (state?.run_id) releaseRunId = state.run_id;
+        } catch { /* state.json may be corrupted — use the runId we captured */ }
+        await lockManager.release(releaseRunId);
+      } catch { /* best effort */ }
+    }
+  }
+}
 
-          // Register all archived files in the orchestrator registry
-          // so the scope guard knows they are orchestrator-owned
-          const prevIterStr = String(iteration - 1).padStart(2, '0');
-          const historyIterDir = join(agentDir, 'history', `iteration-${prevIterStr}`);
-          registerDirectoryFiles(historyIterDir, orchestratorRegistry);
+// ─── Iteration Loop ────────────────────────────────────────────
+
+/** Parameters for the iteration loop, shared between normal and resume paths. */
+interface IterationLoopParams {
+  projectRoot: string;
+  agentDir: string;
+  runId: string;
+  stateStore: StateStore;
+  artifactStore: ArtifactStore;
+  orchestratorRegistry: OrchestratorFileRegistry;
+  config: ReviewLoopConfig;
+  currentBranch: string;
+  baseCommit: string;
+  goalFm: import('../types.js').GoalFrontMatter;
+  verificationCommands: import('../types.js').VerificationCommand[];
+  goalDigest: string;
+  maxIterations: number;
+  startIteration: number;
+  resumePhase?: Phase;
+  combinedSignal: AbortSignal;
+}
+
+/**
+ * Run the iteration loop — DEVELOPING → VERIFYING → AUDITING per iteration,
+ * with auto-rework on failure.
+ *
+ * When `resumePhase` is set, the loop starts at that phase for the
+ * `startIteration` iteration, skipping phases that have already completed.
+ */
+async function runIterationLoop(params: IterationLoopParams): Promise<OrchestratorResult> {
+  const {
+    projectRoot, agentDir, runId, stateStore, artifactStore,
+    orchestratorRegistry, config, currentBranch, baseCommit,
+    goalFm, verificationCommands, goalDigest, maxIterations,
+    startIteration, resumePhase, combinedSignal,
+  } = params;
+
+  for (let iteration = startIteration; iteration <= maxIterations; iteration++) {
+    // ── Cancel check at top of iteration ──
+    const cancelReq = await checkCancelRequest(agentDir);
+    if (cancelReq) {
+      await stateStore.update(() => ({ cancel_requested_at: cancelReq.requested_at }));
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'cancel requested', 'CANCELLED');
+      return makeResult(
+        runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+        'Run cancelled by user request',
+        `Cancel requested at ${cancelReq.requested_at}`,
+        null,
+      );
+    }
+
+    // ── DEVELOPING (or REWORKING for iteration > 1) ──
+
+    if (iteration > 1) {
+      // Archive previous iteration history
+      if (config.loop.archive_history) {
+        // F-406: Verify idempotency before archiving.
+        const preArchiveDigests: Record<string, string> = {};
+        const handoffPath = join(agentDir, ARTIFACT_FILES.HANDOFF);
+        if (existsSync(handoffPath)) {
+          preArchiveDigests[ARTIFACT_FILES.HANDOFF] = computeDigest(readFileSync(handoffPath, 'utf8'));
         }
-
-        // Build rework findings from the previous iteration's failures
-        // We collect findings from scope, verification, and audit
-        const reworkFindings: ReworkFinding[] = [];
-        const evidencePaths: string[] = [];
-        const reworkVerificationCommands: string[] = [];
-
-        // Read previous scope report if it exists
-        const prevScopeReportPath = join(agentDir, 'evidence', `iteration-${String(iteration - 1).padStart(2, '0')}`, 'scope-report.json');
-        if (existsSync(prevScopeReportPath)) {
-          try {
-            const scopeReportData = JSON.parse(readFileSync(prevScopeReportPath, 'utf8'));
-            if (validateScopeReportData(scopeReportData)) {
-              reworkFindings.push(...buildReworkFindingsFromScope(scopeReportData as ScopeReportV2, iteration, projectRoot));
-              evidencePaths.push(prevScopeReportPath);
-            }
-          } catch { /* skip invalid scope report */ }
+        const auditPath = join(agentDir, ARTIFACT_FILES.AUDIT_REPORT);
+        if (existsSync(auditPath)) {
+          preArchiveDigests[ARTIFACT_FILES.AUDIT_REPORT] = computeDigest(readFileSync(auditPath, 'utf8'));
         }
-
-        // Read previous verification manifest if it exists
-        const prevManifestPath = join(agentDir, 'verification', 'manifest.json');
-        if (existsSync(prevManifestPath)) {
-          try {
-            const manifestData = JSON.parse(readFileSync(prevManifestPath, 'utf8'));
-            reworkFindings.push(...buildReworkFindingsFromVerification(manifestData as VerificationManifest, iteration));
-            evidencePaths.push(prevManifestPath);
-          } catch { /* skip invalid manifest */ }
-        }
-
-        // Read previous audit report if it exists
-        const prevAuditPath = join(agentDir, 'audit-report.md');
-        if (existsSync(prevAuditPath)) {
-          try {
-            const auditContent = readFileSync(prevAuditPath, 'utf8');
-            reworkFindings.push(...buildReworkFindingsFromAudit(auditContent, iteration));
-            evidencePaths.push(prevAuditPath);
-          } catch { /* skip invalid audit report */ }
-        }
-
-        // Add verification commands to rework instructions
-        for (const cmd of verificationCommands) {
-          reworkVerificationCommands.push(cmd.argv.join(' '));
-        }
-
-        // Determine rework source
-        const reworkSource = reworkFindings.length > 0
-          ? reworkFindings[0].source
-          : 'audit' as const;
-
-        // Build and write rework instructions
-        const reworkContent = buildReworkInstructions({
-          run_id: runId,
-          iteration,
-          source: reworkSource,
-          findings: reworkFindings,
-          goal_path: join(projectRoot, '.agent/GOAL.md'),
-          evidence_paths: evidencePaths,
-          verification_commands: reworkVerificationCommands,
-          project_root: projectRoot,
-        });
-        await writeReworkInstructions(projectRoot, reworkContent);
-
-        // Register rework-instructions.md in the orchestrator registry
-        const reworkInstrPath = join(agentDir, 'rework-instructions.md');
+        const reworkInstrPath = join(agentDir, ARTIFACT_FILES.REWORK_INSTRUCTIONS);
         if (existsSync(reworkInstrPath)) {
-          const reworkDigest = computeDigest(readFileSync(reworkInstrPath, 'utf8'));
-          orchestratorRegistry.register(reworkInstrPath, reworkDigest);
+          preArchiveDigests[ARTIFACT_FILES.REWORK_INSTRUCTIONS] = computeDigest(readFileSync(reworkInstrPath, 'utf8'));
         }
 
-        // Update state for new iteration
-        await stateStore.update(() => ({ iteration }));
-
-        // Transition to REWORKING only if not already in that phase.
-        // When coming from audit FAIL, the phase is already REWORKING.
-        const currentState = await stateStore.read();
-        if (currentState.phase !== PhaseEnum.REWORKING) {
-          await stateStore.transition(PhaseEnum.REWORKING);
-          await appendLog(artifactStore, runId, iteration, 'REWORKING', 'rework start', 'PASS');
+        const idempotency = await artifactStore.verifyArchiveIdempotent(iteration - 1, preArchiveDigests);
+        if (!idempotency.safe) {
+          await transitionToBlocked(stateStore, `Archive idempotency violation for iteration ${iteration - 1}: ${idempotency.reason}`);
+          return makeBlockedResult(
+            runId, projectRoot,
+            `Cannot safely archive iteration ${iteration - 1}: ${idempotency.reason}`,
+            'STATE_CONFLICT',
+            currentBranch,
+          );
         }
 
-        // Transition to DEVELOPING for the rework iteration
-        await stateStore.transition(PhaseEnum.DEVELOPING);
-        await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer rework start', 'PASS');
+        await artifactStore.archiveIterationFull(iteration - 1);
+
+        // Register all archived files in the orchestrator registry
+        const prevIterStr = String(iteration - 1).padStart(2, '0');
+        const historyIterDir = join(agentDir, 'history', `iteration-${prevIterStr}`);
+        registerDirectoryFiles(historyIterDir, orchestratorRegistry);
       }
 
+      // Build rework findings from the previous iteration's failures
+      const reworkFindings: ReworkFinding[] = [];
+      const evidencePaths: string[] = [];
+      const reworkVerificationCommands: string[] = [];
+
+      const prevScopeReportPath = join(agentDir, 'evidence', `iteration-${String(iteration - 1).padStart(2, '0')}`, 'scope-report.json');
+      if (existsSync(prevScopeReportPath)) {
+        try {
+          const scopeReportData = JSON.parse(readFileSync(prevScopeReportPath, 'utf8'));
+          if (validateScopeReportData(scopeReportData)) {
+            reworkFindings.push(...buildReworkFindingsFromScope(scopeReportData as ScopeReportV2, iteration, projectRoot));
+            evidencePaths.push(prevScopeReportPath);
+          }
+        } catch { /* skip invalid scope report */ }
+      }
+
+      const prevManifestPath = join(agentDir, 'verification', 'manifest.json');
+      if (existsSync(prevManifestPath)) {
+        try {
+          const manifestData = JSON.parse(readFileSync(prevManifestPath, 'utf8'));
+          reworkFindings.push(...buildReworkFindingsFromVerification(manifestData as VerificationManifest, iteration));
+          evidencePaths.push(prevManifestPath);
+        } catch { /* skip invalid manifest */ }
+      }
+
+      const prevAuditPath = join(agentDir, 'audit-report.md');
+      if (existsSync(prevAuditPath)) {
+        try {
+          const auditContent = readFileSync(prevAuditPath, 'utf8');
+          reworkFindings.push(...buildReworkFindingsFromAudit(auditContent, iteration));
+          evidencePaths.push(prevAuditPath);
+        } catch { /* skip invalid audit report */ }
+      }
+
+      for (const cmd of verificationCommands) {
+        reworkVerificationCommands.push(cmd.argv.join(' '));
+      }
+
+      const reworkSource = reworkFindings.length > 0
+        ? reworkFindings[0].source
+        : 'audit' as const;
+
+      const reworkContent = buildReworkInstructions({
+        run_id: runId,
+        iteration,
+        source: reworkSource,
+        findings: reworkFindings,
+        goal_path: join(projectRoot, '.agent/GOAL.md'),
+        evidence_paths: evidencePaths,
+        verification_commands: reworkVerificationCommands,
+        project_root: projectRoot,
+      });
+      await writeReworkInstructions(projectRoot, reworkContent);
+
+      const reworkInstrPath = join(agentDir, 'rework-instructions.md');
+      if (existsSync(reworkInstrPath)) {
+        const reworkDigest = computeDigest(readFileSync(reworkInstrPath, 'utf8'));
+        orchestratorRegistry.register(reworkInstrPath, reworkDigest);
+      }
+
+      await stateStore.update(() => ({ iteration }));
+      const currentState = await stateStore.read();
+      if (currentState.phase !== PhaseEnum.REWORKING) {
+        await stateStore.transition(PhaseEnum.REWORKING);
+        await appendLog(artifactStore, runId, iteration, 'REWORKING', 'rework start', 'PASS');
+      }
+
+      await stateStore.transition(PhaseEnum.DEVELOPING);
+      await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer rework start', 'PASS');
+    }
+
+    // ── Skip DEVELOPING if resuming from VERIFYING or AUDITING ──
+    const skipDeveloper = resumePhase === PhaseEnum.VERIFYING || resumePhase === PhaseEnum.AUDITING;
+    // Only skip for the first iteration of a resume
+    const shouldSkipDeveloper = skipDeveloper && iteration === startIteration;
+
+    // ── Skip VERIFYING if resuming from AUDITING ──
+    // When resuming from AUDITING, verification has already passed — go straight to auditing
+    const shouldSkipVerifying = resumePhase === PhaseEnum.AUDITING && iteration === startIteration;
+
+    if (!shouldSkipDeveloper) {
       // Record plan/GOAL digests before Developer
       const preDevPlanDigest = computeDigest(readFileSync(join(projectRoot, '.agent/plan.md'), 'utf8'));
       const preDevGoalDigest = computeDigest(readFileSync(join(projectRoot, '.agent/GOAL.md'), 'utf8'));
 
-      // Snapshot system-protected paths before Developer
       const preDevSystemPaths = snapshotSystemPaths(agentDir);
 
       // Build Developer prompt (initial or rework)
@@ -428,7 +706,6 @@ export async function runOrchestrator(params: {
       let developerPromptFile: string | undefined;
       try {
         if (iteration === 1) {
-          // Initial development prompt
           const promptResult = await buildPrompt(
             projectRoot,
             'developer.md',
@@ -445,7 +722,6 @@ export async function runOrchestrator(params: {
           developerPrompt = promptResult.prompt;
           developerPromptFile = promptResult.prompt_file_path ?? undefined;
         } else {
-          // Rework prompt
           const promptResult = await buildPrompt(
             projectRoot,
             'rework.md',
@@ -467,7 +743,6 @@ export async function runOrchestrator(params: {
         return makeBlockedResult(runId, projectRoot, 'Developer prompt build failed', 'CONFIG_ERROR', currentBranch);
       }
 
-      // Cancel check before Developer agent call
       const preDevCancel = await checkCancelRequest(agentDir);
       if (preDevCancel) {
         await stateStore.update(() => ({ cancel_requested_at: preDevCancel.requested_at }));
@@ -481,7 +756,6 @@ export async function runOrchestrator(params: {
         );
       }
 
-      // Execute Developer agent
       let developerResult;
       let developerCleanupResult: PromptCleanupResult | undefined;
       try {
@@ -493,7 +767,7 @@ export async function runOrchestrator(params: {
           timeout_seconds: config.agents.developer.timeout_seconds,
           prompt: developerPrompt,
           prompt_file: developerPromptFile,
-          signal: params.signal,
+          signal: combinedSignal,
         });
 
         developerResult = await runAgent(developerInput, projectRoot);
@@ -512,10 +786,8 @@ export async function runOrchestrator(params: {
         return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Developer configuration or check agent availability', `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, developerResult.error);
       }
 
-      // Register Developer agent log files
       registerAgentLogs(developerResult, orchestratorRegistry);
 
-      // Verify system-protected paths after Developer
       const registryVerification = await verifySystemProtectedPaths(
         projectRoot,
         orchestratorRegistry,
@@ -534,7 +806,6 @@ export async function runOrchestrator(params: {
         );
       }
 
-      // Validate Developer output
       const developerValidation = validateDeveloperOutput(
         projectRoot,
         runId,
@@ -556,367 +827,346 @@ export async function runOrchestrator(params: {
       }
 
       await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'PASS');
+    }
 
-      // ── VERIFYING ──
+    // ── VERIFYING ──
+    // Skip verification when resuming from AUDITING (verification already passed)
+    // When skipping, we still need diffResult and diffDigest for the auditing phase,
+    // so we collect them from existing evidence files.
+    let diffResult: Awaited<ReturnType<typeof collectDiff>>;
+    let diffDigest: string;
+    const scopeReportPath = join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`, 'scope-report.json');
 
+    if (!shouldSkipVerifying) {
+
+    // Only transition if not already in VERIFYING (e.g. on resume)
+    const preVerifyState = await stateStore.read();
+    if (preVerifyState.phase !== PhaseEnum.VERIFYING) {
       await stateStore.transition(PhaseEnum.VERIFYING);
-      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification start', 'PASS');
+    }
+    await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification start', 'PASS');
 
-      // 1. Collect diff from base commit
-      const diffResult = await collectDiff({
-        projectRoot,
-        baseCommit,
-        iteration,
-      });
+    diffResult = await collectDiff({
+      projectRoot,
+      baseCommit,
+      iteration,
+    });
 
-      // 2. Write iteration evidence
-      await writeDiffArtifacts(projectRoot, iteration, diffResult);
+    await writeDiffArtifacts(projectRoot, iteration, diffResult);
 
-      // Register evidence files
-      registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
+    registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
 
-      // 3. Execute Scope Guard
-      const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
-      const scopeResult = checkScope({
-        allowedChanges: goalFm.allowed_changes,
-        disallowedChanges: goalFm.disallowed_changes,
-        changedFiles: diffResult.changedFiles,
-        orchestratorOwnedFiles,
-      });
+    const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
+    const scopeResult = checkScope({
+      allowedChanges: goalFm.allowed_changes,
+      disallowedChanges: goalFm.disallowed_changes,
+      changedFiles: diffResult.changedFiles,
+      orchestratorOwnedFiles,
+    });
 
-      await writeScopeReport(projectRoot, iteration, scopeResult.report);
+    await writeScopeReport(projectRoot, iteration, scopeResult.report);
 
-      // Register scope report
-      const scopeReportPath = join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`, 'scope-report.json');
-      if (existsSync(scopeReportPath)) {
-        const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
-        orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
-      }
+    if (existsSync(scopeReportPath)) {
+      const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
+      orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
+    }
 
-      if (!scopeResult.passed) {
-        await stateStore.transition(PhaseEnum.REWORKING);
-        const deniedPaths = scopeResult.report.denied.map(d => d.path).join(', ');
-        await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'FAIL', `Denied: ${deniedPaths}`);
+    if (!scopeResult.passed) {
+      await stateStore.transition(PhaseEnum.REWORKING);
+      const deniedPaths = scopeResult.report.denied.map(d => d.path).join(', ');
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'FAIL', `Denied: ${deniedPaths}`);
 
-        // If max iterations reached, transition to FAILED
-        if (iteration >= maxIterations) {
-          await stateStore.transition(PhaseEnum.FAILED);
-          return makeResult(
-            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
-            'Max iterations reached — scope violation persists',
-            `Scope violation after ${maxIterations} iterations: ${scopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ')}`,
-            null,
-          );
-        }
-
-        // Continue to next iteration for rework
-        continue;
-      }
-
-      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'PASS');
-
-      // 4. Execute GOAL verification commands
-      const verificationResult = await runVerification({
-        commands: verificationCommands,
-        projectRoot,
-        runId,
-        iteration,
-      });
-
-      // Register verification log files
-      registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
-
-      const requiredPassed = verificationResult.manifest.commands
-        .filter(c => c.required)
-        .every(c => c.status === 'success');
-
-      if (!requiredPassed) {
-        await stateStore.transition(PhaseEnum.REWORKING);
-        const failedCmds = verificationResult.manifest.commands
-          .filter(c => c.required && c.status !== 'success')
-          .map(c => c.id);
-        await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', 'FAIL', `Failed: ${failedCmds.join(', ')}`);
-
-        if (iteration >= maxIterations) {
-          await stateStore.transition(PhaseEnum.FAILED);
-          return makeResult(
-            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
-            'Max iterations reached — required verification still fails',
-            `Required verification failed after ${maxIterations} iterations: ${failedCmds.join(', ')}`,
-            null,
-          );
-        }
-
-        continue;
-      }
-
-      const allPassed = verificationResult.passed;
-      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', allPassed ? 'PASS' : 'FAIL');
-
-      // Register verification manifest
-      const verificationManifestPath = join(agentDir, 'verification', 'manifest.json');
-      if (existsSync(verificationManifestPath)) {
-        const manifestDigest = computeDigest(readFileSync(verificationManifestPath, 'utf8'));
-        orchestratorRegistry.register(verificationManifestPath, manifestDigest);
-      }
-
-      // ── AUDITING ──
-
-      // Re-collect diff AFTER verification
-      const postVerificationDiffResult = await collectDiff({
-        projectRoot,
-        baseCommit,
-        iteration,
-      });
-      await writeDiffArtifacts(projectRoot, iteration, postVerificationDiffResult);
-
-      // Register post-verification evidence
-      registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
-
-      // Re-run Scope Guard on post-verification diff
-      const postVerificationOrchestratorOwned = orchestratorRegistry.getRelativePaths(projectRoot);
-      const postVerificationScopeResult = checkScope({
-        allowedChanges: goalFm.allowed_changes,
-        disallowedChanges: goalFm.disallowed_changes,
-        changedFiles: postVerificationDiffResult.changedFiles,
-        orchestratorOwnedFiles: postVerificationOrchestratorOwned,
-      });
-      await writeScopeReport(projectRoot, iteration, postVerificationScopeResult.report);
-
-      if (existsSync(scopeReportPath)) {
-        const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
-        orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
-      }
-
-      if (!postVerificationScopeResult.passed) {
-        await stateStore.transition(PhaseEnum.REWORKING);
-        const deniedPaths = postVerificationScopeResult.report.denied.map(d => d.path).join(', ');
-        await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'post-verification scope', 'FAIL', `Denied: ${deniedPaths}`);
-
-        if (iteration >= maxIterations) {
-          await stateStore.transition(PhaseEnum.FAILED);
-          return makeResult(
-            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
-            'Max iterations reached — post-verification scope violation persists',
-            `Post-verification scope violation after ${maxIterations} iterations: ${deniedPaths}`,
-            null,
-          );
-        }
-
-        continue;
-      }
-
-      const diffDigest = `sha256:${postVerificationDiffResult.diffDigest}` as Digest;
-      await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
-
-      // Transition to AUDITING
-      await stateStore.transition(PhaseEnum.AUDITING);
-      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor start', 'PASS');
-
-      // Record workspace state before Auditor
-      const preAuditWorkspaceDigests = await snapshotWorkspaceDigests(projectRoot, diffResult);
-
-      // Build Auditor prompt
-      let auditorPrompt: string;
-      let auditorPromptFile: string | undefined;
-      try {
-        const iterStr = String(iteration).padStart(2, '0');
-        const promptResult = await buildPrompt(
-          projectRoot,
-          'auditor.md',
-          (template) => buildAuditorPrompt(template, {
-            run_id: runId,
-            iteration,
-            project_root: projectRoot,
-            plan_path: join(projectRoot, '.agent/plan.md'),
-            goal_path: join(projectRoot, '.agent/GOAL.md'),
-            handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
-            verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
-            changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
-            untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
-            scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
-            tracked_diff_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'tracked.diff'),
-            diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
-            audit_report_path: join(projectRoot, '.agent/audit-report.md'),
-            goal_digest: goalDigest,
-            diff_digest: diffDigest,
-          }),
-          { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
-        );
-        auditorPrompt = promptResult.prompt;
-        auditorPromptFile = promptResult.prompt_file_path ?? undefined;
-      } catch (err) {
-        await transitionToBlocked(stateStore, `Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
-        return makeBlockedResult(runId, projectRoot, 'Auditor prompt build failed', 'CONFIG_ERROR', currentBranch);
-      }
-
-      // Cancel check before Auditor agent call
-      const preAuditCancel = await checkCancelRequest(agentDir);
-      if (preAuditCancel) {
-        await stateStore.update(() => ({ cancel_requested_at: preAuditCancel.requested_at }));
-        await stateStore.transition(PhaseEnum.CANCELLED);
-        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'cancel requested', 'CANCELLED');
+      if (iteration >= maxIterations) {
+        await stateStore.transition(PhaseEnum.FAILED);
         return makeResult(
-          runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
-          'Run cancelled by user request',
-          `Cancel requested at ${preAuditCancel.requested_at}`,
+          runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+          'Max iterations reached — scope violation persists',
+          `Scope violation after ${maxIterations} iterations: ${scopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ')}`,
           null,
         );
       }
 
-      // Execute Auditor agent
-      let auditorResult;
-      let auditorCleanupResult: PromptCleanupResult | undefined;
-      try {
-        const auditorInput = buildAuditorInput({
+      continue;
+    }
+
+    await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'PASS');
+
+    const verificationResult = await runVerification({
+      commands: verificationCommands,
+      projectRoot,
+      runId,
+      iteration,
+    });
+
+    registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
+
+    const requiredPassed = verificationResult.manifest.commands
+      .filter(c => c.required)
+      .every(c => c.status === 'success');
+
+    if (!requiredPassed) {
+      await stateStore.transition(PhaseEnum.REWORKING);
+      const failedCmds = verificationResult.manifest.commands
+        .filter(c => c.required && c.status !== 'success')
+        .map(c => c.id);
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', 'FAIL', `Failed: ${failedCmds.join(', ')}`);
+
+      if (iteration >= maxIterations) {
+        await stateStore.transition(PhaseEnum.FAILED);
+        return makeResult(
+          runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+          'Max iterations reached — required verification still fails',
+          `Required verification failed after ${maxIterations} iterations: ${failedCmds.join(', ')}`,
+          null,
+        );
+      }
+
+      continue;
+    }
+
+    const allPassed = verificationResult.passed;
+    await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', allPassed ? 'PASS' : 'FAIL');
+
+    const verificationManifestPath = join(agentDir, 'verification', 'manifest.json');
+    if (existsSync(verificationManifestPath)) {
+      const manifestDigest = computeDigest(readFileSync(verificationManifestPath, 'utf8'));
+      orchestratorRegistry.register(verificationManifestPath, manifestDigest);
+    }
+
+    // Set diffDigest after verification passes (used by auditing phase)
+    diffDigest = `sha256:${diffResult.diffDigest}` as Digest;
+
+    } else {
+      // When skipping verification (resume from AUDITING), re-collect diff for auditing
+      diffResult = await collectDiff({ projectRoot, baseCommit, iteration });
+      diffDigest = `sha256:${diffResult.diffDigest}` as Digest;
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification skipped (resume)', 'PASS');
+    }
+
+    // ── AUDITING ──
+    // diffResult and diffDigest are already set by either the VERIFYING block or the skip-else above.
+    // Re-collect diff for post-verification scope check (files may have changed between verification and audit).
+    const postVerificationDiffResult = await collectDiff({
+      projectRoot,
+      baseCommit,
+      iteration,
+    });
+    await writeDiffArtifacts(projectRoot, iteration, postVerificationDiffResult);
+
+    registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(iteration).padStart(2, '0')}`), orchestratorRegistry);
+
+    const postVerificationOrchestratorOwned = orchestratorRegistry.getRelativePaths(projectRoot);
+    const postVerificationScopeResult = checkScope({
+      allowedChanges: goalFm.allowed_changes,
+      disallowedChanges: goalFm.disallowed_changes,
+      changedFiles: postVerificationDiffResult.changedFiles,
+      orchestratorOwnedFiles: postVerificationOrchestratorOwned,
+    });
+    await writeScopeReport(projectRoot, iteration, postVerificationScopeResult.report);
+
+    if (existsSync(scopeReportPath)) {
+      const scopeReportDigest = computeDigest(readFileSync(scopeReportPath, 'utf8'));
+      orchestratorRegistry.register(scopeReportPath, scopeReportDigest);
+    }
+
+    if (!postVerificationScopeResult.passed) {
+      await stateStore.transition(PhaseEnum.REWORKING);
+      const deniedPaths = postVerificationScopeResult.report.denied.map(d => d.path).join(', ');
+      await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'post-verification scope', 'FAIL', `Denied: ${deniedPaths}`);
+
+      if (iteration >= maxIterations) {
+        await stateStore.transition(PhaseEnum.FAILED);
+        return makeResult(
+          runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+          'Max iterations reached — post-verification scope violation persists',
+          `Post-verification scope violation after ${maxIterations} iterations: ${deniedPaths}`,
+          null,
+        );
+      }
+
+      continue;
+    }
+
+    // Use diffDigest from VERIFYING phase (already set above)
+    await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
+
+    // Skip auditor if resuming from AUDITING and we want to re-run it
+    // (we always re-run the auditor on resume from AUDITING)
+    // Only transition if not already in AUDITING (e.g. on resume)
+    const preAuditState = await stateStore.read();
+    if (preAuditState.phase !== PhaseEnum.AUDITING) {
+      await stateStore.transition(PhaseEnum.AUDITING);
+    }
+    await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor start', 'PASS');
+
+    const preAuditWorkspaceDigests = await snapshotWorkspaceDigests(projectRoot, diffResult);
+
+    let auditorPrompt: string;
+    let auditorPromptFile: string | undefined;
+    try {
+      const iterStr = String(iteration).padStart(2, '0');
+      const promptResult = await buildPrompt(
+        projectRoot,
+        'auditor.md',
+        (template) => buildAuditorPrompt(template, {
           run_id: runId,
           iteration,
           project_root: projectRoot,
-          command_template: config.agents.auditor.command,
-          timeout_seconds: config.agents.auditor.timeout_seconds,
-          prompt: auditorPrompt,
-          prompt_file: auditorPromptFile,
-          signal: params.signal,
-        });
-
-        auditorResult = await runAgent(auditorInput, projectRoot);
-      } finally {
-        if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
-      }
-
-      if (auditorCleanupResult && !auditorCleanupResult.success) {
-        await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
-        return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
-      }
-
-      if (auditorResult.status !== 'success') {
-        await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
-        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditorResult.error?.message);
-        return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Auditor configuration or check agent availability', `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, auditorResult.error);
-      }
-
-      // Register Auditor agent log files
-      registerAgentLogs(auditorResult, orchestratorRegistry);
-
-      // Register audit-report.md in the orchestrator registry
-      // (written by the Auditor agent, but orchestrator-owned for scope purposes)
-      const auditReportPath = join(agentDir, 'audit-report.md');
-      if (existsSync(auditReportPath)) {
-        const auditReportDigest = computeDigest(readFileSync(auditReportPath, 'utf8'));
-        orchestratorRegistry.register(auditReportPath, auditReportDigest);
-      }
-
-      // Validate Auditor output
-      const auditValidation = await validateAuditorOutput(
-        projectRoot,
-        runId,
-        iteration,
-        goalDigest,
-        diffDigest,
-        preAuditWorkspaceDigests,
+          plan_path: join(projectRoot, '.agent/plan.md'),
+          goal_path: join(projectRoot, '.agent/GOAL.md'),
+          handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+          verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
+          changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
+          untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
+          scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
+          tracked_diff_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'tracked.diff'),
+          diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
+          audit_report_path: join(projectRoot, '.agent/audit-report.md'),
+          goal_digest: goalDigest,
+          diff_digest: diffDigest,
+        }),
+        { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
       );
+      auditorPrompt = promptResult.prompt;
+      auditorPromptFile = promptResult.prompt_file_path ?? undefined;
+    } catch (err) {
+      await transitionToBlocked(stateStore, `Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+      return makeBlockedResult(runId, projectRoot, 'Auditor prompt build failed', 'CONFIG_ERROR', currentBranch);
+    }
 
-      if (!auditValidation.valid) {
-        if (auditValidation.decision === 'PASS') {
-          await stateStore.transition(PhaseEnum.REWORKING);
-          await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', `Mechanical check failure overrides PASS: ${auditValidation.errors.join('; ')}`);
+    const preAuditCancel = await checkCancelRequest(agentDir);
+    if (preAuditCancel) {
+      await stateStore.update(() => ({ cancel_requested_at: preAuditCancel.requested_at }));
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'cancel requested', 'CANCELLED');
+      return makeResult(
+        runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [],
+        'Run cancelled by user request',
+        `Cancel requested at ${preAuditCancel.requested_at}`,
+        null,
+      );
+    }
 
-          if (iteration >= maxIterations) {
-            await stateStore.transition(PhaseEnum.FAILED);
-            return makeResult(
-              runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
-              'Max iterations reached — mechanical check overrides Auditor PASS',
-              `Mechanical check failure after ${maxIterations} iterations: ${auditValidation.errors.join('; ')}`,
-              null,
-            );
-          }
+    let auditorResult;
+    let auditorCleanupResult: PromptCleanupResult | undefined;
+    try {
+      const auditorInput = buildAuditorInput({
+        run_id: runId,
+        iteration,
+        project_root: projectRoot,
+        command_template: config.agents.auditor.command,
+        timeout_seconds: config.agents.auditor.timeout_seconds,
+        prompt: auditorPrompt,
+        prompt_file: auditorPromptFile,
+        signal: combinedSignal,
+      });
 
-          continue;
-        }
-        await transitionToBlocked(stateStore, `Auditor output validation failed: ${auditValidation.errors.join('; ')}`);
-        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditValidation.errors.join('; '));
-        return makeBlockedResult(runId, projectRoot, `Auditor output invalid: ${auditValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', currentBranch);
-      }
+      auditorResult = await runAgent(auditorInput, projectRoot);
+    } finally {
+      if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
+    }
 
-      // Process audit decision
-      const decision = auditValidation.effectiveDecision ?? auditValidation.decision;
+    if (auditorCleanupResult && !auditorCleanupResult.success) {
+      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
+      return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
+    }
 
-      if (decision === 'PASS') {
-        await stateStore.transition(PhaseEnum.FINALIZING);
-        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'PASS');
-        return makeResult(
-          runId, PhaseEnum.FINALIZING, 0, currentBranch, 'PASS',
-          ['.agent/plan.md', '.agent/GOAL.md', '.agent/developer-handoff.md', '.agent/audit-report.md'],
-          'Audit PASSED. Not yet committed — Phase 5 will handle finalization.',
-          'Audit PASSED. Not yet committed.',
-          null,
-        );
-      }
+    if (auditorResult.status !== 'success') {
+      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditorResult.error?.message);
+      return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Auditor configuration or check agent availability', `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, auditorResult.error);
+    }
 
-      if (decision === 'FAIL') {
+    registerAgentLogs(auditorResult, orchestratorRegistry);
+
+    // Register audit-report.md in the orchestrator registry
+    const auditReportPath = join(agentDir, 'audit-report.md');
+    if (existsSync(auditReportPath)) {
+      const auditReportDigest = computeDigest(readFileSync(auditReportPath, 'utf8'));
+      orchestratorRegistry.register(auditReportPath, auditReportDigest);
+    }
+
+    const auditValidation = await validateAuditorOutput(
+      projectRoot,
+      runId,
+      iteration,
+      goalDigest,
+      diffDigest,
+      preAuditWorkspaceDigests,
+    );
+
+    if (!auditValidation.valid) {
+      if (auditValidation.decision === 'PASS') {
         await stateStore.transition(PhaseEnum.REWORKING);
-        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL');
+        await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', `Mechanical check failure overrides PASS: ${auditValidation.errors.join('; ')}`);
 
         if (iteration >= maxIterations) {
           await stateStore.transition(PhaseEnum.FAILED);
           return makeResult(
-            runId, PhaseEnum.FAILED, 2, currentBranch, 'FAIL', [],
-            'Max iterations reached — Auditor still returns FAIL',
-            `Auditor FAIL after ${maxIterations} iterations. Not yet committed.`,
+            runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+            'Max iterations reached — mechanical check overrides Auditor PASS',
+            `Mechanical check failure after ${maxIterations} iterations: ${auditValidation.errors.join('; ')}`,
             null,
           );
         }
 
-        // Continue to next iteration for rework
         continue;
       }
+      await transitionToBlocked(stateStore, `Auditor output validation failed: ${auditValidation.errors.join('; ')}`);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditValidation.errors.join('; '));
+      return makeBlockedResult(runId, projectRoot, `Auditor output invalid: ${auditValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', currentBranch);
+    }
 
-      // BLOCKED — no rework
-      await transitionToBlocked(stateStore, 'Auditor returned BLOCKED');
-      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'BLOCKED');
+    const decision = auditValidation.effectiveDecision ?? auditValidation.decision;
+
+    if (decision === 'PASS') {
+      await stateStore.transition(PhaseEnum.FINALIZING);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'PASS');
       return makeResult(
-        runId, PhaseEnum.BLOCKED, 3, currentBranch, 'BLOCKED', [],
-        'Resolve BLOCKED issue and retry',
-        'Auditor returned BLOCKED.',
+        runId, PhaseEnum.FINALIZING, 0, currentBranch, 'PASS',
+        ['.agent/plan.md', '.agent/GOAL.md', '.agent/developer-handoff.md', '.agent/audit-report.md'],
+        'Audit PASSED. Not yet committed — Phase 5 will handle finalization.',
+        'Audit PASSED. Not yet committed.',
         null,
       );
-    } // end iteration loop
+    }
 
-    // If we exit the loop without returning, max iterations was reached
-    await stateStore.transition(PhaseEnum.FAILED);
+    if (decision === 'FAIL') {
+      await stateStore.transition(PhaseEnum.REWORKING);
+      await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL');
+
+      if (iteration >= maxIterations) {
+        await stateStore.transition(PhaseEnum.FAILED);
+        return makeResult(
+          runId, PhaseEnum.FAILED, 2, currentBranch, 'FAIL', [],
+          'Max iterations reached — Auditor still returns FAIL',
+          `Auditor FAIL after ${maxIterations} iterations. Not yet committed.`,
+          null,
+        );
+      }
+
+      continue;
+    }
+
+    // BLOCKED — no rework
+    await transitionToBlocked(stateStore, 'Auditor returned BLOCKED');
+    await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'BLOCKED');
     return makeResult(
-      runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
-      `Max iterations (${maxIterations}) reached without passing audit`,
-      `Failed after ${maxIterations} iterations`,
+      runId, PhaseEnum.BLOCKED, 3, currentBranch, 'BLOCKED', [],
+      'Resolve BLOCKED issue and retry',
+      'Auditor returned BLOCKED.',
       null,
     );
+  } // end iteration loop
 
-  } catch (err) {
-    if (stateStore) {
-      try {
-        await transitionToBlocked(stateStore, `Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
-      } catch { /* best effort */ }
-    }
-    return makeBlockedResult(
-      '', projectRoot,
-      `Unexpected error: ${err instanceof Error ? err.message : String(err)}`,
-      'AGENT_ERROR',
-    );
-  } finally {
-    if (lockManager) {
-      try {
-        // Try to read state for run_id, but fall back to the runId variable
-        // which is always available in this scope. This ensures lock release
-        // even when state.json is corrupted or deleted by a malicious agent.
-        let releaseRunId = runId;
-        try {
-          const state = stateStore ? await stateStore.read() : null;
-          if (state?.run_id) releaseRunId = state.run_id;
-        } catch { /* state.json may be corrupted — use the runId we captured */ }
-        await lockManager.release(releaseRunId);
-      } catch { /* best effort */ }
-    }
-  }
+  // If we exit the loop without returning, max iterations was reached
+  await stateStore.transition(PhaseEnum.FAILED);
+  return makeResult(
+    runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+    `Max iterations (${maxIterations}) reached without passing audit`,
+    `Failed after ${maxIterations} iterations`,
+    null,
+  );
 }
 
 // ─── Helpers ──────────────────────────────────────────────────

@@ -263,52 +263,101 @@ describe('Phase 4 Rework Loop integration', () => {
   });
 
   // ─── Scenario 10: Resume from VERIFYING reruns full verification ──
-  it('10: resume from VERIFYING reruns full verification', async () => {
-    // First, run a successful orchestrator to create state
+  it('10: resume from VERIFYING reruns full verification and completes', async () => {
     repoDir = createTestRepo('s10');
 
+    // Run a full orchestrator to set up the state and artifacts
     const result = await runOrchestrator({
       project_root: repoDir,
       request: 'Add feature',
     });
+    expect(result.phase).toBe('FINALIZING');
 
-    // The run completed; verify state exists
-    expect(existsSync(join(repoDir, '.agent', 'state.json'))).toBe(true);
+    // Now simulate an interrupted run by modifying state.json back to VERIFYING
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'VERIFYING';
+    state.iteration = 1;
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
 
-    // Resume from a terminal state should report it's already done
-    // (We can't easily interrupt mid-VERIFYING in an integration test,
-    //  so we verify the resume command handles terminal states correctly)
-    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
-    expect(['FINALIZING', 'PASSED']).toContain(state.phase);
+    // Remove the lock so resume can acquire it
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // Resume should re-run verification and auditing, reaching FINALIZING again
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: 1,
+        phase: 'VERIFYING',
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    expect(resumeResult.phase).toBe('FINALIZING');
+    expect(resumeResult.audit_decision).toBe('PASS');
   });
 
   // ─── Scenario 11: Resume with branch mismatch → BLOCKED ───
   it('11: resume with branch mismatch is rejected', async () => {
     repoDir = createTestRepo('s11');
 
-    // Run a successful orchestrator first
+    // Run a full orchestrator first
     await runOrchestrator({
       project_root: repoDir,
       request: 'Add feature',
     });
 
+    // Modify state to non-terminal and switch branch
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'VERIFYING';
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+
     // Switch to a different branch
     execSync('git checkout -b wrong-branch', { cwd: repoDir });
 
-    // Resume should detect the inconsistency
-    // (The run is already terminal, so resume will report that)
-    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
-    expect(['FINALIZING', 'PASSED']).toContain(state.phase);
+    // Remove lock
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // Resume should detect branch mismatch and fail
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: 1,
+        phase: 'VERIFYING',
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    // Should be BLOCKED because the branch doesn't match
+    expect(resumeResult.phase).toBe('BLOCKED');
   });
 
   // ─── Scenario 12: Resume with GOAL digest mismatch → BLOCKED ──
   it('12: resume with GOAL digest mismatch is rejected', async () => {
     repoDir = createTestRepo('s12');
 
-    const result = await runOrchestrator({
+    // Run a full orchestrator first
+    await runOrchestrator({
       project_root: repoDir,
       request: 'Add feature',
     });
+
+    // Modify state to non-terminal
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'VERIFYING';
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
 
     // Tamper with GOAL.md
     const goalPath = join(repoDir, '.agent', 'GOAL.md');
@@ -317,42 +366,68 @@ describe('Phase 4 Rework Loop integration', () => {
       writeFileSync(goalPath, content + '\n// Tampered\n', 'utf8');
     }
 
-    // Resume should detect digest mismatch
-    // (The run is already terminal, so we verify the state)
-    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
-    expect(state.phase).toBeTruthy();
+    // Remove lock
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // Resume should detect GOAL digest mismatch and fail
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: 1,
+        phase: 'VERIFYING',
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    // Should be BLOCKED because GOAL digest doesn't match
+    expect(resumeResult.phase).toBe('BLOCKED');
   });
 
   // ─── Scenario 13: Cancel during long-running Developer → CANCELLED ──
   it('13: cancel request during developer run leads to CANCELLED', async () => {
-    // Use timeout developer to simulate long-running, then write cancel-request.json
-    repoDir = createTestRepo('s13', { developer: 'timeout' }, 3);
+    repoDir = createTestRepo('s13', {}, 3);
 
-    // Start the orchestrator in the background and write a cancel request
-    // This is tricky in integration tests — we test the cancel-request.json
-    // mechanism by writing it before the orchestrator starts
+    // Add .agent to .gitignore so pre-writing files doesn't dirty the worktree
+    writeFileSync(join(repoDir, '.gitignore'), '.agent/\n', 'utf8');
+    execSync('git add .gitignore && git commit -m "add gitignore"', { cwd: repoDir });
+
     const agentDir = join(repoDir, '.agent');
     mkdirSync(agentDir, { recursive: true });
 
-    // Pre-write a cancel request that will be picked up during the run
-    // The orchestrator checks for cancel-request.json at each iteration
-    // We can't easily time this, so we test the cancel command's file writing
-    // and the orchestrator's cancel detection separately
-
-    // Instead, verify the cancel request file format is correct
+    // Write a cancel request before the orchestrator starts.
+    // The orchestrator checks for cancel-request.json at the top of each iteration.
     const cancelRequest = {
       schema_version: 1,
-      run_id: 'test-cancel',
+      run_id: 'any',
       requested_at: new Date().toISOString(),
       requested_by: 'cli:12345',
     };
     writeFileSync(join(agentDir, 'cancel-request.json'), JSON.stringify(cancelRequest), 'utf8');
 
-    // Verify the file exists and is valid JSON
-    expect(existsSync(join(agentDir, 'cancel-request.json'))).toBe(true);
-    const parsed = JSON.parse(readFileSync(join(agentDir, 'cancel-request.json'), 'utf8'));
-    expect(parsed.schema_version).toBe(1);
-    expect(parsed.run_id).toBe('test-cancel');
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add feature',
+      max_iterations: 3,
+    });
+
+    // The orchestrator should detect the cancel request and transition to CANCELLED
+    expect(result.phase).toBe('CANCELLED');
+    expect(result.exit_code).toBe(4);
+
+    // Verify state.json reflects CANCELLED
+    const statePath = join(repoDir, '.agent', 'state.json');
+    expect(existsSync(statePath)).toBe(true);
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.phase).toBe('CANCELLED');
+
+    // Verify evidence is preserved
+    expect(existsSync(join(repoDir, '.agent', 'plan.md'))).toBe(true);
+    expect(existsSync(join(repoDir, '.agent', 'GOAL.md'))).toBe(true);
   });
 
   // ─── Scenario 14: status --json output stable and parseable ──
@@ -390,22 +465,93 @@ describe('Phase 4 Rework Loop integration', () => {
   });
 
   // ─── Scenario 15: Resume from AUDITING reruns or validates Auditor evidence ──
-  it('15: resume from AUDITING handles auditor evidence', async () => {
+  it('15: resume from AUDITING reruns auditor and completes', async () => {
     repoDir = createTestRepo('s15');
 
+    // Run a full orchestrator to set up the state and artifacts
     const result = await runOrchestrator({
       project_root: repoDir,
       request: 'Add feature',
     });
-
-    // Verify the run completed
     expect(result.phase).toBe('FINALIZING');
 
-    // Verify audit evidence exists
-    expect(existsSync(join(repoDir, '.agent', 'audit-report.md'))).toBe(true);
+    // Simulate an interrupted run by modifying state.json back to AUDITING
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'AUDITING';
+    state.iteration = 1;
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
 
-    // Verify state records the correct phase
-    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
-    expect(state.phase).toBe('FINALIZING');
+    // Remove the lock so resume can acquire it
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // Resume should re-run auditing and reach FINALIZING
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: 1,
+        phase: 'AUDITING',
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    expect(resumeResult.phase).toBe('FINALIZING');
+    expect(resumeResult.audit_decision).toBe('PASS');
+  });
+
+  // ─── Scenario 16: Archive idempotency → BLOCKED on digest mismatch ──
+  it('16: archive with existing mismatched digests results in BLOCKED', async () => {
+    repoDir = createTestRepo('s16', { auditor: 'audit-fail-then-pass' }, 3);
+
+    // Run the orchestrator — it will do iteration 1 (audit FAIL) then iteration 2 (audit PASS)
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add feature',
+      max_iterations: 3,
+    });
+    expect(result.phase).toBe('FINALIZING');
+
+    // Verify iteration 1 was archived
+    const historyDir = join(repoDir, '.agent', 'history', 'iteration-01');
+    expect(existsSync(historyDir)).toBe(true);
+
+    // Now tamper with the archived handoff to create a digest mismatch
+    const archivedHandoff = join(historyDir, 'developer-handoff.md');
+    if (existsSync(archivedHandoff)) {
+      writeFileSync(archivedHandoff, 'TAMPERED CONTENT', 'utf8');
+    }
+
+    // Modify state to simulate being at iteration 1 with a rework needed
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'REWORKING';
+    state.iteration = 1;
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    // Remove lock
+    const lockPath = join(repoDir, '.agent', 'run.lock');
+    if (existsSync(lockPath)) rmSync(lockPath);
+
+    // Resume should detect the idempotency violation and BLOCKED
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: 2,
+        phase: 'REWORKING',
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    // Should be BLOCKED because archive digests don't match
+    expect(resumeResult.phase).toBe('BLOCKED');
   });
 });
