@@ -17,11 +17,13 @@
 
 ### 1.1 实施约束
 
-当前未提供 `claude-code-review-loop` 源码，因此开发第一步必须先完成代码库调研。实现时遵守：
+Phase 0 已确认原 `claude-code-review-loop` 是一个极简 Codex 插件原型，主要可复用的是
+“Claude 执行、Codex 审查、失败返工”的工作流概念，而不是 PowerShell 代码本身。当前系统
+以 TypeScript/Node.js 本地 CLI 为核心实现。后续开发遵守：
 
-* 沿用原项目语言、包管理器、CLI 框架、日志框架和测试框架。
-* 不为本功能迁移技术栈。
-* 下文模块名是逻辑职责，可映射到原项目现有模块。
+* 保持 CLI 核心与插件入口解耦。
+* 不把状态机、Git、Scope Guard、Verification Runner 等核心能力塞进 Skill 文档。
+* 下文模块名是逻辑职责，应映射到当前 `src/` 目录中的 TypeScript 模块。
 * 命令调用必须通过适配器，不在主流程中硬编码 Codex 或 Claude CLI 参数。
 
 ---
@@ -47,7 +49,19 @@
   Codex/Claude   .agent/     shell process     git CLI    path rules
 ```
 
-### 2.1 逻辑模块
+### 2.1 交付表面
+
+系统分为两层：
+
+1. **核心执行层**：`review-loop` 本地 CLI。它是唯一实现状态机、验证、Scope Guard、Git
+   证据、返工和提交的组件。
+2. **用户入口层**：Codex 插件/Skill。它只负责让 Codex Desktop、Codex CLI 或 IDE
+   Extension 通过自然语言调用本地 CLI，并解释 `.agent/` 产物。
+
+插件不得绕过 CLI 直接调用 Claude 或 Codex 完成工程流程。若插件需要执行任务，必须调用
+`review-loop start/status/resume/cancel`。
+
+### 2.2 逻辑模块
 
 | 模块 | 职责 |
 |---|---|
@@ -60,6 +74,8 @@
 | Verification Runner | 执行 GOAL 中的验证命令 |
 | Git Manager | 预检、分支、基线、diff、commit、tag |
 | Scope Guard | 根据 Allowed/Disallowed Changes 校验文件范围 |
+| Progress Reporter | 写入 progress.json/progress.md，供 Codex Desktop 或插件轮询 |
+| Transcript Store | 保存 Agent stdout/stderr 摘要和可读转写 |
 | Report Parser | 解析 GOAL、handoff、audit、final audit 的固定字段 |
 | Lock Manager | 防止同一工作区出现两个活动运行 |
 | Event Logger | 追加 iteration-log，输出结构化运行日志 |
@@ -139,6 +155,7 @@ src/
 --no-commit                 通过后不自动 commit
 --tag                       通过后创建 tag
 --config <path>             配置文件路径
+--watch                     持续输出阶段进度，适合 Codex Desktop/CLI 展示
 ```
 
 行为：
@@ -172,6 +189,14 @@ src/
 * 最近错误
 * 下一步预期动作
 
+建议参数：
+
+```text
+--json                      输出机器可读状态
+--watch                     每隔固定时间刷新，直到终态
+--interval <seconds>        watch 间隔，默认 2 秒
+```
+
 ### 4.5 `review-loop cancel`
 
 行为：
@@ -197,7 +222,7 @@ agents:
     command: ["codex", "exec", "{prompt_file}"]
     timeout_seconds: 1800
   developer:
-    command: ["claude", "-p", "{prompt}"]
+    command: ["sh", "-lc", "exec claude -p --permission-mode acceptEdits < \"$1\"", "claude-developer", "{prompt_file}"]
     timeout_seconds: 3600
   auditor:
     command: ["codex", "exec", "{prompt_file}"]
@@ -221,15 +246,97 @@ runtime:
   kill_grace_seconds: 10
   max_log_bytes: 10485760
   lock_stale_seconds: 86400
+  progress_update_interval_ms: 1000
 ```
 
 ### 5.1 配置规则
 
 * 数组形式执行命令，避免通过 shell 拼接参数。
 * `{prompt}`、`{prompt_file}`、`{run_id}` 等占位符必须使用白名单替换。
+* Developer prompt 默认通过 stdin 传给 Claude CLI，不直接把 `{prompt}` 拼成 `claude -p`
+  参数，避免 prompt 以 `---`、`--` 等内容开头时被 CLI 误判为选项。
 * 未知配置字段可以告警，但关键字段类型错误必须停止。
 * `git.push` 在 MVP 中即使配置为 true 也应拒绝，避免误开放未实现能力。
 * 密钥不得写入该配置文件或 `.agent` 文档。
+
+### 5.2 Claude 权限模式配置
+
+`review-loop` 不保存 Claude 凭据。用户必须先通过 Claude CLI 完成账号授权，例如
+`claude auth`，并确认 `claude --version` 可用。
+
+Developer 命令支持三种典型权限策略：
+
+默认安全模式：
+
+```yaml
+developer:
+  command: ["sh", "-lc", "exec claude -p --permission-mode acceptEdits < \"$1\"", "claude-developer", "{prompt_file}"]
+  timeout_seconds: 3600
+```
+
+可信沙盒 bypass：
+
+```yaml
+developer:
+  command: ["sh", "-lc", "exec claude -p --permission-mode bypassPermissions < \"$1\"", "claude-developer", "{prompt_file}"]
+  timeout_seconds: 3600
+```
+
+无人值守实验模式：
+
+```yaml
+developer:
+  command: ["sh", "-lc", "exec claude -p --dangerously-skip-permissions < \"$1\"", "claude-developer", "{prompt_file}"]
+  timeout_seconds: 3600
+```
+
+约束：
+
+* `acceptEdits` 是默认值。
+* `bypassPermissions` 或 `--dangerously-skip-permissions` 只能由用户在配置中显式开启。
+* 当检测到危险跳权参数时，CLI 必须打印风险提示。
+* bypass 只减少 Claude 的交互确认，不替代 Scope Guard、Verification Runner、审计和 Git
+  preflight。
+* 对不可信仓库、第三方代码、生产数据或不可回滚环境，禁止使用 bypass。
+
+### 5.3 Developer Provider 配置
+
+当前 `command` 字段已经允许接入 Claude 以外的编程 CLI。为了长期支持 CodeBuddy、
+OpenCode、GLM、Qwen、Gemini CLI 等工具，后续配置应扩展为 Provider Profile。
+
+示例：
+
+```yaml
+agents:
+  developer:
+    provider: "claude"
+    command: ["sh", "-lc", "exec claude -p --permission-mode acceptEdits < \"$1\"", "claude-developer", "{prompt_file}"]
+    prompt_transport: "stdin"
+    timeout_seconds: 3600
+    health_check: ["claude", "--version"]
+```
+
+自定义 CLI 示例：
+
+```yaml
+agents:
+  developer:
+    provider: "custom"
+    command: ["sh", "-lc", "exec codebuddy run --file \"$1\"", "codebuddy-developer", "{prompt_file}"]
+    prompt_transport: "prompt_file"
+    timeout_seconds: 3600
+    health_check: ["codebuddy", "--version"]
+```
+
+以上 CodeBuddy 命令仅表示适配方式，具体参数以用户本机 CLI 为准。`review-loop` 的要求是：
+
+* Provider 能在项目根目录运行。
+* Provider 能非交互接收任务。
+* Provider 能真实修改文件。
+* Provider 能生成 handoff 或可由适配器生成 handoff。
+* Provider 的 stdout/stderr 能被保存到 transcript。
+
+Provider Adapter 必须输出统一的 AgentRunResult，不得让上层 Orchestrator 关心具体 CLI。
 
 ---
 
@@ -255,10 +362,13 @@ runtime:
 .agent/state.json
 .agent/run.lock
 .agent/iteration-log.md
+.agent/progress.json
+.agent/progress.md
 .agent/verification/
 .agent/evidence/
 .agent/history/
 .agent/debug/
+.agent/transcripts/
 ```
 
 规则：
@@ -606,6 +716,30 @@ stderr_path: string
 artifact_path: string | null
 error: normalized error | null
 ```
+
+Agent Adapter 之下应允许多个 Developer Provider：
+
+```text
+DeveloperProvider.run(input):
+  render prompt transport (stdin | prompt_file | argv)
+  execute provider command through ProcessRunner
+  capture stdout/stderr
+  write transcript artifact
+  verify or synthesize developer-handoff.md
+  return AgentRunResult
+```
+
+内置 Provider 建议：
+
+| provider_id | 用途 |
+|---|---|
+| `claude` | 默认 Claude Code CLI |
+| `custom` | 用户自定义命令模板 |
+| `codebuddy` | CodeBuddy CLI 适配，具体命令由用户配置 |
+| `opencode` | OpenCode CLI 适配，具体命令由用户配置 |
+
+不要在 Orchestrator 中写 `if provider === "claude"` 之类的分支。差异应封装在 Provider
+Profile 或 Provider Adapter 内。
 
 ### 9.2 Planner 输入
 
@@ -1224,6 +1358,59 @@ prompts/
 
 日志不得默认输出完整 Prompt 和敏感环境变量。调试模式可以保存脱敏后的 Prompt 到 `.agent/debug/`。
 
+### 21.1 桌面端进度文件
+
+为让 Codex Desktop/插件看到工作进度，编排器必须持续写入：
+
+```text
+.agent/progress.json
+.agent/progress.md
+```
+
+`progress.json` 建议结构：
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "20260614-xxxxxx",
+  "phase": "DEVELOPING",
+  "iteration": 2,
+  "max_iterations": 3,
+  "current_role": "developer",
+  "provider": "claude",
+  "status": "running",
+  "last_event": "Developer running",
+  "last_event_at": "2026-06-14T12:00:00.000Z",
+  "next_action": "wait for developer-handoff.md",
+  "artifact_paths": [
+    ".agent/GOAL.md",
+    ".agent/developer-handoff.md"
+  ]
+}
+```
+
+`progress.md` 是给用户看的短摘要，Codex 插件可以直接读取并贴回对话。
+
+### 21.2 Transcript
+
+Agent 的完整交互不一定是结构化聊天，但至少要保存可追溯文本：
+
+```text
+.agent/transcripts/iteration-01-planner.md
+.agent/transcripts/iteration-01-developer.md
+.agent/transcripts/iteration-01-auditor.md
+```
+
+Transcript 来源：
+
+* Provider stdout/stderr 脱敏摘要。
+* 关键命令开始/结束时间。
+* 产物路径。
+* 必要时保存 JSONL 原始流，但不得提交到 Git。
+
+Codex Desktop 中显示的是 progress 和 transcript 摘要，不保证等同于 Claude/CodeBuddy/OpenCode
+自己的完整会话 UI。
+
 CLI 最终输出示例：
 
 ```text
@@ -1294,10 +1481,16 @@ Final audit: .agent/final-audit.md
 * Commit/tag。
 * 完整 CLI 状态输出。
 
-### Phase 6：质量与文档
+### Phase 6：插件包装、质量与文档
 
 实现：
 
+* Codex 插件/Skill 包装层。
+* CLI 与插件的自然语言入口联动。
+* Claude permission mode 配置和风险提示。
+* Developer Provider Profile，支持 Claude、CodeBuddy、OpenCode、custom CLI。
+* `start --watch`、`status --watch`、progress.json/progress.md。
+* transcripts 记录和插件侧摘要展示。
 * 单元、集成、恢复、E2E 测试。
 * 安装和配置文档。
 * 故障排查文档。
