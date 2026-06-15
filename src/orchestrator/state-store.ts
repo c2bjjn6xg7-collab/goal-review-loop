@@ -44,7 +44,7 @@ const STATE_SCHEMA = {
     'schema_version', 'run_id', 'task_slug', 'phase', 'iteration',
     'max_iterations', 'project_root', 'base_commit', 'branch',
     'goal_digest', 'audited_diff_digest', 'started_at', 'updated_at',
-    'last_error', 'cancel_requested_at', 'stages',
+    'last_error', 'cancel_requested_at', 'final_commit_sha', 'final_commit_message', 'finalized_at', 'commit_skipped', 'skip_reason', 'tag_name', 'tag_created', 'stages',
   ],
   properties: {
     schema_version: { type: 'number', const: 1 },
@@ -65,6 +65,13 @@ const STATE_SCHEMA = {
     updated_at: { type: 'string' },
     last_error: { type: ['string', 'null'] },
     cancel_requested_at: { type: ['string', 'null'] },
+    final_commit_sha: { type: ['string', 'null'] },
+    final_commit_message: { type: ['string', 'null'] },
+    finalized_at: { type: ['string', 'null'] },
+    commit_skipped: { type: 'boolean' },
+    skip_reason: { type: ['string', 'null'] },
+    tag_name: { type: ['string', 'null'] },
+    tag_created: { type: 'boolean' },
     stages: {
       type: 'object',
       additionalProperties: {
@@ -270,6 +277,13 @@ export class StateStore {
       updated_at: now,
       last_error: null,
       cancel_requested_at: null,
+      final_commit_sha: null,
+      final_commit_message: null,
+      finalized_at: null,
+      commit_skipped: false,
+      skip_reason: null,
+      tag_name: null,
+      tag_created: false,
       stages: defaultStages,
     };
   }

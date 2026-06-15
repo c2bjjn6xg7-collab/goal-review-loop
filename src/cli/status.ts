@@ -4,8 +4,8 @@
  */
 
 import { Command } from 'commander';
-import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import type { RunState, StatusOutput, ReviewLoopError } from '../types.js';
@@ -17,18 +17,24 @@ export function createStatusCommand(): Command {
   cmd
     .description('Show current run status')
     .option('--json', 'Output status as JSON')
+    .option('--watch', 'Continuously poll status until terminal phase')
+    .option('--watch-interval <ms>', 'Watch polling interval in ms', parseInt, 2000)
     .option('--project-root <path>', 'Project root directory', process.cwd())
     .action(async (options) => {
       try {
-        const result = await executeStatus({
-          project_root: options.projectRoot,
-          json: options.json ?? false,
-        });
-        if (result !== null) {
-          if (options.json) {
-            console.log(JSON.stringify(result, null, 2));
-          } else {
-            printHumanReadable(result);
+        if (options.watch) {
+          await watchStatus(options);
+        } else {
+          const result = await executeStatus({
+            project_root: options.projectRoot,
+            json: options.json ?? false,
+          });
+          if (result !== null) {
+            if (options.json) {
+              console.log(JSON.stringify(result, null, 2));
+            } else {
+              printHumanReadable(result);
+            }
           }
         }
       } catch (err) {
@@ -38,6 +44,39 @@ export function createStatusCommand(): Command {
     });
 
   return cmd;
+}
+
+async function watchStatus(options: { projectRoot: string; json?: boolean; watchInterval?: number }): Promise<void> {
+  const interval = options.watchInterval ?? 2000;
+  let lastKey = '';
+  while (true) {
+    const result = await executeStatus({ project_root: options.projectRoot, json: false });
+    if (result) {
+      // F-604: Read progress.json for finer-grained last_event_at
+      let progressEventAt = '';
+      const progressPath = join(resolve(options.projectRoot), '.agent', 'progress.json');
+      if (existsSync(progressPath)) {
+        try {
+          const progress = JSON.parse(readFileSync(progressPath, 'utf8'));
+          progressEventAt = progress.last_event_at ?? '';
+        } catch { /* ignore */ }
+      }
+      const key = `${result.phase}:${result.iteration}:${progressEventAt}`;
+      if (key !== lastKey) {
+        lastKey = key;
+        if (options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          const eventInfo = progressEventAt ? ` (${new Date(progressEventAt).toLocaleTimeString()})` : '';
+          console.log(`[${result.phase}] iter=${result.iteration} ${result.next_step}${eventInfo}`);
+        }
+      }
+      if (['PASSED', 'FAILED', 'BLOCKED', 'CANCELLED'].includes(result.phase)) {
+        return;
+      }
+    }
+    await new Promise(r => setTimeout(r, interval));
+  }
 }
 
 export async function executeStatus(params: {
@@ -95,6 +134,19 @@ export async function executeStatus(params: {
     ? { code: 'STATE_CONFLICT', message: state.last_error, resumable: false, suggested_action: 'Check configuration and try again' }
     : null;
 
+  // Phase 5: Finalization status fields
+  const finalAuditPath = existsSync(join(agentDir, 'final-audit.md'))
+    ? '.agent/final-audit.md' : null;
+  let finalAuditDecision: string | null = null;
+  if (finalAuditPath) {
+    try {
+      const { parseFinalAudit } = await import('../artifacts/artifact-schemas.js');
+      const content = readFileSync(join(agentDir, 'final-audit.md'), 'utf8');
+      const { frontMatter } = parseFinalAudit(content);
+      finalAuditDecision = frontMatter.decision;
+    } catch { /* ignore parse errors */ }
+  }
+
   const output: StatusOutput = {
     run_id: state.run_id,
     phase: state.phase,
@@ -110,9 +162,41 @@ export async function executeStatus(params: {
     started_at: state.started_at,
     updated_at: state.updated_at,
     next_step: nextStep,
+    final_audit_decision: finalAuditDecision,
+    final_audit_path: finalAuditPath,
+    commit_on_pass: true,
+    commit_skipped: state.commit_skipped,
+    final_commit_sha: state.final_commit_sha,
+    tag_requested: state.tag_name !== null,
+    tag_name: state.tag_name,
+    tag_created: state.tag_created,
+    push_enabled: false,
+    finalization_next_step: computeFinalizationNextStep(state),
   };
 
   return output;
+}
+
+function computeFinalizationNextStep(state: RunState): string | null {
+  switch (state.phase) {
+    case 'FINALIZING':
+      return 'Finalization in progress — waiting for Final Audit and commit.';
+    case 'PASSED':
+      if (state.commit_skipped) {
+        return 'Run completed. Commit was skipped.';
+      }
+      if (state.final_commit_sha) {
+        return `Run completed. Committed as ${state.final_commit_sha.slice(0, 8)}.`;
+      }
+      return 'Run completed.';
+    case 'BLOCKED':
+      if (state.final_commit_sha && !state.tag_created && state.tag_name) {
+        return 'Code committed but tag failed. Use `review-loop resume` to retry tag.';
+      }
+      return null;
+    default:
+      return null;
+  }
 }
 
 /**
@@ -123,7 +207,7 @@ function computeNextStep(phase: string, iteration: number, maxIterations: number
     const p = phase as PhaseEnum;
     switch (p) {
       case PhaseEnum.PASSED:
-        return 'Run completed successfully. Phase 5 will handle finalization.';
+        return 'Run completed successfully. Final Audit passed and code committed.';
       case PhaseEnum.FAILED:
         return `Run failed after ${iteration} iteration(s). Review errors and adjust configuration.`;
       case PhaseEnum.BLOCKED:
@@ -149,7 +233,7 @@ function computeNextStep(phase: string, iteration: number, maxIterations: number
     case 'AUDITING':
       return `Auditor is running (iteration ${iteration}/${maxIterations}). Wait for it to complete.`;
     case 'FINALIZING':
-      return 'Audit passed. Phase 5 will handle finalization.';
+      return '正在等待或执行最终审计/本地提交';
     default:
       return 'Unknown phase.';
   }
@@ -185,4 +269,17 @@ function printHumanReadable(status: StatusOutput): void {
   }
 
   console.log(`Next step: ${status.next_step}`);
+
+  if (status.final_commit_sha) {
+    console.log(`Commit: ${status.final_commit_sha}`);
+  }
+  if (status.commit_skipped) {
+    console.log(`Commit: skipped`);
+  }
+  if (status.tag_name) {
+    console.log(`Tag: ${status.tag_name} (${status.tag_created ? 'created' : 'not created'})`);
+  }
+  if (status.final_audit_decision) {
+    console.log(`Final Audit: ${status.final_audit_decision}`);
+  }
 }

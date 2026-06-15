@@ -79,8 +79,14 @@ export async function executeResume(params: {
   }
 
   // 3. Check if already in terminal state
+  // Exception: BLOCKED with final_commit_sha and tag_created=false can be resumed
+  // to retry tag creation (Phase 5 §9.2).
   if (isTerminal(state.phase)) {
-    throw new ResumeConsistencyError(`Run ${state.run_id} is already in terminal state: ${state.phase}. Cannot resume a completed run.`);
+    if (state.phase === 'BLOCKED' && state.final_commit_sha && !state.tag_created && state.tag_name) {
+      // Allow resume from BLOCKED to retry tag creation
+    } else {
+      throw new ResumeConsistencyError(`Run ${state.run_id} is already in terminal state: ${state.phase}. Cannot resume a completed run.`);
+    }
   }
 
   // 4. Consistency checks
@@ -153,8 +159,15 @@ export async function executeResume(params: {
   });
 
   // Report the result
-  if (result.phase === 'FINALIZING') {
-    console.log(`Run ${state.run_id} completed successfully. Audit PASSED.`);
+  if (result.phase === 'PASSED') {
+    if (result.commit_skipped) {
+      console.log(`Run ${state.run_id} completed successfully. Commit skipped (${result.skip_reason}).`);
+    } else if (result.commit_sha) {
+      console.log(`Run ${state.run_id} completed successfully. Committed as ${result.commit_sha.slice(0, 8)}.`);
+      if (result.tag_created && result.tag_name) {
+        console.log(`Tag: ${result.tag_name}`);
+      }
+    }
   } else if (result.phase === 'CANCELLED') {
     console.log(`Run ${state.run_id} was cancelled.`);
   } else if (result.phase === 'FAILED') {
@@ -308,7 +321,14 @@ function determineRecoveryAction(state: RunState): RecoveryAction {
       return { action: 'continue', reason: 'Will re-run or validate Auditor.' };
 
     case PhaseEnum.FINALIZING:
-      return { action: 'blocked', reason: 'Finalization requires Phase 5 capabilities.' };
+      return { action: 'continue', reason: 'Will resume finalization (Final Audit, commit, tag).' };
+
+    case PhaseEnum.BLOCKED: {
+      if (state.final_commit_sha && !state.tag_created && state.tag_name) {
+        return { action: 'continue', reason: 'Commit exists but tag failed — can retry tag creation.' };
+      }
+      return { action: 'blocked', reason: 'Run is blocked. Resolve the blocking issue manually.' };
+    }
 
     default:
       return { action: 'blocked', reason: `Unknown phase: ${state.phase}` };

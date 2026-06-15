@@ -38,6 +38,7 @@
 
 import { writeFileSync, mkdirSync, existsSync, readFileSync, appendFileSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -282,6 +283,139 @@ No violations.
   writeFileSync(join(agentDir, 'audit-report.md'), report, 'utf8');
 }
 
+/** Compute SHA-256 digest of a string, returning sha256:hex format. */
+function computeDigest(content) {
+  const hash = createHash('sha256').update(content).digest('hex');
+  return `sha256:${hash}`;
+}
+
+/** Read a file and compute its digest, or return fallback if file doesn't exist. */
+function computeFileDigest(filePath, fallback) {
+  try {
+    if (existsSync(filePath)) {
+      return computeDigest(readFileSync(filePath, 'utf8'));
+    }
+  } catch { /* ok */ }
+  return fallback;
+}
+
+/** Extract digest values from the prompt file content. */
+function extractDigestsFromPrompt() {
+  const digests = {};
+  const promptFile = getArg('prompt-file');
+  if (promptFile && existsSync(promptFile)) {
+    try {
+      const content = readFileSync(promptFile, 'utf8');
+      // Match digests in both YAML format (goal_digest: "sha256:...") and
+      // markdown format (GOAL digest: `sha256:...`)
+      const patterns = [
+        ['goal_digest', /goal_digest[^a-z]*?(sha256:[a-f0-9]+)/i],
+        ['diff_digest', /diff_digest[^a-z]*?(sha256:[a-f0-9]+)/i],
+        ['audit_report_digest', /audit_report_digest[^a-z]*?(sha256:[a-f0-9]+)/i],
+        ['verification_manifest_digest', /verification_manifest_digest[^a-z]*?(sha256:[a-f0-9]+)/i],
+      ];
+      for (const [key, regex] of patterns) {
+        const match = content.match(regex);
+        if (match) digests[key] = match[1];
+      }
+    } catch { /* ok */ }
+  }
+  return digests;
+}
+
+function writeFinalAuditReport(decision, goalDig, diffDig, forcePassedDigests = false) {
+  // For final-auditor, compute actual digests from files on disk
+  // and from the prompt file (which contains the orchestrator-computed digests).
+  // When forcePassedDigests is true (e.g., audit-bad-digest behavior),
+  // use the explicitly passed goalDig/diffDig instead of computing correct ones.
+  let actualGoalDigest = goalDig;
+  let actualDiffDigest = diffDig;
+  let actualAuditReportDigest = 'sha256:' + 'c'.repeat(64);
+  let actualManifestDigest = 'sha256:' + 'd'.repeat(64);
+
+  if (!forcePassedDigests) {
+    const promptDigests = extractDigestsFromPrompt();
+
+    // Use digests from prompt file first, then from files on disk, then fallback
+    actualGoalDigest = promptDigests.goal_digest
+      || computeFileDigest(join(agentDir, 'GOAL.md'), goalDig);
+    actualDiffDigest = promptDigests.diff_digest || diffDig;
+    actualAuditReportDigest = promptDigests.audit_report_digest
+      || computeFileDigest(join(agentDir, 'audit-report.md'), 'sha256:' + 'c'.repeat(64));
+    actualManifestDigest = promptDigests.verification_manifest_digest
+      || computeFileDigest(join(agentDir, 'verification', 'manifest.json'), 'sha256:' + 'd'.repeat(64));
+  }
+
+  const auditReportDigest = getArg('audit-report-digest') || actualAuditReportDigest;
+  const verificationManifestDigest = getArg('verification-manifest-digest') || actualManifestDigest;
+  const report = `---
+schema_version: 1
+run_id: "${runId}"
+author_role: "auditor"
+decision: "${decision}"
+final_iteration: ${iteration}
+goal_digest: "${actualGoalDigest}"
+diff_digest: "${actualDiffDigest}"
+audit_report_digest: "${auditReportDigest}"
+verification_manifest_digest: "${verificationManifestDigest}"
+created_at: "${new Date().toISOString()}"
+---
+
+# Final Audit Report
+
+## Final Decision
+
+${decision}
+
+## Success Criteria Review
+
+| Criterion | Result | Evidence |
+|---|---|---|
+| SC-1 | ${decision === 'PASS' ? 'PASS' : 'FAIL'} | All checks passed |
+
+## Verification Summary
+
+All required verification commands passed.
+
+## Scope Summary
+
+No scope violations detected.
+
+## Change Summary
+
+Changes are within allowed scope.
+
+## Files To Commit
+
+- .agent/plan.md
+- .agent/GOAL.md
+- .agent/developer-handoff.md
+- .agent/audit-report.md
+- .agent/final-audit.md
+
+## Versioned Artifacts
+
+All versioned artifacts are present and valid.
+
+## Local-only Artifacts Excluded
+
+- .agent/state.json
+- .agent/run.lock
+- .agent/iteration-log.md
+- .agent/verification/
+- .agent/evidence/
+
+## Accepted Residual Risks
+
+None.
+
+## Commit Recommendation
+
+${decision === 'PASS' ? 'Safe to commit.' : 'Do not commit.'}
+`;
+  writeFileSync(join(agentDir, 'final-audit.md'), report, 'utf8');
+}
+
 // ─── Behavior dispatch ────────────────────────────────────────
 
 try {
@@ -461,6 +595,59 @@ try {
           break;
         default:
           writeAuditReport('PASS', goalDigest, diffDigest);
+      }
+      break;
+    }
+
+    case 'final-auditor': {
+      switch (behavior) {
+        case 'success':
+        case 'audit-pass':
+          writeFinalAuditReport('PASS', goalDigest, diffDigest);
+          break;
+        case 'audit-fail':
+          writeFinalAuditReport('FAILED', goalDigest, diffDigest);
+          break;
+        case 'audit-blocked':
+          writeFinalAuditReport('BLOCKED', goalDigest, diffDigest);
+          break;
+        case 'audit-bad-digest':
+          writeFinalAuditReport('PASS', 'sha256:' + '0'.repeat(64), 'sha256:' + '0'.repeat(64), true);
+          break;
+        case 'audit-tamper-final':
+          // Write a valid PASS report, then tamper with a business file.
+          // The orchestrator's F-501R1 digest snapshot should detect this.
+          writeFinalAuditReport('PASS', goalDigest, diffDigest);
+          if (existsSync(join(projectRoot, 'src', 'test-impl.ts'))) {
+            appendFileSync(join(projectRoot, 'src', 'test-impl.ts'), '\n// Final Auditor tampered\n', 'utf8');
+          } else if (existsSync(join(projectRoot, 'src', 'index.ts'))) {
+            appendFileSync(join(projectRoot, 'src', 'index.ts'), '\n// Final Auditor tampered\n', 'utf8');
+          }
+          break;
+        case 'audit-revert-final':
+          // Write a valid PASS report, then delete a Developer-created business file.
+          // This simulates the revert-to-base scenario: the file disappears from
+          // git diff but the pre-snapshot still recorded it. F-501R2 should catch this.
+          writeFinalAuditReport('PASS', goalDigest, diffDigest);
+          try {
+            const { unlinkSync } = await import('node:fs');
+            if (existsSync(join(projectRoot, 'src', 'test-impl.ts'))) {
+              unlinkSync(join(projectRoot, 'src', 'test-impl.ts'));
+            }
+          } catch { /* best effort */ }
+          break;
+        case 'no-artifact':
+          break;
+        case 'timeout':
+          await new Promise((resolve) => {
+            setTimeout(resolve, 300000);
+          });
+          break;
+        case 'exit-error':
+          process.exit(1);
+          break;
+        default:
+          writeFinalAuditReport('PASS', goalDigest, diffDigest);
       }
       break;
     }

@@ -182,6 +182,36 @@ export function buildAuditorPrompt(
   return result;
 }
 
+/**
+ * Build a prompt for the Final Auditor role.
+ * Phase 5 §7: Pre-commit final confirmation.
+ */
+export function buildFinalAuditorPrompt(
+  template: string,
+  context: FinalAuditorPromptContext,
+): string {
+  let result = template;
+  result = replaceAllTokens(result, '{{RUN_ID}}', context.run_id);
+  result = replaceAllTokens(result, '{{ITERATION}}', String(context.iteration));
+  result = replaceAllTokens(result, '{{PROJECT_ROOT}}', context.project_root);
+  result = replaceAllTokens(result, '{{PLAN_PATH}}', context.plan_path);
+  result = replaceAllTokens(result, '{{GOAL_PATH}}', context.goal_path);
+  result = replaceAllTokens(result, '{{HANDOFF_PATH}}', context.handoff_path);
+  result = replaceAllTokens(result, '{{AUDIT_REPORT_PATH}}', context.audit_report_path);
+  result = replaceAllTokens(result, '{{VERIFICATION_MANIFEST_PATH}}', context.verification_manifest_path);
+  result = replaceAllTokens(result, '{{CHANGED_FILES_PATH}}', context.changed_files_path);
+  result = replaceAllTokens(result, '{{UNTRACKED_FILES_PATH}}', context.untracked_files_path);
+  result = replaceAllTokens(result, '{{SCOPE_REPORT_PATH}}', context.scope_report_path);
+  result = replaceAllTokens(result, '{{DIFF_METADATA_PATH}}', context.diff_metadata_path);
+  result = replaceAllTokens(result, '{{FINAL_AUDIT_PATH}}', context.final_audit_path);
+  result = replaceAllTokens(result, '{{GOAL_DIGEST}}', context.goal_digest);
+  result = replaceAllTokens(result, '{{DIFF_DIGEST}}', context.diff_digest);
+  result = replaceAllTokens(result, '{{AUDIT_REPORT_DIGEST}}', context.audit_report_digest);
+  result = replaceAllTokens(result, '{{VERIFICATION_MANIFEST_DIGEST}}', context.verification_manifest_digest);
+  result = replaceAllTokens(result, '{{TEMPLATE_VERSION}}', String(PROMPT_TEMPLATE_VERSION));
+  return result;
+}
+
 /** Context for Planner prompt. */
 export interface PlannerPromptContext {
   user_request: string;
@@ -233,6 +263,27 @@ export interface AuditorPromptContext {
   audit_report_path: string;
   goal_digest: string;
   diff_digest: string;
+}
+
+/** Context for Final Auditor prompt. Phase 5 §7. */
+export interface FinalAuditorPromptContext {
+  run_id: string;
+  iteration: number;
+  project_root: string;
+  plan_path: string;
+  goal_path: string;
+  handoff_path: string;
+  audit_report_path: string;
+  verification_manifest_path: string;
+  changed_files_path: string;
+  untracked_files_path: string;
+  scope_report_path: string;
+  diff_metadata_path: string;
+  final_audit_path: string;
+  goal_digest: string;
+  diff_digest: string;
+  audit_report_digest: string;
+  verification_manifest_digest: string;
 }
 
 /**

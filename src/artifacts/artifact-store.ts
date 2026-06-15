@@ -37,6 +37,7 @@ export const ARTIFACT_DIRS = {
   HISTORY: 'history',
   EVIDENCE: 'evidence',
   DEBUG: 'debug',
+  TRANSCRIPTS: 'transcripts',
 } as const;
 
 /**
@@ -61,6 +62,7 @@ export const LOCAL_ONLY_ARTIFACTS = [
   ARTIFACT_DIRS.EVIDENCE,
   ARTIFACT_DIRS.HISTORY,
   ARTIFACT_DIRS.DEBUG,
+  ARTIFACT_DIRS.TRANSCRIPTS,
 ] as const;
 
 /**
@@ -82,6 +84,7 @@ export class ArtifactStore {
     await fs.ensureDir(path.join(this.agentDir, ARTIFACT_DIRS.HISTORY));
     await fs.ensureDir(path.join(this.agentDir, ARTIFACT_DIRS.EVIDENCE));
     await fs.ensureDir(path.join(this.agentDir, ARTIFACT_DIRS.DEBUG));
+    await fs.ensureDir(path.join(this.agentDir, ARTIFACT_DIRS.TRANSCRIPTS));
   }
 
   /**

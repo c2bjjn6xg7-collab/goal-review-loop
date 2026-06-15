@@ -10,8 +10,8 @@ import type { ReviewLoopError } from '../../src/types.js';
 describe('Error normalization', () => {
   const allCategories = Object.values(ErrorCategory);
 
-  it('has exactly 14 error categories', () => {
-    expect(allCategories).toHaveLength(14);
+  it('has exactly 21 error categories', () => {
+    expect(allCategories).toHaveLength(21);
   });
 
   it('every error category has a default result phase', () => {

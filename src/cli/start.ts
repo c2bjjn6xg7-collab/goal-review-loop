@@ -8,8 +8,8 @@
  * --task-slug <slug>        Optional task short name
  * --max-iterations <n>      Max rework iterations (default from config)
  * --config <path>           Config file path
- * --no-commit               Parse but don't commit (Phase 3 always no-commit)
- * --tag                     Parse but don't tag (Phase 3 never tags)
+ * --no-commit               Skip commit on pass (default: commit on pass)
+ * --tag                     Create local tag on pass (default: no tag)
  */
 
 import { Command } from 'commander';
@@ -27,8 +27,10 @@ export function createStartCommand(): Command {
     .option('--task-slug <slug>', 'Optional task short name')
     .option('--max-iterations <n>', 'Max rework iterations', parseInt)
     .option('--config <path>', 'Config file path')
-    .option('--no-commit', 'Do not commit on pass (Phase 3: always no-commit)')
-    .option('--tag', 'Create tag on pass (Phase 3: never tags)')
+    .option('--no-commit', 'Do not commit on pass')
+    .option('--tag', 'Create local tag on pass')
+    .option('--watch', 'Display progress updates during execution')
+    .option('--watch-interval <ms>', 'Watch polling interval in ms', parseInt, 2000)
     .action(async (options) => {
       try {
         const result = await executeStart(options);
@@ -79,35 +81,71 @@ export async function executeStart(options: StartOptions): Promise<OrchestratorR
 
   // Run orchestrator
   const projectRoot = process.cwd();
-  const result = await runOrchestrator({
-    project_root: projectRoot,
-    request,
-    task_slug: options.taskSlug,
-    max_iterations: options.maxIterations,
-    config_path: options.config,
-    no_commit: options.noCommit ?? true,
-    tag: options.tag ?? false,
-  });
 
-  // Output result
-  console.log('');
-  console.log('═══════════════════════════════════════════════════');
-  console.log(`  Run:        ${result.run_id}`);
-  console.log(`  Phase:      ${result.phase}`);
-  console.log(`  Branch:     ${result.branch}`);
-  if (result.audit_decision) {
-    console.log(`  Audit:      ${result.audit_decision}`);
+  // Set up watch mode polling if --watch is enabled
+  let watchInterval: ReturnType<typeof setInterval> | undefined;
+  let lastPhase = '';
+  if (options.watch) {
+    const progressPath = resolve(projectRoot, '.agent', 'progress.json');
+    const interval = options.watchInterval ?? 2000;
+    watchInterval = setInterval(() => {
+      try {
+        if (existsSync(progressPath)) {
+          const data = JSON.parse(readFileSync(progressPath, 'utf8'));
+          const currentKey = `${data.phase}:${data.iteration}:${data.last_event}`;
+          if (currentKey !== lastPhase) {
+            lastPhase = currentKey;
+            console.log(`[${data.phase}] iter=${data.iteration} ${data.last_event}`);
+          }
+        }
+      } catch { /* progress.json may not exist yet */ }
+    }, interval);
   }
-  console.log(`  Next:       ${result.next_action}`);
-  console.log(`  Message:    ${result.message}`);
-  if (result.artifact_paths.length > 0) {
-    console.log(`  Artifacts:  ${result.artifact_paths.join(', ')}`);
-  }
-  console.log('  ⚠ Not yet committed — Phase 5 handles finalization');
-  console.log('═══════════════════════════════════════════════════');
-  console.log('');
 
-  return result;
+  try {
+    const result = await runOrchestrator({
+      project_root: projectRoot,
+      request,
+      task_slug: options.taskSlug,
+      max_iterations: options.maxIterations,
+      config_path: options.config,
+      no_commit: options.noCommit,
+      tag: options.tag ?? false,
+    });
+
+    if (watchInterval) clearInterval(watchInterval);
+
+    // Output result
+    console.log('');
+    console.log('═══════════════════════════════════════════════════');
+    console.log(`  Run:        ${result.run_id}`);
+    console.log(`  Phase:      ${result.phase}`);
+    console.log(`  Branch:     ${result.branch}`);
+    if (result.audit_decision) {
+      console.log(`  Audit:      ${result.audit_decision}`);
+    }
+    if (result.commit_sha) {
+      console.log(`  Commit:     ${result.commit_sha.slice(0, 8)}`);
+    }
+    if (result.commit_skipped) {
+      console.log(`  Commit:     skipped (${result.skip_reason})`);
+    }
+    if (result.tag_name) {
+      console.log(`  Tag:        ${result.tag_name} (${result.tag_created ? 'created' : 'not created'})`);
+    }
+    console.log(`  Next:       ${result.next_action}`);
+    console.log(`  Message:    ${result.message}`);
+    if (result.artifact_paths.length > 0) {
+      console.log(`  Artifacts:  ${result.artifact_paths.join(', ')}`);
+    }
+    console.log('═══════════════════════════════════════════════════');
+    console.log('');
+
+    return result;
+  } catch (err) {
+    if (watchInterval) clearInterval(watchInterval);
+    throw err;
+  }
 }
 
 export interface StartOptions {
@@ -118,4 +156,6 @@ export interface StartOptions {
   config?: string;
   noCommit?: boolean;
   tag?: boolean;
+  watch?: boolean;
+  watchInterval?: number;
 }

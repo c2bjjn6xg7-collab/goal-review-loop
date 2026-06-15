@@ -295,6 +295,33 @@ CodeBuddy/OpenCode/custom Provider 必须满足：
 - 能生成 handoff，或由 Adapter 根据输出生成 handoff 草稿再校验。
 - stdout/stderr 可记录到 transcript。
 
+## 6.4 Phase 7 预留：智能模型路由
+
+Phase 6 只实现 Provider Profile 和插件入口，不实现自动模型选择。但 Provider Profile 的字段应为
+后续 Phase 7 预留扩展空间：
+
+- `capability_tier`：如 `strong`、`balanced`、`cheap`。
+- `cost_tier`：如 `high`、`medium`、`low`。
+- `recommended_task_types`：如 `architecture`、`bugfix`、`tests`、`docs`。
+- `max_parallel_runs`：Provider 允许的并发上限。
+- `sensitive_task_allowed`：是否允许处理安全、密钥、支付、数据迁移等敏感任务。
+- `worker_roles`：可承担 `premium_worker`、`balanced_worker`、`cheap_worker` 中哪些角色。
+- `escalation_target`：该 Provider 失败后建议升级到哪个 worker 或 Provider。
+
+Phase 6 不根据这些字段自动调度，只允许展示、配置和测试 Provider。自动路由属于 Phase 7。
+
+## 6.5 Phase 7 预留：多 worktree 并发
+
+Phase 6 不允许多个 CLI 同时写同一个项目目录。后续如果要并发处理多个任务，必须满足：
+
+- Planner 先生成任务 DAG。
+- Scheduler 只选择无依赖、无路径冲突、验证可独立运行的任务并发。
+- 每个并发任务使用独立 Git worktree、独立分支、独立 `.agent/` 目录。
+- 每个任务仍走完整 Review Loop。
+- 所有任务通过后，Integration 阶段顺序合并并重新运行全量验证和审计。
+
+因此，Phase 6 插件可以展示“该能力规划中”，但不得提供实际并发启动按钮。
+
 ## 7. 安全规则
 
 - 插件不得把 bypass 作为默认值。

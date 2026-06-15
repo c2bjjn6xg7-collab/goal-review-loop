@@ -126,10 +126,17 @@ export async function validateAuditorOutput(
     join(projectRoot, '.agent', 'evidence') + '/',
     join(projectRoot, '.agent', 'verification') + '/',
     join(projectRoot, '.agent', 'history') + '/',
+    join(projectRoot, '.agent', 'transcripts') + '/',
   ];
 
+  const orchestratorManagedFiles = new Set([
+    join(projectRoot, '.agent', 'progress.json'),
+    join(projectRoot, '.agent', 'progress.md'),
+  ]);
+
   function isOrchestratorManaged(filePath: string): boolean {
-    return orchestratorManagedPrefixes.some(prefix => filePath.startsWith(prefix));
+    return orchestratorManagedFiles.has(filePath)
+      || orchestratorManagedPrefixes.some(prefix => filePath.startsWith(prefix));
   }
 
   for (const [filePath, expectedDigest] of preCallWorkspaceDigests) {

@@ -201,7 +201,7 @@ export function parseAuditReport(content: string, filePath?: string): FrontMatte
 
 const FINAL_AUDIT_SCHEMA = {
   type: 'object',
-  required: ['schema_version', 'run_id', 'author_role', 'decision', 'final_iteration', 'goal_digest', 'diff_digest'],
+  required: ['schema_version', 'run_id', 'author_role', 'decision', 'final_iteration', 'goal_digest', 'diff_digest', 'audit_report_digest', 'verification_manifest_digest', 'created_at'],
   properties: {
     schema_version: { type: 'number', const: 1 },
     run_id: { type: 'string', minLength: 1 },
@@ -210,6 +210,9 @@ const FINAL_AUDIT_SCHEMA = {
     final_iteration: POSITIVE_INTEGER,
     goal_digest: { type: 'string', pattern: DIGEST_PATTERN },
     diff_digest: { type: 'string', pattern: DIGEST_PATTERN },
+    audit_report_digest: { type: 'string', pattern: DIGEST_PATTERN },
+    verification_manifest_digest: { type: 'string', pattern: DIGEST_PATTERN },
+    created_at: { type: 'string', minLength: 1 },
   },
   additionalProperties: true,
 } as const;
@@ -228,7 +231,7 @@ export function parseFinalAudit(content: string, filePath?: string): FrontMatter
 
   validateRequiredFields(
     frontMatter,
-    ['schema_version', 'run_id', 'author_role', 'decision', 'final_iteration', 'goal_digest', 'diff_digest'],
+    ['schema_version', 'run_id', 'author_role', 'decision', 'final_iteration', 'goal_digest', 'diff_digest', 'audit_report_digest', 'verification_manifest_digest', 'created_at'],
     filePath,
   );
   validateEnumField(frontMatter, 'author_role', ['auditor'], filePath);

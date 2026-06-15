@@ -13,6 +13,10 @@ const CONFIG_SCHEMA = {
   required: ['version', 'agents', 'loop', 'git', 'runtime'],
   properties: {
     version: { type: 'number', const: 1 },
+    providers: {
+      type: 'object',
+      additionalProperties: { $ref: '#/$defs/providerConfig' },
+    },
     agents: {
       type: 'object',
       required: ['planner', 'developer', 'auditor'],
@@ -20,6 +24,7 @@ const CONFIG_SCHEMA = {
         planner: { $ref: '#/$defs/agentConfig' },
         developer: { $ref: '#/$defs/agentConfig' },
         auditor: { $ref: '#/$defs/agentConfig' },
+        final_auditor: { $ref: '#/$defs/agentConfig' },
       },
       additionalProperties: false,
     },
@@ -77,6 +82,29 @@ const CONFIG_SCHEMA = {
           minItems: 1,
         },
         timeout_seconds: { type: 'number', minimum: 60 },
+        provider: { type: 'string', minLength: 1 },
+      },
+      additionalProperties: false,
+    },
+    providerConfig: {
+      type: 'object',
+      required: ['enabled'],
+      properties: {
+        enabled: { type: 'boolean' },
+        command_template: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+        },
+        prompt_transport: { type: 'string', enum: ['stdin', 'prompt_file', 'argv'] },
+        health_check: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+        },
+        permission_mode: { type: 'string' },
+        allowed_tools: { type: 'string' },
+        transcript_mode: { type: 'string', enum: ['stdout_stderr', 'jsonl', 'none'] },
       },
       additionalProperties: false,
     },
@@ -108,6 +136,10 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
       timeout_seconds: 3600,
     },
     auditor: {
+      command: ['codex', 'exec', '{prompt_file}'],
+      timeout_seconds: 1800,
+    },
+    final_auditor: {
       command: ['codex', 'exec', '{prompt_file}'],
       timeout_seconds: 1800,
     },
@@ -170,6 +202,11 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     }
     if (config.runtime.cancel_grace_seconds === undefined) {
       config.runtime.cancel_grace_seconds = DEFAULT_CONFIG.runtime.cancel_grace_seconds;
+    }
+
+    // Phase 5 backward compat: fill in final_auditor with auditor config if missing
+    if (!config.agents.final_auditor) {
+      config.agents.final_auditor = config.agents.auditor;
     }
 
     // Enforce MVP constraints — Design doc §5.1

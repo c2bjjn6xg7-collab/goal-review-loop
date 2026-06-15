@@ -22,16 +22,37 @@ import { LockManager } from '../runtime/lock-manager.js';
 import { ArtifactStore, ARTIFACT_FILES } from '../artifacts/artifact-store.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
 import type { ReviewLoopConfig, ReworkFinding, CancelRequest } from '../types.js';
-import { preflight, createTaskBranch } from '../git/git-manager.js';
+import { preflight, createTaskBranch, runGit } from '../git/git-manager.js';
 import { collectDiff, writeDiffArtifacts } from '../git/diff-collector.js';
 import { checkScope, writeScopeReport } from '../scope/scope-guard.js';
 import { runVerification } from '../verification/verification-runner.js';
-import { computeDigest as computeDigestLib, type Digest } from '../runtime/digest.js';
-import { buildPlannerPrompt, buildDeveloperPrompt, buildReworkPrompt, buildAuditorPrompt, buildPrompt, deletePromptFile, type PromptCleanupResult } from '../agents/prompt-builder.js';
+import { computeDigest as computeDigestLib, computeFileDigest, type Digest } from '../runtime/digest.js';
+import { buildPlannerPrompt, buildDeveloperPrompt, buildReworkPrompt, buildAuditorPrompt, buildFinalAuditorPrompt, buildPrompt, deletePromptFile, type PromptCleanupResult } from '../agents/prompt-builder.js';
 import { buildPlannerInput, validatePlannerOutput, snapshotWorkspaceBeforePlanner, validatePlannerWorkspaceOwnership } from '../agents/planner-adapter.js';
 import { buildDeveloperInput, validateDeveloperOutput } from '../agents/developer-adapter.js';
 import { buildAuditorInput, validateAuditorOutput } from '../agents/auditor-adapter.js';
+import { buildFinalAuditorInput, validateFinalAuditorOutput } from '../agents/final-auditor-adapter.js';
+import {
+  renderCommitMessage,
+  renderTagName,
+  stageFiles,
+  getStagedFiles,
+  findStagedSetViolations,
+  createCommit,
+  createTag,
+  getTagTarget,
+  commitExists,
+  verifyCommitTree,
+  findTrackedLocalOnlyArtifacts,
+  buildAllowedCommitSet,
+  VERSIONED_ARTIFACT_PATHS,
+} from '../git/commit-manager.js';
 import { runAgent } from '../agents/agent-adapter.js';
+import { resolveCommandForAgent } from '../providers/provider-registry.js';
+import { parseFinalAudit } from '../artifacts/artifact-schemas.js';
+import { buildProgressData, writeProgress, writeProgressMarkdown } from '../runtime/progress-writer.js';
+import { buildTranscriptEntry, writeTranscript } from '../runtime/transcript-writer.js';
+import { emitPermissionWarnings } from '../providers/permission-guard.js';
 import { buildReworkInstructions, writeReworkInstructions, buildReworkFindingsFromScope, buildReworkFindingsFromVerification, buildReworkFindingsFromAudit } from './rework-instructions.js';
 import { validateCancelRequest } from '../artifacts/json-schemas.js';
 import type {
@@ -58,6 +79,16 @@ export interface OrchestratorResult {
   next_action: string;
   message: string;
   error: ReviewLoopError | null;
+  /** Phase 5: commit SHA if created. */
+  commit_sha: string | null;
+  /** Phase 5: whether commit was skipped. */
+  commit_skipped: boolean;
+  /** Phase 5: tag name if created. */
+  tag_name: string | null;
+  /** Phase 5: whether tag was created. */
+  tag_created: boolean;
+  /** Phase 5: reason commit was skipped. */
+  skip_reason: string | null;
 }
 
 /**
@@ -136,6 +167,9 @@ export async function runOrchestrator(params: {
     } catch (err) {
       return makeBlockedResult('', projectRoot, `Configuration error: ${err instanceof Error ? err.message : String(err)}`, 'CONFIG_ERROR');
     }
+
+    // Phase 6: Emit permission mode warnings
+    emitPermissionWarnings(config);
 
     // 3. Initialize Artifact Store
     const artifactStore = new ArtifactStore(projectRoot);
@@ -267,6 +301,8 @@ export async function runOrchestrator(params: {
         startIteration,
         resumePhase: resume.phase,
         combinedSignal,
+        noCommit: params.no_commit ?? !config.git.commit_on_pass,
+        tag: params.tag ?? config.git.create_tag,
       });
     }
 
@@ -362,10 +398,13 @@ export async function runOrchestrator(params: {
       // Snapshot workspace before Planner to detect unauthorized changes
       const prePlannerSnapshot = await snapshotWorkspaceBeforePlanner(projectRoot);
 
+      // Phase 6 F-604: Emit progress at phase start
+      await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Planner', registry: orchestratorRegistry });
+
       const plannerInput = buildPlannerInput({
         run_id: runId,
         project_root: projectRoot,
-        command_template: config.agents.planner.command,
+        command_template: resolveCommandForAgent(config.agents.planner.command, config.agents.planner.provider, config),
         timeout_seconds: config.agents.planner.timeout_seconds,
         prompt: plannerPrompt,
         prompt_file: plannerPromptFile,
@@ -376,6 +415,12 @@ export async function runOrchestrator(params: {
     } finally {
       if (plannerPromptFile) plannerCleanupResult = await deletePromptFile(plannerPromptFile);
     }
+
+    // Phase 6: Emit planner transcript and progress
+    if (plannerResult.result) {
+      emitTranscript({ projectRoot, role: 'planner', iteration: 0, runId, startedAt: new Date().toISOString(), result: plannerResult.result, registry: orchestratorRegistry });
+    }
+    await emitProgress({ projectRoot, stateStore, lastEvent: 'Planner completed', registry: orchestratorRegistry });
 
     // F-306R2: Prompt cleanup failure is a security boundary — must BLOCKED
     if (plannerCleanupResult && !plannerCleanupResult.success) {
@@ -501,6 +546,8 @@ export async function runOrchestrator(params: {
       startIteration: 1,
       resumePhase: undefined,
       combinedSignal,
+      noCommit: params.no_commit ?? !config.git.commit_on_pass,
+      tag: params.tag ?? config.git.create_tag,
     });
 
   } catch (err) {
@@ -554,6 +601,8 @@ interface IterationLoopParams {
   startIteration: number;
   resumePhase?: Phase;
   combinedSignal: AbortSignal;
+  noCommit: boolean;
+  tag: boolean;
 }
 
 /**
@@ -696,14 +745,18 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer rework start', 'PASS');
     }
 
-    // ── Skip DEVELOPING if resuming from VERIFYING or AUDITING ──
-    const skipDeveloper = resumePhase === PhaseEnum.VERIFYING || resumePhase === PhaseEnum.AUDITING;
+    // ── Skip DEVELOPING if resuming from VERIFYING, AUDITING, or FINALIZING ──
+    const skipDeveloper = resumePhase === PhaseEnum.VERIFYING || resumePhase === PhaseEnum.AUDITING || resumePhase === PhaseEnum.FINALIZING;
     // Only skip for the first iteration of a resume
     const shouldSkipDeveloper = skipDeveloper && iteration === startIteration;
 
-    // ── Skip VERIFYING if resuming from AUDITING ──
+    // ── Skip VERIFYING if resuming from AUDITING or FINALIZING ──
     // When resuming from AUDITING, verification has already passed — go straight to auditing
-    const shouldSkipVerifying = resumePhase === PhaseEnum.AUDITING && iteration === startIteration;
+    const shouldSkipVerifying = (resumePhase === PhaseEnum.AUDITING || resumePhase === PhaseEnum.FINALIZING) && iteration === startIteration;
+
+    // ── Skip AUDITING if resuming from FINALIZING ──
+    // When resuming from FINALIZING, the audit has already passed — go straight to finalization
+    const shouldSkipAuditing = resumePhase === PhaseEnum.FINALIZING && iteration === startIteration;
 
     if (!shouldSkipDeveloper) {
       // Record plan/GOAL digests before Developer
@@ -770,11 +823,13 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       let developerResult;
       let developerCleanupResult: PromptCleanupResult | undefined;
       try {
+        // Phase 6 F-604: Emit progress at phase start
+        await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Developer (iter ${iteration})`, registry: orchestratorRegistry });
         const developerInput = buildDeveloperInput({
           run_id: runId,
           iteration,
           project_root: projectRoot,
-          command_template: config.agents.developer.command,
+          command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
           timeout_seconds: config.agents.developer.timeout_seconds,
           prompt: developerPrompt,
           prompt_file: developerPromptFile,
@@ -785,6 +840,12 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       } finally {
         if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
       }
+
+      // Phase 6: Emit developer transcript and progress
+      if (developerResult) {
+        emitTranscript({ projectRoot, role: 'developer', iteration, runId, startedAt: new Date().toISOString(), result: developerResult, registry: orchestratorRegistry });
+      }
+      await emitProgress({ projectRoot, stateStore, lastEvent: `Developer completed (iter ${iteration})`, registry: orchestratorRegistry });
 
       if (developerCleanupResult && !developerCleanupResult.success) {
         await transitionToBlocked(stateStore, `Developer prompt cleanup failed: ${developerCleanupResult.error}`);
@@ -1025,6 +1086,43 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     // Use diffDigest from VERIFYING phase (already set above)
     await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
 
+    // ── Skip AUDITING if resuming from FINALIZING ──
+    // When resuming from FINALIZING, the audit has already passed — go straight to finalization
+    if (shouldSkipAuditing) {
+      // Read the existing audit report to get the decision
+      const auditReportPath = join(agentDir, 'audit-report.md');
+      if (!existsSync(auditReportPath)) {
+        await transitionToBlocked(stateStore, 'Audit report not found on resume from FINALIZING');
+        return makeBlockedResult(runId, projectRoot, 'Audit report not found on resume from FINALIZING', 'ARTIFACT_ERROR', currentBranch);
+      }
+      // The audit already passed, so proceed directly to finalization
+      // Only transition if not already in FINALIZING (e.g. on resume)
+      const preFinalizationState = await stateStore.read();
+      if (preFinalizationState.phase !== PhaseEnum.FINALIZING) {
+        await stateStore.transition(PhaseEnum.FINALIZING);
+      }
+      await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'resume from FINALIZING', 'PASS', 'skipping audit — already passed');
+
+      return await runFinalization({
+        projectRoot,
+        agentDir,
+        runId,
+        stateStore,
+        artifactStore,
+        config,
+        currentBranch,
+        baseCommit,
+        goalFm,
+        goalDigest,
+        diffDigest,
+        iteration,
+        noCommit: params.noCommit ?? !config.git.commit_on_pass,
+        tag: params.tag ?? config.git.create_tag,
+        combinedSignal,
+        orchestratorRegistry,
+      });
+    }
+
     // Skip auditor if resuming from AUDITING and we want to re-run it
     // (we always re-run the auditor on resume from AUDITING)
     // Only transition if not already in AUDITING (e.g. on resume)
@@ -1085,11 +1183,13 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     let auditorResult;
     let auditorCleanupResult: PromptCleanupResult | undefined;
     try {
+      // Phase 6 F-604: Emit progress at phase start
+      await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Auditor (iter ${iteration})`, registry: orchestratorRegistry });
       const auditorInput = buildAuditorInput({
         run_id: runId,
         iteration,
         project_root: projectRoot,
-        command_template: config.agents.auditor.command,
+        command_template: resolveCommandForAgent(config.agents.auditor.command, config.agents.auditor.provider, config),
         timeout_seconds: config.agents.auditor.timeout_seconds,
         prompt: auditorPrompt,
         prompt_file: auditorPromptFile,
@@ -1100,6 +1200,12 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     } finally {
       if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
     }
+
+    // Phase 6: Emit auditor transcript and progress
+    if (auditorResult) {
+      emitTranscript({ projectRoot, role: 'auditor', iteration, runId, startedAt: new Date().toISOString(), result: auditorResult, registry: orchestratorRegistry });
+    }
+    await emitProgress({ projectRoot, stateStore, lastEvent: `Auditor completed (iter ${iteration})`, registry: orchestratorRegistry });
 
     if (auditorCleanupResult && !auditorCleanupResult.success) {
       await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
@@ -1168,13 +1274,26 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     if (decision === 'PASS') {
       await stateStore.transition(PhaseEnum.FINALIZING);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'PASS');
-      return makeResult(
-        runId, PhaseEnum.FINALIZING, 0, currentBranch, 'PASS',
-        ['.agent/plan.md', '.agent/GOAL.md', '.agent/developer-handoff.md', '.agent/audit-report.md'],
-        'Audit PASSED. Not yet committed — Phase 5 will handle finalization.',
-        'Audit PASSED. Not yet committed.',
-        null,
-      );
+
+      // Phase 5: Run the finalization pipeline
+      return await runFinalization({
+        projectRoot,
+        agentDir,
+        runId,
+        stateStore,
+        artifactStore,
+        config,
+        currentBranch,
+        baseCommit,
+        goalFm,
+        goalDigest,
+        diffDigest,
+        iteration,
+        noCommit: params.noCommit ?? !config.git.commit_on_pass,
+        tag: params.tag ?? config.git.create_tag,
+        combinedSignal,
+        orchestratorRegistry,
+      });
     }
 
     if (decision === 'FAIL') {
@@ -1511,6 +1630,722 @@ function computeDigest(content: string): Digest {
   return computeDigestLib(content);
 }
 
+/**
+ * Run the finalization pipeline after Auditor PASS.
+ * Phase 5 §6: FINALIZING → Final Audit → pre-commit checks → commit → tag → PASSED
+ */
+async function runFinalization(params: {
+  projectRoot: string;
+  agentDir: string;
+  runId: string;
+  stateStore: StateStore;
+  artifactStore: ArtifactStore;
+  config: ReviewLoopConfig;
+  currentBranch: string;
+  baseCommit: string;
+  goalFm: import('../types.js').GoalFrontMatter;
+  goalDigest: string;
+  diffDigest: string;
+  iteration: number;
+  noCommit: boolean;
+  tag: boolean;
+  combinedSignal: AbortSignal;
+  orchestratorRegistry: OrchestratorFileRegistry;
+}): Promise<OrchestratorResult> {
+  const {
+    projectRoot, agentDir, runId, stateStore, artifactStore, config,
+    currentBranch, baseCommit, goalFm, goalDigest, iteration,
+    noCommit, tag, combinedSignal, orchestratorRegistry,
+  } = params;
+
+  // §6.5: Reject git.push: true
+  if (config.git.push) {
+    await transitionToBlocked(stateStore, 'git.push is not supported in Phase 5');
+    return makeBlockedResult(
+      runId, projectRoot,
+      'git.push is not supported in Phase 5. Remove git.push: true from configuration.',
+      'UNSUPPORTED_PUSH',
+      currentBranch,
+    );
+  }
+
+  // §6.3a: Early check — if commit already exists (e.g., resume from FINALIZING
+  // after commit), skip the entire Final Audit pipeline and go directly to tag creation.
+  // This prevents re-running the Final Auditor when the commit is already done.
+  const earlyState = await stateStore.read();
+  if (earlyState.final_commit_sha) {
+    // F-503: Verify the commit actually exists in git before trusting it
+    const commitExistsResult = await commitExists(projectRoot, earlyState.final_commit_sha);
+    if (!commitExistsResult) {
+      // Commit doesn't exist — clear the stale sha and fall through to full finalization
+      await stateStore.update(() => ({
+        final_commit_sha: null,
+        final_commit_message: null,
+      }));
+      await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'commit verification', 'FAIL', `commit sha ${earlyState.final_commit_sha} not found in git — will re-run finalization`);
+    } else {
+      // F-503R1: Verify the commit tree contains required versioned artifacts
+      const requiredCommitPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
+      const treeCheck = await verifyCommitTree(projectRoot, earlyState.final_commit_sha, requiredCommitPaths);
+      if (!treeCheck.valid) {
+        // Commit exists but is missing required artifacts — not a valid finalization commit
+        await stateStore.update(() => ({
+          final_commit_sha: null,
+          final_commit_message: null,
+        }));
+        await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'commit tree verification', 'FAIL', `commit ${earlyState.final_commit_sha} missing: ${treeCheck.missing.join(', ')} — will re-run finalization`);
+      } else {
+      // F-503R2: Verify the commit's final-audit.md belongs to this run.
+      // Check run_id and decision from the commit's final-audit.md frontmatter.
+      // Note: We intentionally don't compare diff_digest — the diff changes after
+      // commit (committed files shift from untracked→tracked), making digest comparison
+      // unreliable on resume. The run_id check proves ownership; the tree check proves
+      // artifact presence; the decision check proves Final Auditor approval.
+      const showResult = await runGit(
+        ['show', `${earlyState.final_commit_sha}:.agent/final-audit.md`],
+        projectRoot,
+      );
+      let commitVerified = false;
+      if (showResult.exit_code === 0) {
+        try {
+          const { frontMatter: commitAuditFm } = parseFinalAudit(showResult.stdout);
+          commitVerified =
+            commitAuditFm.run_id === runId
+            && commitAuditFm.decision === 'PASS';
+        } catch {
+          commitVerified = false;
+        }
+      }
+      if (!commitVerified) {
+        await stateStore.update(() => ({
+          final_commit_sha: null,
+          final_commit_message: null,
+        }));
+        await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'commit content verification', 'FAIL', `commit ${earlyState.final_commit_sha} final-audit.md does not match current run — will re-run finalization`);
+      } else {
+      // Commit already created and fully verified — skip to tag creation
+      const existingCommitSha = earlyState.final_commit_sha;
+      await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'commit already exists', 'PASS', `skipping finalization — ${existingCommitSha.slice(0, 8)} already created`);
+
+      // §6.4: Create tag if requested (and not already created)
+      let tagName: string | null = earlyState.tag_name;
+      let tagCreated = earlyState.tag_created;
+
+      if ((tag || config.git.create_tag) && !tagCreated) {
+        try {
+          const state = await stateStore.read();
+          tagName = renderTagName(config.git.tag_template, {
+            run_id: runId,
+            task_slug: state.task_slug,
+          });
+        } catch (err) {
+          await stateStore.update(() => ({
+            last_error: `Tag template error: ${err instanceof Error ? err.message : String(err)}`,
+            tag_name: null,
+            tag_created: false,
+          }));
+          await stateStore.transition(PhaseEnum.BLOCKED);
+          return makeResult(
+            runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
+            VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+            'Commit exists but tag template error',
+            `Commit ${existingCommitSha.slice(0, 8)} exists but tag template error: ${err instanceof Error ? err.message : String(err)}`,
+            {
+              code: 'GIT_TAG_ERROR',
+              message: `Tag template error: ${err instanceof Error ? err.message : String(err)}`,
+              resumable: true,
+              suggested_action: 'Fix tag template and resume to create tag',
+            },
+            existingCommitSha, false, null, false,
+          );
+        }
+
+        const existingTarget = await getTagTarget(projectRoot, tagName);
+        if (existingTarget !== null) {
+          if (existingTarget === existingCommitSha) {
+            tagCreated = true;
+          } else {
+            await stateStore.update(() => ({
+              last_error: `Tag ${tagName} already exists pointing to ${existingTarget}, expected ${existingCommitSha}`,
+              tag_name: tagName,
+              tag_created: false,
+            }));
+            await stateStore.transition(PhaseEnum.BLOCKED);
+            return makeResult(
+              runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
+              VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+              'Commit exists but tag conflict',
+              `Commit ${existingCommitSha.slice(0, 8)} exists but tag ${tagName} points to different commit ${existingTarget.slice(0, 8)}`,
+              {
+                code: 'GIT_TAG_ERROR',
+                message: `Tag ${tagName} already exists pointing to ${existingTarget}`,
+                resumable: false,
+                suggested_action: 'Resolve tag conflict manually',
+              },
+              existingCommitSha, false, tagName, false,
+            );
+          }
+        } else {
+          const tagResult = await createTag(projectRoot, tagName, existingCommitSha);
+          if (!tagResult.success) {
+            await stateStore.update(() => ({
+              last_error: `Tag creation failed: ${tagResult.error}`,
+              tag_name: tagName,
+              tag_created: false,
+            }));
+            await stateStore.transition(PhaseEnum.BLOCKED);
+            return makeResult(
+              runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
+              VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+              'Commit exists but tag failed',
+              `Commit ${existingCommitSha.slice(0, 8)} exists but tag failed: ${tagResult.error}`,
+              {
+                code: 'GIT_TAG_ERROR',
+                message: `Tag creation failed: ${tagResult.error}`,
+                resumable: true,
+                suggested_action: 'Fix tag issue and resume to create tag',
+              },
+              existingCommitSha, false, tagName, false,
+            );
+          }
+          tagCreated = true;
+        }
+      }
+
+      // Transition to PASSED
+      await stateStore.update(() => ({
+        finalized_at: new Date().toISOString(),
+        tag_name: tagName,
+        tag_created: tagCreated,
+      }));
+      await stateStore.transition(PhaseEnum.PASSED);
+      await emitProgress({ projectRoot, stateStore, lastEvent: 'Finalization PASSED (commit exists)', registry: orchestratorRegistry, commitSha: existingCommitSha, finalAuditDecision: 'PASS' });
+      await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
+
+      const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`);
+      return makeResult(
+        runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
+        artifactPaths,
+        `Final Audit PASSED. Commit ${existingCommitSha.slice(0, 8)} already exists${tagCreated && tagName ? `, tagged ${tagName}` : ''}.`,
+        `Final Audit PASSED. Commit ${existingCommitSha.slice(0, 8)} already exists.`,
+        null,
+        existingCommitSha, false, tagName, tagCreated,
+      );
+      } // end else — commit content verified
+      } // end else — commit tree verified
+    } // end else — commit exists and verified
+  } // end if (earlyState.final_commit_sha)
+
+  // §6.1 step 1: Collect final diff artifacts
+  const finalDiffResult = await collectDiff({ projectRoot, baseCommit, iteration });
+  await writeDiffArtifacts(projectRoot, iteration, finalDiffResult);
+
+  // §6.1 step 2: Run final Scope Guard
+  const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
+  const finalScopeResult = checkScope({
+    allowedChanges: goalFm.allowed_changes,
+    disallowedChanges: goalFm.disallowed_changes,
+    changedFiles: finalDiffResult.changedFiles,
+    orchestratorOwnedFiles,
+  });
+
+  if (!finalScopeResult.passed) {
+    const deniedPaths = finalScopeResult.report.denied.map(d => d.path).join(', ');
+    await transitionToBlocked(stateStore, `Pre-commit scope violation: ${deniedPaths}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Pre-commit scope violation: ${deniedPaths}`,
+      'PRE_COMMIT_SCOPE_VIOLATION',
+      currentBranch,
+    );
+  }
+
+  // §6.1 step 3: Verify verification manifest is current and passed
+  const verificationManifestPath = join(agentDir, 'verification', 'manifest.json');
+  let verificationManifestDigest: string = '';
+  if (existsSync(verificationManifestPath)) {
+    try {
+      const manifestContent = readFileSync(verificationManifestPath, 'utf8');
+      const manifest = JSON.parse(manifestContent) as VerificationManifest;
+      verificationManifestDigest = computeDigest(manifestContent);
+
+      if (manifest.run_id !== runId) {
+        await transitionToBlocked(stateStore, `Verification manifest run_id "${manifest.run_id}" does not match current run "${runId}"`);
+        return makeBlockedResult(
+          runId, projectRoot,
+          `Verification manifest run_id mismatch: expected ${runId}, got ${manifest.run_id}`,
+          'PRE_COMMIT_DIGEST_MISMATCH',
+          currentBranch,
+        );
+      }
+      if (manifest.iteration !== iteration) {
+        await transitionToBlocked(stateStore, `Verification manifest iteration ${manifest.iteration} does not match current iteration ${iteration}`);
+        return makeBlockedResult(
+          runId, projectRoot,
+          `Verification manifest iteration mismatch: expected ${iteration}, got ${manifest.iteration}`,
+          'PRE_COMMIT_DIGEST_MISMATCH',
+          currentBranch,
+        );
+      }
+      if (!manifest.passed) {
+        await transitionToBlocked(stateStore, 'Verification manifest shows not passed');
+        return makeBlockedResult(
+          runId, projectRoot,
+          'Verification manifest shows not passed — cannot commit',
+          'PRE_COMMIT_DIGEST_MISMATCH',
+          currentBranch,
+        );
+      }
+    } catch {
+      await transitionToBlocked(stateStore, 'Cannot parse verification manifest');
+      return makeBlockedResult(
+        runId, projectRoot,
+        'Cannot parse verification manifest for pre-commit check',
+        'PRE_COMMIT_DIGEST_MISMATCH',
+        currentBranch,
+      );
+    }
+  } else {
+    await transitionToBlocked(stateStore, 'Verification manifest not found');
+    return makeBlockedResult(
+      runId, projectRoot,
+      'Verification manifest not found — cannot verify pre-commit',
+      'PRE_COMMIT_DIGEST_MISMATCH',
+      currentBranch,
+    );
+  }
+
+  // §6.1 step 4: Compute current digests for pre-commit check
+  const currentGoalDigest = computeDigest(readFileSync(join(agentDir, 'GOAL.md'), 'utf8'));
+  const currentDiffDigest = `sha256:${finalDiffResult.diffDigest}` as import('../runtime/digest.js').Digest;
+  const auditReportPath = join(agentDir, 'audit-report.md');
+  let currentAuditReportDigest = '';
+  if (existsSync(auditReportPath)) {
+    currentAuditReportDigest = computeDigest(readFileSync(auditReportPath, 'utf8'));
+  }
+
+  // §6.1 step 5: Check for tracked local-only artifacts
+  const trackedLocalOnly = await findTrackedLocalOnlyArtifacts(projectRoot);
+  if (trackedLocalOnly.length > 0) {
+    await transitionToBlocked(stateStore, `Local-only artifacts are tracked by git: ${trackedLocalOnly.join(', ')}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Local-only artifacts are tracked by git: ${trackedLocalOnly.join(', ')}. Remove them from git tracking before committing.`,
+      'PRE_COMMIT_STAGED_SET_VIOLATION',
+      currentBranch,
+    );
+  }
+
+  // §6.1 step 6: Cancel check before Final Auditor
+  const preFinalAuditCancel = await checkCancelRequest(agentDir);
+  if (preFinalAuditCancel) {
+    await stateStore.update(() => ({ cancel_requested_at: preFinalAuditCancel.requested_at }));
+    await stateStore.transition(PhaseEnum.CANCELLED);
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'cancel requested', 'CANCELLED');
+    return makeResult(
+      runId, PhaseEnum.CANCELLED, 4, currentBranch, 'PASS', [],
+      'Run cancelled by user request',
+      `Cancel requested at ${preFinalAuditCancel.requested_at}`,
+      null,
+    );
+  }
+
+  // F-501R1: Snapshot digests of all business files before Final Auditor runs.
+  // After Final Auditor, re-compute and compare to detect content-level tampering
+  // that path/status comparison alone would miss.
+  const preFinalAuditBusinessDigests = new Map<string, Digest>();
+  for (const f of finalDiffResult.changedFiles.files) {
+    if (f.path.startsWith('.agent/')) continue;
+    const fullPath = join(projectRoot, f.path);
+    if (existsSync(fullPath)) {
+      preFinalAuditBusinessDigests.set(f.path, await computeFileDigest(fullPath));
+    }
+  }
+  for (const f of finalDiffResult.untrackedFiles.files) {
+    if (f.path.startsWith('.agent/')) continue;
+    const fullPath = join(projectRoot, f.path);
+    if (existsSync(fullPath)) {
+      preFinalAuditBusinessDigests.set(f.path, await computeFileDigest(fullPath));
+    }
+  }
+
+  // §6.1 step 7: Run Final Auditor
+  // Phase 6 F-604: Emit progress at phase start
+  await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Final Auditor', registry: orchestratorRegistry });
+  let finalAuditorPrompt: string;
+  let finalAuditorPromptFile: string | undefined;
+  try {
+    const iterStr = String(iteration).padStart(2, '0');
+    const promptResult = await buildPrompt(
+      projectRoot,
+      'final-auditor.md',
+      (template) => buildFinalAuditorPrompt(template, {
+        run_id: runId,
+        iteration,
+        project_root: projectRoot,
+        plan_path: join(projectRoot, '.agent/plan.md'),
+        goal_path: join(projectRoot, '.agent/GOAL.md'),
+        handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+        audit_report_path: join(projectRoot, '.agent/audit-report.md'),
+        verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
+        changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
+        untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
+        scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
+        diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
+        final_audit_path: join(projectRoot, '.agent/final-audit.md'),
+        goal_digest: currentGoalDigest,
+        diff_digest: currentDiffDigest,
+        audit_report_digest: currentAuditReportDigest,
+        verification_manifest_digest: verificationManifestDigest,
+      }),
+      { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'final-auditor' },
+    );
+    finalAuditorPrompt = promptResult.prompt;
+    finalAuditorPromptFile = promptResult.prompt_file_path ?? undefined;
+  } catch (err) {
+    await transitionToBlocked(stateStore, `Final Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+    return makeBlockedResult(runId, projectRoot, 'Final Auditor prompt build failed', 'CONFIG_ERROR', currentBranch);
+  }
+
+  let finalAuditorResult;
+  let finalAuditorCleanupResult: PromptCleanupResult | undefined;
+  try {
+    const finalAuditorInput = buildFinalAuditorInput({
+      run_id: runId,
+      iteration,
+      project_root: projectRoot,
+      command_template: resolveCommandForAgent(config.agents.final_auditor.command, config.agents.final_auditor.provider, config),
+      timeout_seconds: config.agents.final_auditor.timeout_seconds,
+      prompt: finalAuditorPrompt,
+      prompt_file: finalAuditorPromptFile,
+      signal: combinedSignal,
+    });
+
+    finalAuditorResult = await runAgent(finalAuditorInput, projectRoot);
+  } finally {
+    if (finalAuditorPromptFile) finalAuditorCleanupResult = await deletePromptFile(finalAuditorPromptFile);
+  }
+
+  // Phase 6: Emit final-auditor transcript and progress
+  if (finalAuditorResult) {
+    emitTranscript({ projectRoot, role: 'final-auditor', iteration, runId, startedAt: new Date().toISOString(), result: finalAuditorResult, registry: orchestratorRegistry });
+  }
+  await emitProgress({ projectRoot, stateStore, lastEvent: 'Final Auditor completed', registry: orchestratorRegistry });
+
+  if (finalAuditorCleanupResult && !finalAuditorCleanupResult.success) {
+    await transitionToBlocked(stateStore, `Final Auditor prompt cleanup failed: ${finalAuditorCleanupResult.error}`);
+    return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${finalAuditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
+  }
+
+  if (finalAuditorResult.status === 'cancelled') {
+    await stateStore.transition(PhaseEnum.CANCELLED);
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final auditor completed', 'CANCELLED', finalAuditorResult.error?.message);
+    return makeResult(
+      runId, PhaseEnum.CANCELLED, 4, currentBranch, 'PASS', [],
+      'Run cancelled by user request',
+      `Final Auditor cancelled: ${finalAuditorResult.error?.message ?? 'unknown'}`,
+      null,
+    );
+  }
+
+  if (finalAuditorResult.status !== 'success') {
+    await transitionToBlocked(stateStore, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`);
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final auditor completed', 'FAIL', finalAuditorResult.error?.message);
+    return makeBlockedResult(runId, projectRoot, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
+  }
+
+  // §6.1 step 8: Validate Final Auditor output
+  const finalAuditValidation = validateFinalAuditorOutput({
+    projectRoot,
+    runId,
+    iteration,
+    expectedGoalDigest: currentGoalDigest,
+    expectedDiffDigest: currentDiffDigest,
+    expectedAuditReportDigest: currentAuditReportDigest,
+    expectedVerificationManifestDigest: verificationManifestDigest,
+  });
+
+  if (!finalAuditValidation.valid) {
+    const errorCode = finalAuditValidation.decision === 'PASS'
+      ? 'FINAL_AUDIT_SCHEMA_ERROR' as ErrorCategory
+      : 'FINAL_AUDIT_FAILED' as ErrorCategory;
+    await transitionToBlocked(stateStore, `Final Audit validation failed: ${finalAuditValidation.errors.join('; ')}`);
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final audit validation', 'FAIL', finalAuditValidation.errors.join('; '));
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Final Audit validation failed: ${finalAuditValidation.errors.join('; ')}`,
+      errorCode,
+      currentBranch,
+    );
+  }
+
+  const finalAuditDecision = finalAuditValidation.effectiveDecision ?? finalAuditValidation.decision;
+
+  if (finalAuditDecision !== 'PASS') {
+    await transitionToBlocked(stateStore, `Final Audit decision: ${finalAuditDecision}`);
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final audit completed', finalAuditDecision === 'FAILED' ? 'FAIL' : 'BLOCKED');
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Final Audit decision: ${finalAuditDecision}. Cannot commit.`,
+      'FINAL_AUDIT_FAILED',
+      currentBranch,
+    );
+  }
+
+  await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final audit completed', 'PASS');
+
+  // F-501R2: Verify Final Auditor workspace immutability via exhaustive digest comparison.
+  // Pass 1: For EVERY file in the pre-snapshot, re-compute current digest regardless of
+  // whether it appears in the post-diff. This catches revert-to-base (file matches base,
+  // so it disappears from git diff, but content differs from the pre-snapshot).
+  // Pass 2: Detect new business files not in the pre-snapshot.
+  const postFinalAuditDiffResult = await collectDiff({ projectRoot, baseCommit, iteration });
+  const finalAuditBusinessViolations: string[] = [];
+
+  // Pass 1: Exhaustive re-verification of all pre-snapshot business files
+  for (const [path, preDigest] of preFinalAuditBusinessDigests) {
+    const fullPath = join(projectRoot, path);
+    if (!existsSync(fullPath)) {
+      finalAuditBusinessViolations.push(`${path} (deleted by final auditor)`);
+    } else {
+      const currentDigest = await computeFileDigest(fullPath);
+      if (currentDigest !== preDigest) {
+        finalAuditBusinessViolations.push(`${path} (content modified)`);
+      }
+    }
+  }
+
+  // Pass 2: Detect new business files (in post-diff but not in pre-snapshot)
+  for (const f of postFinalAuditDiffResult.changedFiles.files) {
+    if (f.path.startsWith('.agent/')) continue;
+    if (!preFinalAuditBusinessDigests.has(f.path)) {
+      finalAuditBusinessViolations.push(`${f.path} (new)`);
+    }
+  }
+  for (const f of postFinalAuditDiffResult.untrackedFiles.files) {
+    if (f.path.startsWith('.agent/')) continue;
+    if (!preFinalAuditBusinessDigests.has(f.path)) {
+      finalAuditBusinessViolations.push(`${f.path} (new untracked)`);
+    }
+  }
+
+  if (finalAuditBusinessViolations.length > 0) {
+    await transitionToBlocked(stateStore, `Final Auditor modified business files: ${finalAuditBusinessViolations.join(', ')}`);
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final auditor workspace', 'FAIL', `Modified: ${finalAuditBusinessViolations.join(', ')}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Final Auditor modified business files: ${finalAuditBusinessViolations.join(', ')}. Only .agent/final-audit.md may be written.`,
+      'SCOPE_VIOLATION',
+      currentBranch,
+    );
+  }
+
+  // F-501: Use post-Final-Auditor diff for commit (includes final-audit.md)
+  const commitDiffResult = postFinalAuditDiffResult;
+
+  // §6.3: --no-commit path
+  if (noCommit || !config.git.commit_on_pass) {
+    await stateStore.update(() => ({
+      commit_skipped: true,
+      skip_reason: noCommit ? '--no-commit' : 'commit_on_pass is false',
+      finalized_at: new Date().toISOString(),
+    }));
+    await stateStore.transition(PhaseEnum.PASSED);
+    await emitProgress({ projectRoot, stateStore, lastEvent: 'Finalization PASSED (commit skipped)', registry: orchestratorRegistry, finalAuditDecision: 'PASS' });
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS', 'commit skipped');
+
+    const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`);
+    return makeResult(
+      runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
+      artifactPaths,
+      'Final Audit PASSED. Commit skipped (--no-commit).',
+      'Final Audit PASSED. Commit skipped.',
+      null,
+      null, true, null, false, noCommit ? '--no-commit' : 'commit_on_pass is false',
+    );
+  }
+
+  // §6.1 step 9: Build the set of files to commit
+  // F-501: Use commitDiffResult (post-Final-Auditor) instead of finalDiffResult
+  const versionedArtifacts = VERSIONED_ARTIFACT_PATHS.filter(p => existsSync(join(projectRoot, p)));
+  const businessFiles = commitDiffResult.changedFiles.files
+    .map(f => f.path)
+    .filter(p => !p.startsWith('.agent/'));
+  const allCommitFiles = [...versionedArtifacts, ...businessFiles];
+  const allowedSet = buildAllowedCommitSet(versionedArtifacts, businessFiles);
+
+  // §6.1 step 10: Stage files
+  const stageResult = await stageFiles(projectRoot, allCommitFiles);
+  if (!stageResult.success) {
+    await transitionToBlocked(stateStore, `Staging failed: ${stageResult.error}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Staging failed: ${stageResult.error}`,
+      'GIT_COMMIT_ERROR',
+      currentBranch,
+    );
+  }
+
+  // §6.1 step 11: Verify staged set
+  const stagedFiles = await getStagedFiles(projectRoot);
+  const violations = findStagedSetViolations(stagedFiles, allowedSet);
+  if (violations.length > 0) {
+    await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
+    await transitionToBlocked(stateStore, `Staged set violation: ${violations.join(', ')}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Staged set contains disallowed files: ${violations.join(', ')}`,
+      'PRE_COMMIT_STAGED_SET_VIOLATION',
+      currentBranch,
+    );
+  }
+
+  // §6.1 step 12: Create commit
+  let commitMessage: string;
+  try {
+    const shortGoalDigest = goalDigest.replace('sha256:', '').slice(0, 12);
+    commitMessage = renderCommitMessage(config.git.commit_template, {
+      task_slug: (await stateStore.read()).task_slug,
+      run_id: runId,
+      iteration,
+      short_goal_digest: shortGoalDigest,
+    });
+  } catch (err) {
+    await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
+    await transitionToBlocked(stateStore, `Commit message template error: ${err instanceof Error ? err.message : String(err)}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Commit message template error: ${err instanceof Error ? err.message : String(err)}`,
+      'GIT_COMMIT_ERROR',
+      currentBranch,
+    );
+  }
+
+  const commitResult = await createCommit(projectRoot, commitMessage);
+  if (!commitResult.success) {
+    await transitionToBlocked(stateStore, `Commit failed: ${commitResult.error}`);
+    return makeBlockedResult(
+      runId, projectRoot,
+      `Commit failed: ${commitResult.error}`,
+      'GIT_COMMIT_ERROR',
+      currentBranch,
+    );
+  }
+
+  const commitSha = commitResult.commitSha!;
+
+  // Record commit in state
+  await stateStore.update(() => ({
+    final_commit_sha: commitSha,
+    final_commit_message: commitMessage,
+  }));
+
+  // §6.4: Create tag if requested
+  let tagName: string | null = null;
+  let tagCreated = false;
+
+  if (tag || config.git.create_tag) {
+    try {
+      const state = await stateStore.read();
+      tagName = renderTagName(config.git.tag_template, {
+        run_id: runId,
+        task_slug: state.task_slug,
+      });
+    } catch (err) {
+      await stateStore.update(() => ({
+        last_error: `Tag template error: ${err instanceof Error ? err.message : String(err)}`,
+        tag_name: null,
+        tag_created: false,
+      }));
+      await stateStore.transition(PhaseEnum.BLOCKED);
+      return makeResult(
+        runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
+        VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+        'Commit created but tag template error',
+        `Commit ${commitSha.slice(0, 8)} created but tag template error: ${err instanceof Error ? err.message : String(err)}`,
+        {
+          code: 'GIT_TAG_ERROR',
+          message: `Tag template error: ${err instanceof Error ? err.message : String(err)}`,
+          resumable: true,
+          suggested_action: 'Fix tag template and resume to create tag',
+        },
+        commitSha, false, null, false,
+      );
+    }
+
+    const existingTarget = await getTagTarget(projectRoot, tagName);
+    if (existingTarget !== null) {
+      if (existingTarget === commitSha) {
+        tagCreated = true;
+      } else {
+        await stateStore.update(() => ({
+          last_error: `Tag ${tagName} already exists pointing to ${existingTarget}, expected ${commitSha}`,
+          tag_name: tagName,
+          tag_created: false,
+        }));
+        await stateStore.transition(PhaseEnum.BLOCKED);
+        return makeResult(
+          runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
+          VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+          'Commit created but tag conflict',
+          `Commit ${commitSha.slice(0, 8)} created but tag ${tagName} points to different commit ${existingTarget.slice(0, 8)}`,
+          {
+            code: 'GIT_TAG_ERROR',
+            message: `Tag ${tagName} already exists pointing to ${existingTarget}`,
+            resumable: false,
+            suggested_action: 'Resolve tag conflict manually',
+          },
+          commitSha, false, tagName, false,
+        );
+      }
+    } else {
+      const tagResult = await createTag(projectRoot, tagName, commitSha);
+      if (!tagResult.success) {
+        await stateStore.update(() => ({
+          last_error: `Tag creation failed: ${tagResult.error}`,
+          tag_name: tagName,
+          tag_created: false,
+        }));
+        await stateStore.transition(PhaseEnum.BLOCKED);
+        return makeResult(
+          runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
+          VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+          'Commit created but tag failed',
+          `Commit ${commitSha.slice(0, 8)} created but tag failed: ${tagResult.error}`,
+          {
+            code: 'GIT_TAG_ERROR',
+            message: `Tag creation failed: ${tagResult.error}`,
+            resumable: true,
+            suggested_action: 'Fix tag issue and resume to create tag',
+          },
+          commitSha, false, tagName, false,
+        );
+      }
+      tagCreated = true;
+    }
+  }
+
+  // §6.1 step 13: Transition to PASSED
+  await stateStore.update(() => ({
+    finalized_at: new Date().toISOString(),
+    tag_name: tagName,
+    tag_created: tagCreated,
+  }));
+  await stateStore.transition(PhaseEnum.PASSED);
+  await emitProgress({ projectRoot, stateStore, lastEvent: 'Finalization PASSED', registry: orchestratorRegistry, commitSha: commitSha, finalAuditDecision: 'PASS' });
+  await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
+
+  const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`);
+  return makeResult(
+    runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
+    artifactPaths,
+    `Final Audit PASSED. Committed as ${commitSha.slice(0, 8)}${tagCreated && tagName ? `, tagged ${tagName}` : ''}.`,
+    `Final Audit PASSED. Committed as ${commitSha.slice(0, 8)}.`,
+    null,
+    commitSha, false, tagName, tagCreated,
+  );
+}
+
 function makeResult(
   runId: string,
   phase: Phase,
@@ -1521,6 +2356,11 @@ function makeResult(
   nextAction: string,
   message: string,
   error: ReviewLoopError | null,
+  commitSha: string | null = null,
+  commitSkipped: boolean = false,
+  tagName: string | null = null,
+  tagCreated: boolean = false,
+  skipReason: string | null = null,
 ): OrchestratorResult {
   return {
     run_id: runId,
@@ -1532,6 +2372,11 @@ function makeResult(
     next_action: nextAction,
     message,
     error,
+    commit_sha: commitSha,
+    commit_skipped: commitSkipped,
+    tag_name: tagName,
+    tag_created: tagCreated,
+    skip_reason: skipReason,
   };
 }
 
@@ -1745,4 +2590,70 @@ async function snapshotWorkspaceDigests(
     }
   }
   return digests;
+}
+
+// ─── Phase 6: Progress & Transcript Helpers ──────────────────
+
+async function emitProgress(params: {
+  projectRoot: string;
+  stateStore: StateStore;
+  lastEvent: string;
+  registry?: OrchestratorFileRegistry;
+  commitSha?: string | null;
+  finalAuditDecision?: string | null;
+}): Promise<void> {
+  try {
+    const state = await params.stateStore.read();
+    const data = buildProgressData({
+      run_id: state.run_id,
+      phase: state.phase,
+      iteration: state.iteration,
+      max_iterations: state.max_iterations,
+      branch: state.branch,
+      task_slug: state.task_slug,
+      started_at: state.started_at,
+      stages: state.stages as Record<string, import('../types.js').StageInfo>,
+      commit_sha: params.commitSha ?? state.final_commit_sha,
+      final_audit_decision: params.finalAuditDecision ?? null,
+      last_event: params.lastEvent,
+    });
+    await writeProgress(params.projectRoot, data);
+    writeProgressMarkdown(params.projectRoot, data);
+    // Register as orchestrator-owned so Scope Guard excludes them
+    if (params.registry) {
+      const jsonPath = join(params.projectRoot, '.agent', 'progress.json');
+      const mdPath = join(params.projectRoot, '.agent', 'progress.md');
+      if (existsSync(jsonPath)) params.registry.register(jsonPath, computeDigest(readFileSync(jsonPath, 'utf8')));
+      if (existsSync(mdPath)) params.registry.register(mdPath, computeDigest(readFileSync(mdPath, 'utf8')));
+    }
+  } catch { /* progress writing is best-effort */ }
+}
+
+function emitTranscript(params: {
+  projectRoot: string;
+  role: import('../types.js').TranscriptEntry['role'];
+  iteration: number;
+  runId: string;
+  startedAt: string;
+  result: import('../types.js').AgentRunResult;
+  registry?: OrchestratorFileRegistry;
+}): void {
+  try {
+    const entry = buildTranscriptEntry({
+      role: params.role,
+      iteration: params.iteration,
+      run_id: params.runId,
+      started_at: params.startedAt,
+      result: params.result,
+    });
+    writeTranscript(params.projectRoot, entry);
+    // Register as orchestrator-owned so Scope Guard excludes it
+    if (params.registry) {
+      const iterStr = String(params.iteration).padStart(2, '0');
+      const transcriptPath = join(params.projectRoot, '.agent', 'transcripts', `iteration-${iterStr}-${params.role}.md`);
+      if (existsSync(transcriptPath)) {
+        params.registry.register(transcriptPath, computeDigest(readFileSync(transcriptPath, 'utf8')));
+      }
+    }
+  } catch { /* transcript writing is best-effort */ }
 }

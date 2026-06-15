@@ -420,6 +420,9 @@ decision: PASS
 final_iteration: 2
 goal_digest: "${VALID_DIGEST}"
 diff_digest: "${VALID_DIGEST}"
+audit_report_digest: "${VALID_DIGEST}"
+verification_manifest_digest: "${VALID_DIGEST}"
+created_at: "2026-06-14T00:00:00.000Z"
 ---
 
 # Final Audit`;
@@ -438,6 +441,9 @@ decision: FAILED
 final_iteration: 3
 goal_digest: "${VALID_DIGEST}"
 diff_digest: "${VALID_DIGEST}"
+audit_report_digest: "${VALID_DIGEST}"
+verification_manifest_digest: "${VALID_DIGEST}"
+created_at: "2026-06-14T00:00:00.000Z"
 ---
 
 # Final Audit`;
@@ -455,6 +461,9 @@ decision: BLOCKED
 final_iteration: 1
 goal_digest: "${VALID_DIGEST}"
 diff_digest: "${VALID_DIGEST}"
+audit_report_digest: "${VALID_DIGEST}"
+verification_manifest_digest: "${VALID_DIGEST}"
+created_at: "2026-06-14T00:00:00.000Z"
 ---
 
 # Final Audit`;

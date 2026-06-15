@@ -1,0 +1,17 @@
+{
+  "name": "review-loop",
+  "version": "0.1.0",
+  "description": "Codex plugin for review-loop CLI orchestration",
+  "type": "local-workflow",
+  "requirements": [
+    "review-loop CLI must be installed and available in PATH",
+    "Codex CLI or Claude CLI must be authenticated",
+    "Project must be a git repository"
+  ],
+  "capabilities": {
+    "auto_push": false,
+    "auto_pr": false,
+    "workspace_cleanup": false,
+    "destructive_git": false
+  }
+}

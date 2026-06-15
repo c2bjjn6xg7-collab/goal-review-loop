@@ -42,7 +42,7 @@ export const LEGAL_TRANSITIONS: ReadonlyMap<Phase, ReadonlySet<Phase>> = new Map
   [Phase.VERIFYING, new Set([Phase.AUDITING, Phase.REWORKING, Phase.BLOCKED, Phase.CANCELLED])],
   [Phase.AUDITING, new Set([Phase.FINALIZING, Phase.REWORKING, Phase.BLOCKED, Phase.CANCELLED])],
   [Phase.REWORKING, new Set([Phase.DEVELOPING, Phase.VERIFYING, Phase.BLOCKED, Phase.FAILED, Phase.CANCELLED])],
-  [Phase.FINALIZING, new Set([Phase.PASSED, Phase.BLOCKED])],
+  [Phase.FINALIZING, new Set([Phase.PASSED, Phase.BLOCKED, Phase.CANCELLED])],
   // Terminal phases — no outgoing transitions
   [Phase.PASSED, new Set()],
   [Phase.FAILED, new Set()],
@@ -91,6 +91,20 @@ export interface RunState {
   last_error: string | null;
   /** ISO timestamp when cancel was requested, or null. */
   cancel_requested_at: string | null;
+  /** SHA of the final commit, if created. */
+  final_commit_sha: string | null;
+  /** The commit message used. */
+  final_commit_message: string | null;
+  /** ISO timestamp when finalization completed. */
+  finalized_at: string | null;
+  /** Whether commit was skipped (--no-commit or other reason). */
+  commit_skipped: boolean;
+  /** Reason commit was skipped, if applicable. */
+  skip_reason: string | null;
+  /** Tag name, if created. */
+  tag_name: string | null;
+  /** Whether the tag was successfully created. */
+  tag_created: boolean;
   stages: Record<string, StageInfo>;
 }
 
@@ -121,7 +135,7 @@ export interface AgentResult {
  * Unified input for all three role adapters.
  */
 export interface AgentRunInput {
-  role: 'planner' | 'developer' | 'auditor';
+  role: 'planner' | 'developer' | 'auditor' | 'final-auditor';
   project_root: string;
   run_id: string;
   iteration: number;
@@ -164,6 +178,13 @@ export const ErrorCategory = {
   STATE_CONFLICT: 'STATE_CONFLICT',
   LOCK_CONFLICT: 'LOCK_CONFLICT',
   GIT_COMMIT_ERROR: 'GIT_COMMIT_ERROR',
+  FINAL_AUDIT_FAILED: 'FINAL_AUDIT_FAILED',
+  FINAL_AUDIT_SCHEMA_ERROR: 'FINAL_AUDIT_SCHEMA_ERROR',
+  PRE_COMMIT_DIGEST_MISMATCH: 'PRE_COMMIT_DIGEST_MISMATCH',
+  PRE_COMMIT_SCOPE_VIOLATION: 'PRE_COMMIT_SCOPE_VIOLATION',
+  PRE_COMMIT_STAGED_SET_VIOLATION: 'PRE_COMMIT_STAGED_SET_VIOLATION',
+  GIT_TAG_ERROR: 'GIT_TAG_ERROR',
+  UNSUPPORTED_PUSH: 'UNSUPPORTED_PUSH',
   USER_CANCELLED: 'USER_CANCELLED',
   INFRASTRUCTURE_ERROR: 'INFRASTRUCTURE_ERROR',
 } as const;
@@ -186,6 +207,13 @@ export const ERROR_CATEGORY_DEFAULT_RESULT: ReadonlyMap<ErrorCategory, Phase> = 
   [ErrorCategory.STATE_CONFLICT, Phase.BLOCKED],
   [ErrorCategory.LOCK_CONFLICT, Phase.BLOCKED],
   [ErrorCategory.GIT_COMMIT_ERROR, Phase.BLOCKED],
+  [ErrorCategory.FINAL_AUDIT_FAILED, Phase.BLOCKED],
+  [ErrorCategory.FINAL_AUDIT_SCHEMA_ERROR, Phase.BLOCKED],
+  [ErrorCategory.PRE_COMMIT_DIGEST_MISMATCH, Phase.BLOCKED],
+  [ErrorCategory.PRE_COMMIT_SCOPE_VIOLATION, Phase.BLOCKED],
+  [ErrorCategory.PRE_COMMIT_STAGED_SET_VIOLATION, Phase.BLOCKED],
+  [ErrorCategory.GIT_TAG_ERROR, Phase.BLOCKED],
+  [ErrorCategory.UNSUPPORTED_PUSH, Phase.BLOCKED],
   [ErrorCategory.USER_CANCELLED, Phase.CANCELLED],
   [ErrorCategory.INFRASTRUCTURE_ERROR, Phase.BLOCKED],
 ]);
@@ -332,6 +360,9 @@ export interface FinalAuditFrontMatter {
   final_iteration: number;
   goal_digest: string;
   diff_digest: string;
+  audit_report_digest: string;
+  verification_manifest_digest: string;
+  created_at: string;
 }
 
 /**
@@ -367,7 +398,9 @@ export interface ReviewLoopConfig {
     planner: AgentConfig;
     developer: AgentConfig;
     auditor: AgentConfig;
+    final_auditor: AgentConfig;
   };
+  providers?: Record<string, ProviderConfig>;
   loop: {
     max_iterations: number;
     /** Whether to archive per-iteration history. Default: true. */
@@ -382,6 +415,66 @@ export interface ReviewLoopConfig {
 export interface AgentConfig {
   command: string[];
   timeout_seconds: number;
+  provider?: string;
+}
+
+export interface ProviderConfig {
+  enabled: boolean;
+  command_template?: string[];
+  prompt_transport?: 'stdin' | 'prompt_file' | 'argv';
+  health_check?: string[];
+  permission_mode?: string;
+  allowed_tools?: string;
+  transcript_mode?: 'stdout_stderr' | 'jsonl' | 'none';
+}
+
+export interface ProviderProfile {
+  provider_id: string;
+  display_name: string;
+  command_template: string[];
+  prompt_transport: 'stdin' | 'prompt_file' | 'argv';
+  health_check?: string[];
+  permission_modes: string[];
+  transcript_mode: 'stdout_stderr' | 'jsonl' | 'none';
+  enabled: boolean;
+  capability_tier?: 'strong' | 'balanced' | 'cheap';
+  cost_tier?: 'high' | 'medium' | 'low';
+  recommended_task_types?: string[];
+  max_parallel_runs?: number;
+  sensitive_task_allowed?: boolean;
+  worker_roles?: string[];
+  escalation_target?: string;
+}
+
+export interface ProgressData {
+  schema_version: 1;
+  run_id: string;
+  phase: Phase;
+  iteration: number;
+  max_iterations: number;
+  branch: string;
+  task_slug: string;
+  started_at: string;
+  updated_at: string;
+  last_event: string;
+  last_event_at: string;
+  stages: Record<string, StageInfo>;
+  commit_sha: string | null;
+  final_audit_decision: string | null;
+}
+
+export interface TranscriptEntry {
+  role: 'planner' | 'developer' | 'auditor' | 'final-auditor';
+  iteration: number;
+  run_id: string;
+  started_at: string;
+  finished_at: string;
+  duration_ms: number;
+  status: 'success' | 'failed' | 'timeout' | 'cancelled';
+  exit_code: number | null;
+  stdout_summary: string;
+  stderr_summary: string;
+  artifacts: string[];
 }
 
 export interface GitConfig {
@@ -733,4 +826,14 @@ export interface StatusOutput {
   started_at: string;
   updated_at: string;
   next_step: string;
+  final_audit_decision: string | null;
+  final_audit_path: string | null;
+  commit_on_pass: boolean;
+  commit_skipped: boolean;
+  final_commit_sha: string | null;
+  tag_requested: boolean;
+  tag_name: string | null;
+  tag_created: boolean;
+  push_enabled: boolean;
+  finalization_next_step: string | null;
 }

@@ -34,3 +34,8 @@ export { runAgent, recordPreCallState, verifyArtifactFreshness, type PreCallArti
 export { buildPlannerInput, validatePlannerOutput, type PlannerValidationResult } from './agents/planner-adapter.js';
 export { buildDeveloperInput, validateDeveloperOutput, type DeveloperValidationResult } from './agents/developer-adapter.js';
 export { buildAuditorInput, validateAuditorOutput, type AuditorValidationResult } from './agents/auditor-adapter.js';
+
+// Phase 5: Commit management & final audit
+export { renderCommitMessage, renderTagName, isLocalOnlyPath, stageFiles, getStagedFiles, findStagedSetViolations, createCommit, createTag, getTagTarget, commitExists, findTrackedLocalOnlyArtifacts, buildAllowedCommitSet, VERSIONED_ARTIFACT_PATHS, LOCAL_ONLY_PATTERNS } from './git/commit-manager.js';
+export { buildFinalAuditorInput, validateFinalAuditorOutput } from './agents/final-auditor-adapter.js';
+export { buildFinalAuditorPrompt, type FinalAuditorPromptContext } from './agents/prompt-builder.js';

@@ -1,0 +1,72 @@
+import type { ProviderProfile } from '../types.js';
+
+export const BUILTIN_PROVIDERS: ReadonlyArray<ProviderProfile> = [
+  {
+    provider_id: 'claude',
+    display_name: 'Claude Code CLI',
+    command_template: [
+      'sh', '-lc',
+      'exec claude -p --permission-mode acceptEdits < "$1"',
+      'claude-developer',
+      '{prompt_file}',
+    ],
+    prompt_transport: 'prompt_file',
+    health_check: ['claude', '--version'],
+    permission_modes: ['acceptEdits', 'bypassPermissions', 'dangerously-skip-permissions'],
+    transcript_mode: 'stdout_stderr',
+    enabled: true,
+    capability_tier: 'strong',
+    cost_tier: 'high',
+    recommended_task_types: ['architecture', 'bugfix', 'tests', 'refactor'],
+    max_parallel_runs: 1,
+    sensitive_task_allowed: false,
+    worker_roles: ['premium_worker'],
+  },
+  {
+    provider_id: 'codex',
+    display_name: 'OpenAI Codex CLI',
+    command_template: ['codex', 'exec', '{prompt_file}'],
+    prompt_transport: 'prompt_file',
+    health_check: ['codex', '--version'],
+    permission_modes: ['full-auto'],
+    transcript_mode: 'stdout_stderr',
+    enabled: true,
+    capability_tier: 'balanced',
+    cost_tier: 'medium',
+    recommended_task_types: ['bugfix', 'tests', 'docs'],
+    max_parallel_runs: 1,
+    worker_roles: ['balanced_worker'],
+  },
+  {
+    provider_id: 'codebuddy',
+    display_name: 'CodeBuddy CLI',
+    command_template: ['codebuddy', 'run', '--prompt-file', '{prompt_file}'],
+    prompt_transport: 'prompt_file',
+    health_check: ['codebuddy', '--version'],
+    permission_modes: ['default'],
+    transcript_mode: 'stdout_stderr',
+    enabled: false,
+    capability_tier: 'balanced',
+    cost_tier: 'medium',
+    recommended_task_types: ['bugfix', 'tests'],
+    worker_roles: ['balanced_worker'],
+  },
+  {
+    provider_id: 'opencode',
+    display_name: 'OpenCode CLI',
+    command_template: ['opencode', '--prompt-file', '{prompt_file}'],
+    prompt_transport: 'prompt_file',
+    health_check: ['opencode', '--version'],
+    permission_modes: ['default'],
+    transcript_mode: 'stdout_stderr',
+    enabled: false,
+    capability_tier: 'cheap',
+    cost_tier: 'low',
+    recommended_task_types: ['docs', 'tests'],
+    worker_roles: ['cheap_worker'],
+  },
+];
+
+export function getBuiltinProvider(providerId: string): ProviderProfile | undefined {
+  return BUILTIN_PROVIDERS.find(p => p.provider_id === providerId);
+}

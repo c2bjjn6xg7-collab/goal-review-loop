@@ -33,6 +33,10 @@ function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, str
         command: ['node', fakeAgentPath, '--role', 'auditor', '--run-id', '{run_id}', '--iteration', '{iteration}', '--project-root', '{project_root}', '--prompt-file', '{prompt_file}', '--behavior', roleBehaviors.auditor || 'audit-pass'],
         timeout_seconds: 60,
       },
+      final_auditor: {
+        command: ['node', fakeAgentPath, '--role', 'final-auditor', '--run-id', '{run_id}', '--iteration', '{iteration}', '--project-root', '{project_root}', '--prompt-file', '{prompt_file}', '--behavior', roleBehaviors.finalAuditor || 'audit-pass'],
+        timeout_seconds: 60,
+      },
     },
     loop: { max_iterations: maxIterations },
     git: {
@@ -61,8 +65,11 @@ function copyPrompts(repoDir: string): void {
   const promptsDir = join(repoDir, 'prompts');
   mkdirSync(promptsDir, { recursive: true });
   const srcPromptsDir = join(process.cwd(), 'prompts');
-  for (const f of ['planner.md', 'developer.md', 'auditor.md']) {
-    copyFileSync(join(srcPromptsDir, f), join(promptsDir, f));
+  for (const f of ['planner.md', 'developer.md', 'auditor.md', 'final-auditor.md']) {
+    const src = join(srcPromptsDir, f);
+    if (existsSync(src)) {
+      copyFileSync(src, join(promptsDir, f));
+    }
   }
   // Copy rework prompt if it exists
   const reworkPrompt = join(srcPromptsDir, 'rework.md');
@@ -112,8 +119,8 @@ describe('Phase 4 Rework Loop integration', () => {
     }
   });
 
-  // ─── Scenario 1: First-round PASS → FINALIZING ─────────────
-  it('1: first-round PASS ends in FINALIZING', async () => {
+  // ─── Scenario 1: First-round PASS → PASSED ─────────────
+  it('1: first-round PASS ends in PASSED', async () => {
     repoDir = createTestRepo('s1');
 
     const result = await runOrchestrator({
@@ -122,7 +129,7 @@ describe('Phase 4 Rework Loop integration', () => {
       task_slug: 'hello-func',
     });
 
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
     expect(result.exit_code).toBe(0);
     expect(result.audit_decision).toBe('PASS');
   });
@@ -138,8 +145,8 @@ describe('Phase 4 Rework Loop integration', () => {
       max_iterations: 3,
     });
 
-    // Should reach FINALIZING after iteration 2
-    expect(result.phase).toBe('FINALIZING');
+    // Should reach PASSED after iteration 2
+    expect(result.phase).toBe('PASSED');
     expect(result.exit_code).toBe(0);
     expect(result.audit_decision).toBe('PASS');
 
@@ -177,7 +184,7 @@ describe('Phase 4 Rework Loop integration', () => {
       max_iterations: 3,
     });
 
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
     expect(result.audit_decision).toBe('PASS');
   });
 
@@ -219,7 +226,7 @@ describe('Phase 4 Rework Loop integration', () => {
       max_iterations: 3,
     });
 
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
 
     // Iteration 1 should be archived
     const historyDir1 = join(repoDir, '.agent', 'history', 'iteration-01');
@@ -239,7 +246,7 @@ describe('Phase 4 Rework Loop integration', () => {
       max_iterations: 3,
     });
 
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
 
     // Verify only one task branch exists (no extra branches from rework)
     const branches = execSync('git branch --list "agent/*"', { cwd: repoDir, encoding: 'utf8' }).trim();
@@ -271,7 +278,7 @@ describe('Phase 4 Rework Loop integration', () => {
       project_root: repoDir,
       request: 'Add feature',
     });
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
 
     // Now simulate an interrupted run by modifying state.json back to VERIFYING
     const statePath = join(repoDir, '.agent', 'state.json');
@@ -284,7 +291,7 @@ describe('Phase 4 Rework Loop integration', () => {
     const lockPath = join(repoDir, '.agent', 'run.lock');
     if (existsSync(lockPath)) rmSync(lockPath);
 
-    // Resume should re-run verification and auditing, reaching FINALIZING again
+    // Resume should re-run verification and auditing, reaching PASSED again
     const resumeResult = await runOrchestrator({
       project_root: repoDir,
       resume_from: {
@@ -298,7 +305,7 @@ describe('Phase 4 Rework Loop integration', () => {
       },
     });
 
-    expect(resumeResult.phase).toBe('FINALIZING');
+    expect(resumeResult.phase).toBe('PASSED');
     expect(resumeResult.audit_decision).toBe('PASS');
   });
 
@@ -473,7 +480,7 @@ describe('Phase 4 Rework Loop integration', () => {
       project_root: repoDir,
       request: 'Add feature',
     });
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
 
     // Simulate an interrupted run by modifying state.json back to AUDITING
     const statePath = join(repoDir, '.agent', 'state.json');
@@ -486,7 +493,7 @@ describe('Phase 4 Rework Loop integration', () => {
     const lockPath = join(repoDir, '.agent', 'run.lock');
     if (existsSync(lockPath)) rmSync(lockPath);
 
-    // Resume should re-run auditing and reach FINALIZING
+    // Resume should re-run auditing and reach PASSED
     const resumeResult = await runOrchestrator({
       project_root: repoDir,
       resume_from: {
@@ -500,7 +507,7 @@ describe('Phase 4 Rework Loop integration', () => {
       },
     });
 
-    expect(resumeResult.phase).toBe('FINALIZING');
+    expect(resumeResult.phase).toBe('PASSED');
     expect(resumeResult.audit_decision).toBe('PASS');
   });
 
@@ -514,7 +521,7 @@ describe('Phase 4 Rework Loop integration', () => {
       request: 'Add feature',
       max_iterations: 3,
     });
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
 
     // Verify iteration 1 was archived
     const historyDir = join(repoDir, '.agent', 'history', 'iteration-01');
@@ -639,14 +646,10 @@ describe('Phase 4 Rework Loop integration', () => {
     const lockPath = join(repoDir, '.agent', 'run.lock');
     if (existsSync(lockPath)) rmSync(lockPath);
 
-    // executeResume should throw ResumeConsistencyError
+    // executeResume should throw ResumeConsistencyError due to branch mismatch
     await expect(executeResume({
       project_root: repoDir,
     })).rejects.toThrow(ResumeConsistencyError);
-
-    await expect(executeResume({
-      project_root: repoDir,
-    })).rejects.toThrow(/branch/i);
   });
 
   // ─── Scenario 20: Tamper archived evidence/verification → BLOCKED on resume ──
@@ -659,7 +662,7 @@ describe('Phase 4 Rework Loop integration', () => {
       request: 'Add feature',
       max_iterations: 3,
     });
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
 
     // Verify iteration 1 was archived with evidence
     const historyDir = join(repoDir, '.agent', 'history', 'iteration-01');

@@ -31,6 +31,10 @@ function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, str
         command: ['node', fakeAgentPath, '--role', 'auditor', '--run-id', '{run_id}', '--iteration', '{iteration}', '--project-root', '{project_root}', '--prompt-file', '{prompt_file}', '--behavior', roleBehaviors.auditor || 'audit-pass'],
         timeout_seconds: 60,
       },
+      final_auditor: {
+        command: ['node', fakeAgentPath, '--role', 'final-auditor', '--run-id', '{run_id}', '--iteration', '{iteration}', '--project-root', '{project_root}', '--prompt-file', '{prompt_file}', '--behavior', roleBehaviors.finalAuditor || 'audit-pass'],
+        timeout_seconds: 60,
+      },
     },
     loop: { max_iterations: 3 },
     git: {
@@ -59,8 +63,11 @@ function copyPrompts(repoDir: string): void {
   const promptsDir = join(repoDir, 'prompts');
   mkdirSync(promptsDir, { recursive: true });
   const srcPromptsDir = join(process.cwd(), 'prompts');
-  for (const f of ['planner.md', 'developer.md', 'auditor.md']) {
-    copyFileSync(join(srcPromptsDir, f), join(promptsDir, f));
+  for (const f of ['planner.md', 'developer.md', 'auditor.md', 'final-auditor.md']) {
+    const src = join(srcPromptsDir, f);
+    if (existsSync(src)) {
+      copyFileSync(src, join(promptsDir, f));
+    }
   }
 }
 
@@ -105,8 +112,8 @@ describe('Run Orchestrator integration', () => {
     }
   });
 
-  // ─── Scenario 1: First-round PASS → FINALIZING ─────────────
-  it('completes first round PASS ending in FINALIZING without commit', async () => {
+  // ─── Scenario 1: First-round PASS → PASSED (with commit) ─────────────
+  it('completes first round PASS ending in PASSED with commit', async () => {
     repoDir = createTestRepo('pass');
 
     const result = await runOrchestrator({
@@ -115,14 +122,15 @@ describe('Run Orchestrator integration', () => {
       task_slug: 'hello-func',
     });
 
-    expect(result.phase).toBe('FINALIZING');
+    expect(result.phase).toBe('PASSED');
     expect(result.exit_code).toBe(0);
     expect(result.audit_decision).toBe('PASS');
     expect(result.artifact_paths.length).toBeGreaterThan(0);
+    expect(result.commit_sha).toBeTruthy();
 
-    // Verify no commit was made
+    // Verify commit exists in git log
     const logOutput = execSync('git log --oneline', { cwd: repoDir, encoding: 'utf8' });
-    expect(logOutput.trim().split('\n').length).toBe(1); // Only initial commit
+    expect(logOutput.trim().split('\n').length).toBe(2); // initial + agent commit
 
     // Verify artifacts exist
     expect(existsSync(join(repoDir, '.agent', 'plan.md'))).toBe(true);

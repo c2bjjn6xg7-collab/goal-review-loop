@@ -8,6 +8,7 @@ import { createStartCommand } from './start.js';
 import { createResumeCommand } from './resume.js';
 import { createStatusCommand } from './status.js';
 import { createCancelCommand } from './cancel.js';
+import { createProvidersCommand } from './providers.js';
 
 export function createCLI(): Command {
   const program = new Command();
@@ -22,6 +23,7 @@ export function createCLI(): Command {
   program.addCommand(createResumeCommand());
   program.addCommand(createStatusCommand());
   program.addCommand(createCancelCommand());
+  program.addCommand(createProvidersCommand());
 
   return program;
 }

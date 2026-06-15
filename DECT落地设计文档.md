@@ -1496,6 +1496,21 @@ Final audit: .agent/final-audit.md
 * 故障排查文档。
 * 示例仓库演示。
 
+### Phase 7：智能任务路由与多 worktree 并发
+
+实现：
+
+* 项目级 Task Graph / DAG 拆解。
+* 任务复杂度分类器。
+* Provider Router：按复杂度、风险、成本和历史通过率选择 Developer Provider。
+* Worktree Scheduler：为可并发任务创建独立 Git worktree 和任务分支。
+* 并发上限、Provider 速率限制和预算控制。
+* Integration Orchestrator：顺序合并已通过任务，重新运行全量验证和集成审计。
+* 冲突、验证失败和集成审计失败时安全停止。
+
+Phase 7 不改变 Phase 1-6 的原则：单个工作区仍只能有一个活动 run；并发只能发生在隔离
+worktree 中，不能多个 CLI 同时写同一个目录。
+
 ---
 
 ## 23. 开发交付清单
@@ -1550,7 +1565,8 @@ Final audit: .agent/final-audit.md
 
 - [ ] 关键阶段中断均可安全 resume。
 - [ ] 不重复 commit。
-- [ ] 并发运行被锁阻止。
+- [ ] Phase 1-6 中，同一工作区并发运行被锁阻止。
+- [ ] Phase 7 中，并发任务只允许在独立 Git worktree 中运行。
 
 ### 安全
 
@@ -1572,4 +1588,5 @@ Final audit: .agent/final-audit.md
 7. 审计后的 diff 变化会使 PASS 作废。
 8. commit 由编排器执行，Developer 和 Auditor 都无权提交。
 9. 默认要求干净工作区，不自动清理用户文件。
-10. MVP 只做本地闭环，不 push、不并行、不自动进化 Harness。
+10. Phase 1-6 只做本地单任务闭环，不 push、不在同一工作区并行、不自动进化 Harness。
+11. 后续并发必须通过 Task Graph、Provider Router、独立 Git worktree 和 Integration Audit 实现。
