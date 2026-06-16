@@ -1,12 +1,17 @@
+# Build and dependency artifacts
 node_modules/
 dist/
 coverage/
+.tsbuildinfo
 
 # Goal Review Loop - local runtime files
 .agent/state.json
 .agent/run.lock
 .agent/iteration-log.md
+.agent/progress.json
+.agent/progress.md
 .agent/verification/
 .agent/evidence/
 .agent/history/
 .agent/debug/
+.agent/transcripts/
