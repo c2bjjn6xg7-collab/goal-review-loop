@@ -165,45 +165,6 @@ review-loop status --watch
 
 Codex Desktop 可以读取 `.agent/` 里的状态、审计报告和 transcript 摘要，但外部 Developer CLI 自己的完整对话历史不一定会原样出现在 Codex 对话里。
 
-### 给朋友使用
-
-朋友只需要：
-
-1. clone 这个仓库
-2. `npm ci && npm run build && npm install -g .`
-3. 自己安装并登录 Claude/Codex 或其他 provider CLI
-4. 在自己的项目里执行 `review-loop init`
-5. 用 `review-loop start --watch --request "..."` 启动任务
-
-你的账号、token、key 不会随仓库一起给出去。
-
-### 开发和验证
-
-```bash
-npm run typecheck
-npm run lint
-npm test
-npm run build
-npm audit --omit=dev
-npm pack --dry-run
-```
-
-### 开源前检查
-
-推荐推送前检查：
-
-```bash
-git status --short
-rg -n --hidden --glob '!node_modules/**' --glob '!dist/**' \
-  "sk-|ghp_|github_pat_|AKIA|BEGIN .*PRIVATE KEY|api[_-]?key|secret|token"
-npm run typecheck
-npm run lint
-npm test
-npm run build
-```
-
-宽泛 secret 扫描可能会扫到测试里的假 secret、变量名 token 等误报，需要人工确认。
-
 ### 协议
 
 MIT
@@ -383,46 +344,6 @@ review-loop status --watch
 Codex Desktop can read `.agent/` status, audit reports, and transcript summaries, but a
 third-party Developer CLI's complete conversation history may not appear verbatim inside
 the Codex chat.
-
-### Sharing With Friends
-
-Your friend can:
-
-1. clone this repository
-2. run `npm ci && npm run build && npm install -g .`
-3. install and authenticate their own Claude/Codex or other provider CLI
-4. run `review-loop init` in their target project
-5. start a task with `review-loop start --watch --request "..."`
-
-Your account, tokens, and keys are not included in this repository.
-
-### Development
-
-```bash
-npm run typecheck
-npm run lint
-npm test
-npm run build
-npm audit --omit=dev
-npm pack --dry-run
-```
-
-### Before Publishing Publicly
-
-Recommended checks before pushing:
-
-```bash
-git status --short
-rg -n --hidden --glob '!node_modules/**' --glob '!dist/**' \
-  "sk-|ghp_|github_pat_|AKIA|BEGIN .*PRIVATE KEY|api[_-]?key|secret|token"
-npm run typecheck
-npm run lint
-npm test
-npm run build
-```
-
-The broad secret scan may report false positives from tests or variable names. Review
-the output manually before publishing.
 
 ### License
 
