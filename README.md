@@ -165,6 +165,10 @@ review-loop status --watch
 
 Codex Desktop 可以读取 `.agent/` 里的状态、审计报告和 transcript 摘要，但外部 Developer CLI 自己的完整对话历史不一定会原样出现在 Codex 对话里。
 
+### 路线图
+
+下一阶段计划是插件体验和可视化进程，详见 [Phase 7 需求文档](docs/phase-7-plugin-and-visual-progress.md)。
+
 ### 协议
 
 MIT
@@ -344,6 +348,10 @@ review-loop status --watch
 Codex Desktop can read `.agent/` status, audit reports, and transcript summaries, but a
 third-party Developer CLI's complete conversation history may not appear verbatim inside
 the Codex chat.
+
+### Roadmap
+
+The next planned phase is plugin experience and visual progress. See the [Phase 7 requirement](docs/phase-7-plugin-and-visual-progress.md).
 
 ### License
 
