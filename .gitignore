@@ -1,0 +1,15 @@
+# Build and dependency artifacts
+node_modules/
+dist/
+coverage/
+.tsbuildinfo
+*.tgz
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Goal Review Loop - local runtime files
+.agent/

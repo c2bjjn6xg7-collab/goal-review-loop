@@ -1,0 +1,55 @@
+{
+  "name": "goal-review-loop",
+  "version": "0.1.0",
+  "description": "Codex + Claude Code Goal Review Loop - automated local orchestration",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "review-loop": "dist/cli/main.js"
+  },
+  "files": [
+    "dist/",
+    "prompts/",
+    "plugin/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/ --max-warnings=0"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
+  },
+  "keywords": [
+    "codex",
+    "claude-code",
+    "review-loop",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "commander": "^15.0.0",
+    "fs-extra": "^11.3.5",
+    "js-yaml": "^4.2.0",
+    "micromatch": "^4.0.8",
+    "pino": "^10.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/fs-extra": "^11.0.4",
+    "@types/js-yaml": "^4.0.9",
+    "@types/micromatch": "^4.0.10",
+    "@types/node": "^25.9.3",
+    "@vitest/coverage-v8": "^4.1.8",
+    "eslint": "^9.39.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.0",
+    "vitest": "^4.1.8"
+  }
+}

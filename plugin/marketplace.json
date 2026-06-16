@@ -1,0 +1,7 @@
+{
+  "name": "review-loop",
+  "version": "0.1.0",
+  "description": "Multi-round code review and development orchestration",
+  "author": "DECT Team",
+  "plugins": ["plugins/review-loop"]
+}
