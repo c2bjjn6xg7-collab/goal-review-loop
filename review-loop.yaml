@@ -1,0 +1,47 @@
+version: 1
+agents:
+  planner:
+    command:
+      - codex
+      - exec
+      - '{prompt_file}'
+    timeout_seconds: 1800
+  developer:
+    command:
+      - sh
+      - '-lc'
+      - exec claude -p --permission-mode acceptEdits < "$1"
+      - claude-developer
+      - '{prompt_file}'
+    timeout_seconds: 3600
+  auditor:
+    command:
+      - codex
+      - exec
+      - '{prompt_file}'
+    timeout_seconds: 1800
+  final_auditor:
+    command:
+      - codex
+      - exec
+      - '{prompt_file}'
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+  archive_history: true
+  stop_on_infrastructure_error: true
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: agent/{run_id}-{task_slug}
+  commit_on_pass: true
+  commit_template: 'feat(agent): complete {task_slug} [{run_id}]'
+  create_tag: false
+  tag_template: agent-{run_id}-pass
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+  cancel_grace_seconds: 10
