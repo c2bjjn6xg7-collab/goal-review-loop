@@ -2,8 +2,10 @@ version: 1
 agents:
   planner:
     command:
-      - codex
-      - exec
+      - sh
+      - '-lc'
+      - exec codex exec -s workspace-write -c approval_policy=never < "$1"
+      - codex-planner
       - '{prompt_file}'
     timeout_seconds: 1800
   developer:
@@ -16,14 +18,18 @@ agents:
     timeout_seconds: 3600
   auditor:
     command:
-      - codex
-      - exec
+      - sh
+      - '-lc'
+      - exec codex exec -s workspace-write -c approval_policy=never < "$1"
+      - codex-auditor
       - '{prompt_file}'
     timeout_seconds: 1800
   final_auditor:
     command:
-      - codex
-      - exec
+      - sh
+      - '-lc'
+      - exec codex exec -s workspace-write -c approval_policy=never < "$1"
+      - codex-final-auditor
       - '{prompt_file}'
     timeout_seconds: 1800
 loop:
