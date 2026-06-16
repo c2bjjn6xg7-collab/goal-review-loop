@@ -58,6 +58,8 @@ export const LOCAL_ONLY_ARTIFACTS = [
   ARTIFACT_FILES.STATE,
   ARTIFACT_FILES.RUN_LOCK,
   ARTIFACT_FILES.ITERATION_LOG,
+  'progress.json',
+  'progress.md',
   ARTIFACT_DIRS.VERIFICATION,
   ARTIFACT_DIRS.EVIDENCE,
   ARTIFACT_DIRS.HISTORY,
@@ -379,7 +381,16 @@ export class ArtifactStore {
    * Design doc §6.2
    */
   gitignoreEntries(): string[] {
-    return LOCAL_ONLY_ARTIFACTS.map((entry) => `.agent/${entry}`);
+    const agentEntries = LOCAL_ONLY_ARTIFACTS.map((entry) => `.agent/${entry}`);
+    // F-702: Common build/test artifact directories that trigger Scope Guard
+    // if tracked by git. Only added when they don't already exist in .gitignore.
+    const buildArtifacts = [
+      'dist/',
+      'node_modules/',
+      'coverage/',
+      '.tsbuildinfo',
+    ];
+    return [...agentEntries, ...buildArtifacts];
   }
 
   /**
@@ -400,7 +411,7 @@ export class ArtifactStore {
 
     if (newLines.length > 0) {
       const addition = (existingContent.endsWith('\n') || existingContent === '' ? '' : '\n')
-        + `# Goal Review Loop - local runtime files\n`
+        + `# Goal Review Loop - local runtime files and build artifacts\n`
         + newLines.join('\n')
         + '\n';
       await fs.appendFile(gitignorePath, addition, 'utf8');

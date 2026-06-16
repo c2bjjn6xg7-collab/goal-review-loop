@@ -95,6 +95,52 @@ export async function executeInit(
   if (isGitRepo) {
     await checkLocalFilesNotTracked(projectRoot);
   }
+
+  // 7. F-704: Check provider availability and warn
+  await checkProviderAvailability();
+}
+
+/**
+ * F-704: Check if default provider CLIs are available on the system.
+ * Warns the user if the default config references tools that aren't installed.
+ */
+async function checkProviderAvailability(): Promise<void> {
+  const { execFileSync } = await import('child_process');
+
+  const providers = [
+    { name: 'claude', role: 'Developer', installHint: 'https://docs.anthropic.com/en/docs/claude-code' },
+    { name: 'codex', role: 'Planner/Auditor/Final Auditor', installHint: 'https://platform.openai.com/docs/codex' },
+  ];
+
+  const missing: Array<{ name: string; role: string; installHint: string }> = [];
+
+  for (const provider of providers) {
+    try {
+      execFileSync(provider.name, ['--version'], {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      });
+    } catch {
+      missing.push(provider);
+    }
+  }
+
+  if (missing.length > 0) {
+    console.log();
+    console.log('  ⚠ Provider availability check:');
+    for (const m of missing) {
+      console.log(`    - "${m.name}" not found in PATH (used as ${m.role})`);
+      console.log(`      Install: ${m.installHint}`);
+      console.log(`      Or configure an alternative provider in review-loop.yaml`);
+    }
+    console.log();
+    console.log('  The default review-loop.yaml uses these tools. If you use a different');
+    console.log('  AI coding CLI, update the agents section in review-loop.yaml or use');
+    console.log('  the providers configuration block. See: review-loop providers list');
+  } else {
+    console.log('  ✓ All default providers available (claude, codex).');
+  }
 }
 
 /**
@@ -109,10 +155,13 @@ async function checkLocalFilesNotTracked(
     '.agent/state.json',
     '.agent/run.lock',
     '.agent/iteration-log.md',
+    '.agent/progress.json',
+    '.agent/progress.md',
     '.agent/verification/',
     '.agent/evidence/',
     '.agent/history/',
     '.agent/debug/',
+    '.agent/transcripts/',
   ];
 
   const trackedFiles: string[] = [];

@@ -84,6 +84,28 @@ New files:
 - Added terminal progress writes after all 3 PASSED transition paths (early-exit, no-commit, normal commit)
 - `status --watch` now uses `phase:iteration:last_event_at` for dedup
 
+## Smoke Follow-up Fixes (F-702, F-704, F-705)
+
+After a real-model smoke test (successful 11.5-minute run → PASSED + commit), three init/configuration issues were found and fixed:
+
+### F-702 — `review-loop init` `.gitignore` missing build/test artifacts
+
+**Problem**: `dist/`, `node_modules/`, `coverage/` not in `.gitignore`, causing build products to trigger Scope Guard violations.
+
+**Fix**: Extended `gitignoreEntries()` in `artifact-store.ts` to include `dist/`, `node_modules/`, `coverage/`, `.tsbuildinfo`.
+
+### F-705 — `.agent/progress.json` and `progress.md` not in `.gitignore`
+
+**Problem**: Runtime progress files were not excluded from git tracking, leaving dirty state after each run.
+
+**Fix**: Added `progress.json` and `progress.md` to `LOCAL_ONLY_ARTIFACTS` in `artifact-store.ts`.
+
+### F-704 — No provider availability check during `init`
+
+**Problem**: Default config references `codex` and `claude` CLIs. New users without these tools would hit opaque failures on first run.
+
+**Fix**: Added `checkProviderAvailability()` to `init.ts` that detects `claude`/`codex` in PATH and prints install links + alternative provider guidance for missing tools.
+
 ## Engineering Gates
 
 ```
@@ -94,11 +116,12 @@ npm test: 691 tests passed, 0 skipped (45 files)
 npm audit --omit=dev: 0 vulnerabilities
 git diff --check: no whitespace errors
 npm pack --dry-run: 176 files, 177.2 kB (includes 5 plugin files)
+init smoke: .gitignore contains 14 entries (10 .agent/ + 4 build), provider detection working
 ```
 
 ## Known Risks
 
-1. **No real model smoke**: All testing done with Fake Agent. Real model smoke (acceptEdits + bypass) should be run before production use.
+1. **Real model smoke**: One successful acceptEdits run completed (11.5 min, commit 096a9c8a). Bypass mode smoke should be run before production use.
 2. **F-503R2 digest circular dependency**: `diff_digest` comparison was dropped from resume commit verification because final-audit.md is both in the commit and affects the diff. `run_id` + `decision` + tree check provide strong but not absolute proof.
 3. **Provider health checks are best-effort**: `providers test` runs the health_check command synchronously with a 10s timeout. Network-dependent providers may need longer timeouts.
 4. **Plugin packaging is static**: The SKILL.md and shell scripts are templates; actual Codex Desktop integration depends on the Codex plugin runtime, which is external to this project.
