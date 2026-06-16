@@ -9,6 +9,7 @@ import { createResumeCommand } from './resume.js';
 import { createStatusCommand } from './status.js';
 import { createCancelCommand } from './cancel.js';
 import { createProvidersCommand } from './providers.js';
+import { createDashboardCommand } from './dashboard.js';
 
 export function createCLI(): Command {
   const program = new Command();
@@ -24,6 +25,7 @@ export function createCLI(): Command {
   program.addCommand(createStatusCommand());
   program.addCommand(createCancelCommand());
   program.addCommand(createProvidersCommand());
+  program.addCommand(createDashboardCommand());
 
   return program;
 }
