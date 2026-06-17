@@ -822,23 +822,55 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       let developerResult;
       let developerCleanupResult: PromptCleanupResult | undefined;
-      try {
-        // Phase 6 F-604: Emit progress at phase start
-        await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Developer (iter ${iteration})`, registry: orchestratorRegistry });
-        const developerInput = buildDeveloperInput({
-          run_id: runId,
-          iteration,
-          project_root: projectRoot,
-          command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
-          timeout_seconds: config.agents.developer.timeout_seconds,
-          prompt: developerPrompt,
-          prompt_file: developerPromptFile,
-          signal: combinedSignal,
-        });
+      const MAX_DEVELOPER_RETRIES = 1;
+      for (let developerAttempt = 0; developerAttempt <= MAX_DEVELOPER_RETRIES; developerAttempt++) {
+        developerCleanupResult = undefined;
+        try {
+          // Phase 6 F-604: Emit progress at phase start
+          await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Developer (iter ${iteration}${developerAttempt > 0 ? ` retry ${developerAttempt}` : ''})`, registry: orchestratorRegistry });
 
-        developerResult = await runAgent(developerInput, projectRoot);
-      } finally {
-        if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
+          // Rebuild prompt file on retry (previous attempt's finally block deleted it)
+          if (developerAttempt > 0) {
+            const retryPromptResult = iteration === 1
+              ? await buildPrompt(projectRoot, 'developer.md', (template) => buildDeveloperPrompt(template, { run_id: runId, iteration, project_root: projectRoot, plan_path: join(projectRoot, '.agent/plan.md'), goal_path: join(projectRoot, '.agent/GOAL.md'), handoff_path: join(projectRoot, '.agent/developer-handoff.md') }), { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'developer' })
+              : await buildPrompt(projectRoot, 'rework.md', (template) => buildReworkPrompt(template, { run_id: runId, iteration, project_root: projectRoot, goal_path: join(projectRoot, '.agent/GOAL.md'), rework_instructions_path: join(projectRoot, '.agent/rework-instructions.md'), handoff_path: join(projectRoot, '.agent/developer-handoff.md') }), { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'developer-rework' });
+            developerPrompt = retryPromptResult.prompt;
+            developerPromptFile = retryPromptResult.prompt_file_path ?? undefined;
+          }
+
+          const developerInput = buildDeveloperInput({
+            run_id: runId,
+            iteration,
+            project_root: projectRoot,
+            command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
+            timeout_seconds: config.agents.developer.timeout_seconds,
+            prompt: developerPrompt,
+            prompt_file: developerPromptFile,
+            signal: combinedSignal,
+          });
+
+          developerResult = await runAgent(developerInput, projectRoot);
+        } finally {
+          if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
+        }
+
+        // If Developer failed due to AGENT_ERROR (e.g. API empty response), retry once
+        if (developerResult.status === 'failed' && developerResult.error?.code === 'AGENT_ERROR' && developerAttempt < MAX_DEVELOPER_RETRIES) {
+          await appendLog(artifactStore, runId, iteration, 'DEVELOPING', `developer retry ${developerAttempt + 1}`, 'FAIL', `Developer failed with AGENT_ERROR, retrying: ${developerResult.error?.message ?? 'unknown'}`);
+          continue;
+        }
+        break;
+      }
+
+      if (!developerResult) {
+        await transitionToBlocked(stateStore, 'Developer produced no result');
+        return makeBlockedResult(runId, projectRoot, 'Developer produced no result', 'AGENT_ERROR', currentBranch);
+      }
+
+      // developerResult is always assigned after the retry loop
+      if (!developerResult) {
+        await transitionToBlocked(stateStore, "Developer produced no result");
+        return makeBlockedResult(runId, projectRoot, "Developer produced no result", "AGENT_ERROR", currentBranch);
       }
 
       // Phase 6: Emit developer transcript and progress
