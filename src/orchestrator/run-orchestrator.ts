@@ -1854,7 +1854,7 @@ async function runFinalization(params: {
           await stateStore.transition(PhaseEnum.BLOCKED);
           return makeResult(
             runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
-            VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+            VERSIONED_ARTIFACT_PATHS.map(p => p),
             'Commit exists but tag template error',
             `Commit ${existingCommitSha.slice(0, 8)} exists but tag template error: ${err instanceof Error ? err.message : String(err)}`,
             {
@@ -1880,7 +1880,7 @@ async function runFinalization(params: {
             await stateStore.transition(PhaseEnum.BLOCKED);
             return makeResult(
               runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
-              VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+              VERSIONED_ARTIFACT_PATHS.map(p => p),
               'Commit exists but tag conflict',
               `Commit ${existingCommitSha.slice(0, 8)} exists but tag ${tagName} points to different commit ${existingTarget.slice(0, 8)}`,
               {
@@ -1903,7 +1903,7 @@ async function runFinalization(params: {
             await stateStore.transition(PhaseEnum.BLOCKED);
             return makeResult(
               runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
-              VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+              VERSIONED_ARTIFACT_PATHS.map(p => p),
               'Commit exists but tag failed',
               `Commit ${existingCommitSha.slice(0, 8)} exists but tag failed: ${tagResult.error}`,
               {
@@ -1929,7 +1929,7 @@ async function runFinalization(params: {
       await emitProgress({ projectRoot, stateStore, lastEvent: 'Finalization PASSED (commit exists)', registry: orchestratorRegistry, commitSha: existingCommitSha, finalAuditDecision: 'PASS' });
       await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
 
-      const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`);
+      const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
       return makeResult(
         runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
         artifactPaths,
@@ -2261,7 +2261,7 @@ async function runFinalization(params: {
     await emitProgress({ projectRoot, stateStore, lastEvent: 'Finalization PASSED (commit skipped)', registry: orchestratorRegistry, finalAuditDecision: 'PASS' });
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS', 'commit skipped');
 
-    const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`);
+    const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
     return makeResult(
       runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
       artifactPaths,
@@ -2367,7 +2367,7 @@ async function runFinalization(params: {
       await stateStore.transition(PhaseEnum.BLOCKED);
       return makeResult(
         runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
-        VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+        VERSIONED_ARTIFACT_PATHS.map(p => p),
         'Commit created but tag template error',
         `Commit ${commitSha.slice(0, 8)} created but tag template error: ${err instanceof Error ? err.message : String(err)}`,
         {
@@ -2393,7 +2393,7 @@ async function runFinalization(params: {
         await stateStore.transition(PhaseEnum.BLOCKED);
         return makeResult(
           runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
-          VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+          VERSIONED_ARTIFACT_PATHS.map(p => p),
           'Commit created but tag conflict',
           `Commit ${commitSha.slice(0, 8)} created but tag ${tagName} points to different commit ${existingTarget.slice(0, 8)}`,
           {
@@ -2416,7 +2416,7 @@ async function runFinalization(params: {
         await stateStore.transition(PhaseEnum.BLOCKED);
         return makeResult(
           runId, PhaseEnum.BLOCKED, 3, currentBranch, 'PASS',
-          VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`),
+          VERSIONED_ARTIFACT_PATHS.map(p => p),
           'Commit created but tag failed',
           `Commit ${commitSha.slice(0, 8)} created but tag failed: ${tagResult.error}`,
           {
@@ -2442,7 +2442,7 @@ async function runFinalization(params: {
   await emitProgress({ projectRoot, stateStore, lastEvent: 'Finalization PASSED', registry: orchestratorRegistry, commitSha: commitSha, finalAuditDecision: 'PASS' });
   await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
 
-  const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => `.agent/${p}`);
+  const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
   return makeResult(
     runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
     artifactPaths,

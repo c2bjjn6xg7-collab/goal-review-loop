@@ -124,7 +124,7 @@ import { test, expect } from 'vitest';
 import { hello } from '../src/hello.js';
 test('hello returns greeting', () => { expect(hello('World')).toBe('Hello, World'); });
 EOF
-npm install -D vitest
+npm install -D vitest --prefer-offline
 npm pkg set scripts.test="vitest run"
 git add -A && git commit -m "init: smoke baseline"
 ```
@@ -177,7 +177,8 @@ cat .agent/state.json | python3 -c "import json,sys;d=json.load(sys.stdin);print
 | 指标 | 期望 |
 |---|---|
 | 最终 phase | `PASSED` |
-| `.agent/task-graph.json` | 存在，至少 2 个任务，所有任务 status=`done` |
+| `.agent/task-graph.json` | 存在，至少 2 个任务（Planner 不可变契约，每个任务 `status` 字段保留为 `pending` 是预期行为） |
+| `.agent/task-results.json` | 存在，每个任务 `status=passed`，与 task-graph.json 中的任务 ID 一一对应 |
 | `.agent/audit-report.md` | decision=`PASS` |
 | `.agent/final-audit.md` | decision=`PASS` |
 | 最终 commit | 存在，commit message 含 task slug 和 run_id |
