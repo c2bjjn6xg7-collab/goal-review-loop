@@ -163,6 +163,71 @@ None.
   writeFileSync(join(agentDir, 'GOAL.md'), goal, 'utf8');
 }
 
+function writeTaskGraphPlan() {
+  writeValidPlan();
+  writeValidGoal();
+
+  // Compute GOAL.md digest so task-graph.json goal_digest matches.
+  const goalPath = join(agentDir, 'GOAL.md');
+  const goalContent = readFileSync(goalPath, 'utf8');
+  const goalDigest = computeDigest(goalContent);
+
+  const taskGraph = {
+    schema_version: 1,
+    run_id: runId,
+    goal_digest: goalDigest,
+    created_at: new Date().toISOString(),
+    tasks: [
+      {
+        id: 'task-1',
+        title: 'Implement feature part A',
+        description: 'Add the first part of the feature under src/part-a/.',
+        difficulty: 'low',
+        risk: 'low',
+        parallelizable: false,
+        depends_on: [],
+        allowed_changes: ['src/part-a/**'],
+        disallowed_changes: ['.git/**', '.agent/state.json'],
+        verification_commands: [
+          { id: 'task-1-verify', command: ['node', '-e', 'process.exit(0)'], cwd: '.', required: true, timeout_seconds: 30 },
+        ],
+        status: 'pending',
+      },
+      {
+        id: 'task-2',
+        title: 'Implement feature part B',
+        description: 'Add the second part of the feature under src/part-b/.',
+        difficulty: 'low',
+        risk: 'low',
+        parallelizable: false,
+        depends_on: ['task-1'],
+        allowed_changes: ['src/part-b/**'],
+        disallowed_changes: ['.git/**', '.agent/state.json'],
+        verification_commands: [
+          { id: 'task-2-verify', command: ['node', '-e', 'process.exit(0)'], cwd: '.', required: true, timeout_seconds: 30 },
+        ],
+        status: 'pending',
+      },
+      {
+        id: 'task-3',
+        title: 'Integration verification',
+        description: 'Final integration task that depends on all prior tasks.',
+        difficulty: 'low',
+        risk: 'low',
+        parallelizable: false,
+        depends_on: ['task-1', 'task-2'],
+        allowed_changes: ['src/integration/**'],
+        disallowed_changes: ['.git/**', '.agent/state.json'],
+        verification_commands: [
+          { id: 'task-3-verify', command: ['node', '-e', 'process.exit(0)'], cwd: '.', required: true, timeout_seconds: 30 },
+        ],
+        status: 'pending',
+      },
+    ],
+  };
+  writeFileSync(join(agentDir, 'task-graph.json'), JSON.stringify(taskGraph, null, 2), 'utf8');
+}
+
 function writeInvalidGoal() {
   const goal = `---
 schema_version: 1
@@ -426,6 +491,9 @@ try {
           writeValidPlan();
           writeValidGoal();
           break;
+        case 'task-graph':
+          writeTaskGraphPlan();
+          break;
         case 'invalid-goal':
           writeValidPlan();
           writeInvalidGoal();
@@ -466,6 +534,28 @@ try {
             mkdirSync(join(projectRoot, 'src'), { recursive: true });
           }
           writeFileSync(join(projectRoot, 'src', 'test-impl.ts'), '// Test implementation\nexport const testFn = () => true;\n', 'utf8');
+          break;
+        case 'task-success':
+          writeCompletedHandoff();
+          // Phase 8B: create a file within the current task's allowed_changes,
+          // parsed from the prompt file. Falls back to src/task-impl.ts.
+          {
+            let taskDir = join(projectRoot, 'src');
+            const promptFile = getArg('prompt-file');
+            if (promptFile && existsSync(promptFile)) {
+              try {
+                const content = readFileSync(promptFile, 'utf8');
+                // First allowed_changes glob like "src/part-a/**"
+                const m = content.match(/- `((?:src|tests)[^`]*?)\*\*`/);
+                if (m) {
+                  const glob = m[1];
+                  taskDir = join(projectRoot, glob.replace(/\/+$/, '').replace(/\/\*\*$/, ''));
+                }
+              } catch { /* ignore */ }
+            }
+            mkdirSync(taskDir, { recursive: true });
+            writeFileSync(join(taskDir, 'impl.ts'), '// Task implementation\nexport const taskFn = () => true;\n', 'utf8');
+          }
           break;
         case 'blocked-handoff':
           writeBlockedHandoff();

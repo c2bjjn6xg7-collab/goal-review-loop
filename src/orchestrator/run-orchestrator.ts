@@ -14,7 +14,7 @@
  */
 
 import { join, resolve, sep } from 'node:path';
-import { existsSync, readFileSync, writeFileSync, readdirSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, lstatSync, unlinkSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
@@ -524,6 +524,12 @@ export async function runOrchestrator(params: {
     if (existsSync(iterLogPath)) {
       const iterLogDigest = computeDigest(readFileSync(iterLogPath, 'utf8'));
       orchestratorRegistry.register(iterLogPath, iterLogDigest);
+    }
+    // Phase 8B: Register task-graph.json so the Scope Guard excludes it.
+    const taskGraphPath = join(agentDir, 'task-graph.json');
+    if (existsSync(taskGraphPath)) {
+      const tgDigest = computeDigest(readFileSync(taskGraphPath, 'utf8'));
+      orchestratorRegistry.register(taskGraphPath, tgDigest);
     }
 
     // Save GOAL digest to state
@@ -2701,6 +2707,16 @@ async function emitProgress(params: {
 }): Promise<void> {
   try {
     const state = await params.stateStore.read();
+    // Phase 8B: preserve task_graph progress across non-task progress writes
+    // (e.g. finalization) so the final progress.json still reflects task state.
+    let preservedTaskGraph: import('../types.js').TaskProgressInfo | null = null;
+    const existingProgressPath = join(params.projectRoot, '.agent', 'progress.json');
+    if (existsSync(existingProgressPath)) {
+      try {
+        const existing = JSON.parse(readFileSync(existingProgressPath, 'utf8'));
+        if (existing?.task_graph) preservedTaskGraph = existing.task_graph;
+      } catch { /* ignore */ }
+    }
     const data = buildProgressData({
       run_id: state.run_id,
       phase: state.phase,
@@ -2713,6 +2729,7 @@ async function emitProgress(params: {
       commit_sha: params.commitSha ?? state.final_commit_sha,
       final_audit_decision: params.finalAuditDecision ?? null,
       last_event: params.lastEvent,
+      task_graph: state.task_graph_state ? preservedTaskGraph : null,
     });
     await writeProgress(params.projectRoot, data);
     writeProgressMarkdown(params.projectRoot, data);
@@ -2867,6 +2884,21 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
       await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex: i, taskStatus: attempt > 1 ? 'rework' : 'running', lastEvent: `Task ${taskIndexDisplay} attempt ${attempt}/${maxIterations}: ${task.title}` });
 
       // Build task-scoped Developer prompt
+      // Phase 8B: Remove stale developer-handoff.md from prior tasks so the
+      // agent-adapter artifact freshness check sees a freshly written file.
+      const handoffFile = join(agentDir, 'developer-handoff.md');
+      if (existsSync(handoffFile)) {
+        try { unlinkSync(handoffFile); } catch { /* best effort */ }
+      }
+
+      // Snapshot protected paths + plan/GOAL digests BEFORE creating the prompt
+      // file, so the prompt file (written to .agent/debug/) is not in the
+      // snapshot and its later deletion is not flagged as tampering.
+      const preDevSystemPaths = snapshotSystemPaths(agentDir);
+      const preDevGoalDigest = computeDigest(readFileSync(goalPath, 'utf8'));
+      // Phase 8B: snapshot workspace files for a task-scoped diff after Developer.
+      const preTaskWorkspace = snapshotWorkspaceFiles(projectRoot);
+
       let developerPrompt: string;
       let developerPromptFile: string | undefined;
       try {
@@ -2891,10 +2923,6 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
         await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} prompt`, 'FAIL', taskError);
         break;
       }
-
-      // Snapshot protected paths + plan/GOAL digests before Developer
-      const preDevSystemPaths = snapshotSystemPaths(agentDir);
-      const preDevGoalDigest = computeDigest(readFileSync(goalPath, 'utf8'));
 
       let developerResult;
       let developerCleanupResult: PromptCleanupResult | undefined;
@@ -2966,15 +2994,19 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
       }
 
       // ── Per-task scope guard (enforces task.allowed_changes) ──
+      // Collect full diff for evidence/metadata, but scope-check ONLY the files
+      // this Developer run changed (task-scoped), so prior tasks' files — which
+      // legitimately fall outside this task's allowed_changes — are not flagged.
       const diffResult = await collectDiff({ projectRoot, baseCommit, iteration: taskIndexDisplay });
       await writeDiffArtifacts(projectRoot, taskIndexDisplay, diffResult);
+      const taskChangedFiles = buildTaskChangedFiles(projectRoot, preTaskWorkspace);
       registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`), orchestratorRegistry);
 
       const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
       const scopeResult = checkScope({
         allowedChanges: task.allowed_changes,
         disallowedChanges: task.disallowed_changes,
-        changedFiles: diffResult.changedFiles,
+        changedFiles: taskChangedFiles,
         orchestratorOwnedFiles,
       });
       await writeScopeReport(projectRoot, taskIndexDisplay, scopeResult.report);
@@ -3005,6 +3037,10 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
         signal: combinedSignal,
       });
       registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`), orchestratorRegistry);
+      const taskManifestPath = join(agentDir, 'verification', 'manifest.json');
+      if (existsSync(taskManifestPath)) {
+        orchestratorRegistry.register(taskManifestPath, computeDigest(readFileSync(taskManifestPath, 'utf8')));
+      }
 
       const requiredPassed = verificationResult.manifest.commands
         .filter(c => c.required)
@@ -3098,6 +3134,10 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
     signal: combinedSignal,
   });
   registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(integrationIteration).padStart(2, '0')}`), orchestratorRegistry);
+  const integrationManifestPath = join(agentDir, 'verification', 'manifest.json');
+  if (existsSync(integrationManifestPath)) {
+    orchestratorRegistry.register(integrationManifestPath, computeDigest(readFileSync(integrationManifestPath, 'utf8')));
+  }
 
   const integrationPassed = integrationVerification.manifest.commands
     .filter(c => c.required)
@@ -3116,6 +3156,88 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
 
   const diffDigest = `sha256:${integrationDiff.diffDigest}` as Digest;
   await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
+
+  // ── Audit the full cumulative diff before finalization ──
+  // runFinalization runs the Final Auditor, which requires audit-report.md to
+  // exist. Run one Auditor pass over the integration diff to produce it.
+  const auditIteration = integrationIteration;
+  await stateStore.transition(PhaseEnum.AUDITING);
+  await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor start', 'PASS');
+  await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Auditor (integration)', registry: orchestratorRegistry });
+
+  {
+    let auditorPromptFile: string | undefined;
+    let auditorResult;
+    let auditorCleanupResult: PromptCleanupResult | undefined;
+    try {
+      const iterStr = String(auditIteration).padStart(2, '0');
+      const promptResult = await buildPrompt(
+        projectRoot,
+        'auditor.md',
+        (template) => buildAuditorPrompt(template, {
+          run_id: runId,
+          iteration: auditIteration,
+          project_root: projectRoot,
+          plan_path: join(projectRoot, '.agent/plan.md'),
+          goal_path: join(projectRoot, '.agent/GOAL.md'),
+          handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+          verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
+          changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
+          untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
+          scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
+          tracked_diff_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'tracked.diff'),
+          diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
+          audit_report_path: join(projectRoot, '.agent/audit-report.md'),
+          goal_digest: goalDigest,
+          diff_digest: diffDigest,
+        }),
+        { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
+      );
+      auditorPromptFile = promptResult.prompt_file_path ?? undefined;
+
+      const auditorInput = buildAuditorInput({
+        run_id: runId,
+        iteration: auditIteration,
+        project_root: projectRoot,
+        command_template: resolveCommandForAgent(config.agents.auditor.command, config.agents.auditor.provider, config),
+        timeout_seconds: config.agents.auditor.timeout_seconds,
+        prompt: promptResult.prompt,
+        prompt_file: auditorPromptFile,
+        signal: combinedSignal,
+      });
+      auditorResult = await runAgent(auditorInput, projectRoot);
+    } finally {
+      if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
+    }
+
+    if (auditorResult) {
+      emitTranscript({ projectRoot, role: 'auditor', iteration: auditIteration, runId, startedAt: new Date().toISOString(), result: auditorResult, registry: orchestratorRegistry });
+    }
+    registerAgentLogs(auditorResult, orchestratorRegistry);
+
+    if (auditorCleanupResult && !auditorCleanupResult.success) {
+      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
+      return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
+    }
+    if (auditorResult.status === 'cancelled') {
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      return makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled', 'Auditor cancelled', auditorResult.error);
+    }
+    if (auditorResult.status !== 'success') {
+      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
+      return makeBlockedResult(runId, projectRoot, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
+    }
+
+    // Register audit-report.md
+    const auditReportPath = join(agentDir, 'audit-report.md');
+    if (existsSync(auditReportPath)) {
+      orchestratorRegistry.register(auditReportPath, computeDigest(readFileSync(auditReportPath, 'utf8')));
+    }
+    await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor completed', 'PASS');
+  }
+
+  // Transition to FINALIZING before delegating to the finalization pipeline.
+  await stateStore.transition(PhaseEnum.FINALIZING);
 
   // Delegate to the existing finalization pipeline (final audit + commit + tag).
   return await runFinalization({
@@ -3144,6 +3266,55 @@ async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orchestrat
  * Parse "Success Criteria" numbered lines from GOAL.md body.
  * Returns an array of criteria strings for task prompt context.
  */
+// ─── Phase 8B: per-task workspace diff ────────────────────────
+
+/**
+ * Snapshot all workspace files (tracked + untracked) with their digests.
+ * Used to compute per-task diffs that only include files a single task
+ * Developer run changed — not the cumulative diff from baseCommit.
+ */
+function snapshotWorkspaceFiles(projectRoot: string): Map<string, string> {
+  const snap = new Map<string, string>();
+  try {
+    const tracked = execSync('git ls-files -z', { cwd: projectRoot, encoding: 'utf8' }).split('\0').filter(Boolean);
+    const untracked = execSync('git ls-files --others --exclude-standard -z', { cwd: projectRoot, encoding: 'utf8' }).split('\0').filter(Boolean);
+    for (const rel of [...tracked, ...untracked]) {
+      const posix = rel.split(/\\\\/).join('/');
+      const full = join(projectRoot, rel);
+      if (existsSync(full)) {
+        try {
+          const st = lstatSync(full);
+          if (st.isFile()) snap.set(posix, computeDigest(readFileSync(full, 'utf8')));
+        } catch { /* skip */ }
+      }
+    }
+  } catch { /* not a git repo — fall back empty */ }
+  return snap;
+}
+
+/**
+ * Build a ChangedFilesSchema containing only files that changed between
+ * a pre-task snapshot and the current workspace state.
+ */
+function buildTaskChangedFiles(projectRoot: string, preTask: Map<string, string>): import('../types.js').ChangedFilesSchema {
+  const current = snapshotWorkspaceFiles(projectRoot);
+  const files: import('../types.js').ChangedFile[] = [];
+  const allPaths = new Set<string>([...preTask.keys(), ...current.keys()]);
+  for (const posix of allPaths) {
+    const before = preTask.get(posix);
+    const after = current.get(posix);
+    if (before === after) continue;
+    if (before === undefined && after !== undefined) {
+      files.push({ path: posix, status: 'added', tracked: false, additions: null, deletions: null });
+    } else if (before !== undefined && after === undefined) {
+      files.push({ path: posix, status: 'deleted', tracked: true, additions: null, deletions: null });
+    } else {
+      files.push({ path: posix, status: 'modified', tracked: true, additions: null, deletions: null });
+    }
+  }
+  return { schema_version: 1, base_commit: 'task-scoped', files };
+}
+
 function parseGoalSuccessCriteria(goalPath: string): string[] {
   try {
     const content = readFileSync(goalPath, 'utf8');
