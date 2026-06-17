@@ -15,3 +15,6 @@ coverage/
 .agent/history/
 .agent/debug/
 .agent/transcripts/
+
+# Local test report
+review-loop-test-report.md
