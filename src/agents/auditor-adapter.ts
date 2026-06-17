@@ -31,6 +31,8 @@ const AUDITOR_ALLOWED_WRITE = '.agent/audit-report.md';
 export function buildAuditorInput(params: {
   run_id: string;
   iteration: number;
+  /** 1-indexed retry attempt; when >= 2 the adapter appends `-attempt${N}` to log filenames. */
+  attempt?: number;
   project_root: string;
   command_template: string[];
   timeout_seconds: number;
@@ -43,6 +45,7 @@ export function buildAuditorInput(params: {
     project_root: params.project_root,
     run_id: params.run_id,
     iteration: params.iteration,
+    attempt: params.attempt,
     prompt: params.prompt,
     prompt_file: params.prompt_file,
     expected_artifacts: AUDITOR_ARTIFACTS.map(p => join(params.project_root, p)),

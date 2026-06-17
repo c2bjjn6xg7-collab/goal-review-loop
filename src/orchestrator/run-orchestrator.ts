@@ -910,6 +910,9 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
           const developerInput = buildDeveloperInput({
             run_id: runId,
             iteration,
+            // F-8D-T-001 fix: 1-indexed attempt prevents log filename collision
+            // between AGENT_ERROR retries within the same iteration.
+            attempt: developerAttempt + 1,
             project_root: projectRoot,
             command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
             timeout_seconds: config.agents.developer.timeout_seconds,

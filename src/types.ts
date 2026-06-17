@@ -141,6 +141,13 @@ export interface AgentRunInput {
   project_root: string;
   run_id: string;
   iteration: number;
+  /**
+   * 1-indexed retry attempt within the same iteration.
+   * When present and >= 2, appended to debug log filenames as `-attempt${N}`
+   * to avoid orchestrator-registered file digest mismatches across retries.
+   * Default behavior (undefined or 1) keeps original `iter${iteration}.stdout.log` naming.
+   */
+  attempt?: number;
   prompt: string;
   prompt_file?: string;
   expected_artifacts: string[];

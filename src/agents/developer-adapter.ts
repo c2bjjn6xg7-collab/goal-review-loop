@@ -29,6 +29,8 @@ const DEVELOPER_ARTIFACTS = ['.agent/developer-handoff.md'];
 export function buildDeveloperInput(params: {
   run_id: string;
   iteration: number;
+  /** 1-indexed retry attempt; when >= 2 the adapter appends `-attempt${N}` to log filenames. */
+  attempt?: number;
   project_root: string;
   command_template: string[];
   timeout_seconds: number;
@@ -41,6 +43,7 @@ export function buildDeveloperInput(params: {
     project_root: params.project_root,
     run_id: params.run_id,
     iteration: params.iteration,
+    attempt: params.attempt,
     prompt: params.prompt,
     prompt_file: params.prompt_file,
     expected_artifacts: DEVELOPER_ARTIFACTS.map(p => join(params.project_root, p)),

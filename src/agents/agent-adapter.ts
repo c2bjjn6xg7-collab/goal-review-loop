@@ -91,6 +91,30 @@ export interface ArtifactFreshnessViolation {
  * Run an agent through the unified adapter.
  * F-305 fix: Artifact freshness checks are now wired into the success path.
  */
+
+/**
+ * F-8D-T-001: Compute attempt-aware stdout/stderr log paths for a single
+ * agent run. When `attempt >= 2`, the suffix `-attempt${N}` is appended so
+ * retries within the same iteration write to distinct files. When `attempt`
+ * is undefined or 1, the original `iter${iteration}` naming is preserved
+ * for backward compatibility with the existing on-disk layout and tests.
+ */
+export function buildAgentLogPaths(
+  debugDir: string,
+  runId: string,
+  role: AgentRunInput['role'],
+  iteration: number,
+  attempt?: number,
+): { logBase: string; stdoutPath: string; stderrPath: string } {
+  const attemptSuffix = attempt && attempt >= 2 ? `-attempt${attempt}` : '';
+  const logBase = join(debugDir, `${runId}-${role}-iter${iteration}${attemptSuffix}`);
+  return {
+    logBase,
+    stdoutPath: `${logBase}.stdout.log`,
+    stderrPath: `${logBase}.stderr.log`,
+  };
+}
+
 export async function runAgent(
   input: AgentRunInput,
   projectRoot: string,
@@ -215,9 +239,10 @@ export async function runAgent(
     await mkdir(debugDir, { recursive: true });
   }
 
-  const logBase = join(debugDir, `${input.run_id}-${input.role}-iter${input.iteration}`);
-  const stdoutPath = `${logBase}.stdout.log`;
-  const stderrPath = `${logBase}.stderr.log`;
+  // F-8D-T-001: derive attempt-aware log paths so retries don't overwrite
+  // the previous attempt's debug log files (which would otherwise trip
+  // the orchestrator's verifySystemProtectedPaths digest_mismatch check).
+  const { stdoutPath, stderrPath } = buildAgentLogPaths(debugDir, input.run_id, input.role, input.iteration, input.attempt);
 
   // Step 5: Execute via Process Runner
   try {

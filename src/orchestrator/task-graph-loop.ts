@@ -220,6 +220,10 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
         const developerInput = buildDeveloperInput({
           run_id: runId,
           iteration: taskIndexDisplay,
+          // F-8D-T-001 fix: pass attempt so retry log files don't collide
+          // with the previous attempt's log files (which would otherwise
+          // trip verifySystemProtectedPaths' digest_mismatch check).
+          attempt,
           project_root: projectRoot,
           command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
           timeout_seconds: config.agents.developer.timeout_seconds,
