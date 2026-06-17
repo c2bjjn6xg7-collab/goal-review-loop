@@ -1,138 +1,63 @@
 ---
 schema_version: 1
-run_id: phase6-dev
+run_id: "20260617042618-f2zvcf"
 iteration: 1
-author_role: developer
-status: COMPLETED
+author_role: "developer"
+status: "COMPLETED"
 ---
 
-# Phase 6 Developer Handoff — Iteration 1 + Rework (F-601 through F-604)
+# Phase 8F: Per-Provider Network/Proxy Mode Support
 
-## Summary
+## Summary of Changes
 
-Phase 6 transforms `review-loop` from a standalone CLI into a Codex-callable Plugin/Skill with Provider abstraction, real-time progress, transcripts, and `--watch` mode. All 12 acceptance criteria from the Phase 6 requirements document are addressed. An initial implementation was reviewed and 4 findings (F-601 through F-604) were fixed in a rework pass.
+Implemented Phase 8F per-provider network/proxy configuration supporting 4 proxy modes (`inherit`, `none`, `auto`, `custom`) so different provider CLIs can have independent proxy behavior within a single Review Loop run.
 
-## Implementation Overview
+## Files Changed
 
-### Layer 1: Provider Profile System
+### New Files
 
-New files:
-- `src/providers/builtin-providers.ts` — 4 built-in providers (claude, codex, codebuddy, opencode)
-- `src/providers/provider-registry.ts` — `createProviderRegistry()`, `resolveCommandForAgent()`, health checks
-- `src/providers/permission-guard.ts` — Detects `--dangerously-skip-permissions` and `bypassPermissions` in resolved commands
+- **`src/providers/network-env.ts`** — Core env-resolver module with `resolveProviderEnv()`, `probeProxyPort()`, `DEFAULT_CANDIDATE_PORTS`, `PROXY_ENV_KEYS`, `NO_PROXY_KEYS`, and `ResolvedProviderEnv` interface. Implements all 4 proxy modes without mutating any external state.
 
-Changes:
-- `src/types.ts` — Added `ProviderProfile`, `ProviderConfig`, `ProgressData`, `TranscriptEntry`; extended `AgentConfig` with optional `provider` field; extended `ReviewLoopConfig` with optional `providers` map
-- `src/artifacts/config.ts` — Schema extended with `providers` block and `agentConfig.provider` field
-- `src/orchestrator/run-orchestrator.ts` — All 4 agent call sites use `resolveCommandForAgent()`
+- **`tests/unit/network-env.test.ts`** — Unit tests covering all 4 proxy modes, default candidate ports, custom proxy_url, both-case variable handling, NO_PROXY preservation, port-probe open/closed branches (using ephemeral `net.Server`), and regression test for inherit mode.
 
-### Layer 2: Progress + Transcript Runtime Output
+- **`tests/integration/provider-network.test.ts`** — Integration test verifying env isolation between Codex-like (none mode) and Claude-like (custom mode) provider commands, parent env immutability, and inherit mode regression.
 
-New files:
-- `src/runtime/progress-writer.ts` — `writeProgress()` (JSON) + `writeProgressMarkdown()` (human-readable)
-- `src/runtime/transcript-writer.ts` — `writeTranscript()` generates `iteration-NN-role.md`
+- **`docs/configuration.md`** — Documentation for the `network` block, all 4 modes, `candidate_ports`, `proxy_url`, cross-platform notes, and per-provider YAML examples.
 
-Changes:
-- `src/artifacts/artifact-store.ts` — Added `TRANSCRIPTS` to `ARTIFACT_DIRS` and `LOCAL_ONLY_ARTIFACTS`; `init()` creates `.agent/transcripts/`
-- `src/scope/scope-guard.ts` — Added `progress.json`, `progress.md`, `transcripts/**` to `SYSTEM_PROTECTED_PATHS` and `ORCHESTRATOR_OWNED_PATTERNS`
-- `src/agents/auditor-adapter.ts` — Added progress/transcripts to orchestrator-managed exclusions
-- `src/orchestrator/run-orchestrator.ts` — `emitProgress()` + `emitTranscript()` called before/after each agent; terminal progress writes after all 3 PASSED transitions
+### Modified Files
 
-### Layer 3: CLI Enhancements
+- **`src/types.ts`** — Added `ProxyMode` type, `ProviderNetworkConfig` interface, `network?: ProviderNetworkConfig` to `ProviderConfig` and `ProviderProfile`, `network?: ProviderNetworkConfig` to `AgentRunInput`, `delete_env?: string[]` to `ProcessRunnerInput`.
 
-- `src/cli/start.ts` — Added `--watch` + `--watch-interval` flags; polls `progress.json` during execution
-- `src/cli/status.ts` — Added `--watch` + `--watch-interval` flags; uses `last_event_at` for fine-grained dedup
-- `src/cli/providers.ts` — New `providers list` and `providers test <id>` subcommands
-- `src/cli/index.ts` — Registered `providers` subcommand
+- **`src/artifacts/config.ts`** — Added `networkConfig` subschema to `CONFIG_SCHEMA` with `proxy_mode` enum, `candidate_ports` array, `proxy_url` string. Added `validateNetworkConfig()` function that rejects `custom` mode without `proxy_url`. Imported `ProviderNetworkConfig` and `ProviderConfig` types.
 
-### Layer 4: Codex Plugin/Skill Packaging
+- **`src/providers/provider-registry.ts`** — Threaded `network` field through `mergeProviderConfig()` and `buildCustomProfile()`.
 
-New files:
-- `plugin/marketplace.json` — Plugin marketplace descriptor
-- `plugin/plugins/review-loop/.codex-plugin/plugin.json` — Codex plugin config
-- `plugin/plugins/review-loop/skills/review-loop/SKILL.md` — Skill prompt (7 rules for Codex)
-- `plugin/plugins/review-loop/skills/review-loop/scripts/run-review-loop.sh` — Bash entry script
-- `plugin/plugins/review-loop/skills/review-loop/scripts/run-review-loop.ps1` — PowerShell entry script
-- `package.json` — Added `plugin/` to `files` array for npm distribution
+- **`src/runtime/process-runner.ts`** — Added `delete_env` handling in both `runProcess()` and `runProcessRaw()`: after copying `process.env` and applying `input.env` overlay, deletes keys listed in `input.delete_env`.
 
-## Rework Fixes (F-601 through F-604)
+- **`src/agents/agent-adapter.ts`** — Imported `resolveProviderEnv`. When `input.network` is set, resolves provider env and passes `env`/`delete_env` to `runProcess`.
 
-### F-601 (High) — Permission guard didn't scan resolved provider commands
+- **`tests/unit/provider-registry.test.ts`** — Added 3 tests for network block threading through `mergeProviderConfig`, `buildCustomProfile`, and undefined network preservation.
 
-**Root cause**: `checkPermissionModes()` only scanned `config.agents[role].command`, but at runtime `resolveCommandForAgent()` replaces it with the provider's `command_template`. Dangerous flags in provider commands were invisible.
+- **`tests/unit/config.test.ts`** — Added 8 tests for network config validation: valid modes (inherit, none, auto, custom), invalid proxy_mode, custom without proxy_url, backward compat (no network block), and `validateNetworkConfig` unit tests.
 
-**Fix**: `checkPermissionModes()` now calls `resolveCommandForAgent()` before scanning. Added 2 regression tests.
+- **`tests/unit/process-runner.test.ts`** — Added 3 tests for `delete_env`: deleting specified keys, empty delete_env array, and non-existent keys.
 
-### F-602 (Medium-High) — Plugin files not in npm pack
+## Verification Performed
 
-**Root cause**: `package.json.files` only included `dist/`, `prompts/`, `review-loop.yaml`.
+All 5 required verification gates passed:
 
-**Fix**: Added `plugin/` to `files`. Verified: `npm pack --dry-run` now includes 5 plugin files (176 total).
+1. **`npm test`** — 55 test files, 917 tests passed (including all new tests)
+2. **`npm run typecheck`** — TypeScript compilation with no errors
+3. **`npm run lint`** — ESLint with 0 warnings/errors
+4. **`npm run build`** — `tsc` build succeeded
+5. **`git diff --check`** — No whitespace errors
 
-### F-603 (Medium-High) — No custom Provider integration test
+## Risks
 
-**Root cause**: Only unit tests for provider registry; no end-to-end test with `runOrchestrator()`.
+- **Auto-mode port probing**: TCP probes against `127.0.0.1` could be racy in CI environments with slow networking. Mitigated by short timeout (200ms) and safe fallback to `none` mode when no port is open.
+- **Env deletion semantics**: The `delete_env` mechanism deletes keys from the child env after copying `process.env`. If a future change modifies the env construction order, the deletion must still happen after the overlay.
+- **Backward compatibility**: Providers without a `network` block default to `inherit` (no changes). Verified by regression test.
 
-**Fix**: Added `tests/fixtures/custom-provider-cli.mjs` (simulates non-Claude AI tool) and `tests/integration/custom-provider.test.ts` (4 per-role custom providers driving full lifecycle → PASSED + commit + progress + transcripts).
+## Unresolved Issues
 
-### F-604 (Medium) — Progress only written after agent completion
-
-**Root cause**: `emitProgress()` was only called after `runAgent()` returned. During long agent runs, `--watch` had no updates. `status --watch` deduped by `phase:iteration` only.
-
-**Fix**:
-- Added `emitProgress()` calls BEFORE each agent starts ("Starting Planner/Developer/Auditor/Final Auditor")
-- Added terminal progress writes after all 3 PASSED transition paths (early-exit, no-commit, normal commit)
-- `status --watch` now uses `phase:iteration:last_event_at` for dedup
-
-## Smoke Follow-up Fixes (F-702, F-704, F-705)
-
-After a real-model smoke test (successful 11.5-minute run → PASSED + commit), three init/configuration issues were found and fixed:
-
-### F-702 — `review-loop init` `.gitignore` missing build/test artifacts
-
-**Problem**: `dist/`, `node_modules/`, `coverage/` not in `.gitignore`, causing build products to trigger Scope Guard violations.
-
-**Fix**: Extended `gitignoreEntries()` in `artifact-store.ts` to include `dist/`, `node_modules/`, `coverage/`, `.tsbuildinfo`.
-
-### F-705 — `.agent/progress.json` and `progress.md` not in `.gitignore`
-
-**Problem**: Runtime progress files were not excluded from git tracking, leaving dirty state after each run.
-
-**Fix**: Added `progress.json` and `progress.md` to `LOCAL_ONLY_ARTIFACTS` in `artifact-store.ts`.
-
-### F-704 — No provider availability check during `init`
-
-**Problem**: Default config references `codex` and `claude` CLIs. New users without these tools would hit opaque failures on first run.
-
-**Fix**: Added `checkProviderAvailability()` to `init.ts` that detects `claude`/`codex` in PATH and prints install links + alternative provider guidance for missing tools.
-
-## Engineering Gates
-
-```
-npm run typecheck: PASS (0 errors)
-npm run lint: PASS (0 errors, 0 warnings)
-npm run build: PASS
-npm test: 691 tests passed, 0 skipped (45 files)
-npm audit --omit=dev: 0 vulnerabilities
-git diff --check: no whitespace errors
-npm pack --dry-run: 176 files, 177.2 kB (includes 5 plugin files)
-init smoke: .gitignore contains 14 entries (10 .agent/ + 4 build), provider detection working
-```
-
-## Known Risks
-
-1. **Real model smoke**: One successful acceptEdits run completed (11.5 min, commit 096a9c8a). Bypass mode smoke should be run before production use.
-2. **F-503R2 digest circular dependency**: `diff_digest` comparison was dropped from resume commit verification because final-audit.md is both in the commit and affects the diff. `run_id` + `decision` + tree check provide strong but not absolute proof.
-3. **Provider health checks are best-effort**: `providers test` runs the health_check command synchronously with a 10s timeout. Network-dependent providers may need longer timeouts.
-4. **Plugin packaging is static**: The SKILL.md and shell scripts are templates; actual Codex Desktop integration depends on the Codex plugin runtime, which is external to this project.
-
-## Explicit Non-Goals (Phase 7, not implemented)
-
-- Automatic model routing based on `capability_tier` / `cost_tier`
-- Multi-worktree concurrent execution
-- Automatic push
-- GitHub/GitLab PR creation
-- Remote repository creation
-- GUI
-- Prompt auto-evolution
-- Destructive git cleanup
+None. All success criteria from the GOAL are met.

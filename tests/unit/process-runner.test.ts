@@ -468,6 +468,59 @@ describe('ProcessRunner', () => {
       await fs.remove(logDir);
     }
   });
+
+  // Phase 8F: delete_env support
+  it('should delete env keys specified in delete_env', async () => {
+    const result = await runProcess({
+      argv: ['bash', '-c', 'echo "HTTP_PROXY=$HTTP_PROXY"; echo "HOME=$HOME"'],
+      cwd: tmpDir,
+      timeout_ms: 5000,
+      stdout_path: stdoutPath,
+      stderr_path: stderrPath,
+      env: {
+        HTTP_PROXY: 'http://should-be-deleted:8080',
+        HOME: '/home/test',
+      },
+      delete_env: ['HTTP_PROXY'],
+    });
+
+    expect(result.status).toBe(ProcessStatus.SUCCESS);
+    const stdout = await fs.readFile(stdoutPath, 'utf8');
+    expect(stdout).toContain('HTTP_PROXY=');
+    expect(stdout).not.toContain('HTTP_PROXY=http://should-be-deleted:8080');
+    expect(stdout).toContain('HOME=/home/test');
+  });
+
+  it('should handle empty delete_env array', async () => {
+    const result = await runProcess({
+      argv: ['bash', '-c', 'echo $MY_VAR'],
+      cwd: tmpDir,
+      timeout_ms: 5000,
+      stdout_path: stdoutPath,
+      stderr_path: stderrPath,
+      env: {
+        MY_VAR: 'present',
+      },
+      delete_env: [],
+    });
+
+    expect(result.status).toBe(ProcessStatus.SUCCESS);
+    const stdout = await fs.readFile(stdoutPath, 'utf8');
+    expect(stdout.trim()).toBe('present');
+  });
+
+  it('should handle delete_env with keys that do not exist in env', async () => {
+    const result = await runProcess({
+      argv: ['echo', 'ok'],
+      cwd: tmpDir,
+      timeout_ms: 5000,
+      stdout_path: stdoutPath,
+      stderr_path: stderrPath,
+      delete_env: ['NONEXISTENT_KEY_12345'],
+    });
+
+    expect(result.status).toBe(ProcessStatus.SUCCESS);
+  });
 });
 
 describe('runProcessRaw', () => {

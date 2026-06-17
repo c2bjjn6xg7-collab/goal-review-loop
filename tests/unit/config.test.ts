@@ -7,6 +7,7 @@ import {
   loadConfigWithDefaults,
   generateSampleConfig,
   validateMvpConstraints,
+  validateNetworkConfig,
   DEFAULT_CONFIG,
   ConfigError,
 } from '../../src/artifacts/config.js';
@@ -260,6 +261,328 @@ runtime:
       expect(config.agents.developer.command[0]).toBe('sh');
       expect(config.agents.developer.command).toContain('{prompt_file}');
       expect(config.agents.developer.command[2]).toContain('my-custom-llm');
+    });
+  });
+
+  // Phase 8F: network config validation
+  describe('Phase 8F: network config validation', () => {
+    it('accepts valid network config with proxy_mode inherit', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  claude:
+    enabled: true
+    network:
+      proxy_mode: inherit
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      const config = await loadConfig(configPath);
+      expect(config.providers!.claude.network!.proxy_mode).toBe('inherit');
+    });
+
+    it('accepts valid network config with proxy_mode none', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  claude:
+    enabled: true
+    network:
+      proxy_mode: none
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      const config = await loadConfig(configPath);
+      expect(config.providers!.claude.network!.proxy_mode).toBe('none');
+    });
+
+    it('accepts valid network config with proxy_mode auto and candidate_ports', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  codex:
+    enabled: true
+    network:
+      proxy_mode: auto
+      candidate_ports: [7890, 7897]
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      const config = await loadConfig(configPath);
+      expect(config.providers!.codex.network!.proxy_mode).toBe('auto');
+      expect(config.providers!.codex.network!.candidate_ports).toEqual([7890, 7897]);
+    });
+
+    it('accepts valid network config with proxy_mode custom and proxy_url', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  opencode:
+    enabled: true
+    network:
+      proxy_mode: custom
+      proxy_url: "http://my-proxy:3128"
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      const config = await loadConfig(configPath);
+      expect(config.providers!.opencode.network!.proxy_mode).toBe('custom');
+      expect(config.providers!.opencode.network!.proxy_url).toBe('http://my-proxy:3128');
+    });
+
+    it('rejects invalid proxy_mode', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  claude:
+    enabled: true
+    network:
+      proxy_mode: invalid_mode
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+    });
+
+    it('rejects custom mode without proxy_url', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  claude:
+    enabled: true
+    network:
+      proxy_mode: custom
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+      await expect(loadConfig(configPath)).rejects.toThrow('proxy_url');
+    });
+
+    it('accepts provider without network block (backward compat)', async () => {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const yaml = `
+version: 1
+agents:
+  planner:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+  developer:
+    command: ["claude", "-p", "{prompt}"]
+    timeout_seconds: 3600
+  auditor:
+    command: ["codex", "exec", "{prompt_file}"]
+    timeout_seconds: 1800
+loop:
+  max_iterations: 3
+git:
+  require_repository: true
+  require_head: true
+  require_clean_worktree: true
+  branch_template: "agent/test"
+  commit_on_pass: true
+  commit_template: "feat: test"
+  create_tag: false
+  tag_template: "test"
+  push: false
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+providers:
+  claude:
+    enabled: true
+`;
+      await fs.writeFile(configPath, yaml, 'utf8');
+      const config = await loadConfig(configPath);
+      expect(config.providers!.claude.network).toBeUndefined();
+    });
+
+    it('validateNetworkConfig rejects custom mode without proxy_url', () => {
+      const config = {
+        ...DEFAULT_CONFIG,
+        providers: {
+          test: {
+            enabled: true,
+            network: { proxy_mode: 'custom' as const },
+          },
+        },
+      } as unknown as import('../../src/types.js').ReviewLoopConfig;
+      expect(() => validateNetworkConfig(config)).toThrow(ConfigError);
+      expect(() => validateNetworkConfig(config)).toThrow('proxy_url');
+    });
+
+    it('validateNetworkConfig passes for custom mode with proxy_url', () => {
+      const config = {
+        ...DEFAULT_CONFIG,
+        providers: {
+          test: {
+            enabled: true,
+            network: { proxy_mode: 'custom' as const, proxy_url: 'http://proxy:3128' },
+          },
+        },
+      } as unknown as import('../../src/types.js').ReviewLoopConfig;
+      expect(() => validateNetworkConfig(config)).not.toThrow();
+    });
+
+    it('validateNetworkConfig passes when no providers configured', () => {
+      expect(() => validateNetworkConfig(DEFAULT_CONFIG)).not.toThrow();
     });
   });
 });

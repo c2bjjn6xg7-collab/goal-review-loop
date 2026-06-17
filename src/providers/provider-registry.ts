@@ -78,6 +78,8 @@ function mergeProviderConfig(base: ProviderProfile, override: ProviderConfig): P
     prompt_transport: override.prompt_transport ?? base.prompt_transport,
     health_check: override.health_check ?? base.health_check,
     transcript_mode: override.transcript_mode ?? base.transcript_mode,
+    env: override.env ?? base.env,
+    network: override.network ?? base.network,
   };
 }
 
@@ -91,6 +93,8 @@ function buildCustomProfile(id: string, pc: ProviderConfig): ProviderProfile {
     permission_modes: pc.permission_mode ? [pc.permission_mode] : ['default'],
     transcript_mode: pc.transcript_mode ?? 'stdout_stderr',
     enabled: pc.enabled,
+    env: pc.env,
+    network: pc.network,
   };
 }
 

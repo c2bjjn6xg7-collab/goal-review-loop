@@ -145,6 +145,8 @@ export interface AgentRunInput {
   timeout_seconds: number;
   command_template: string[];
   signal?: AbortSignal;
+  /** Phase 8F: Per-provider network/proxy configuration for this agent run. */
+  network?: ProviderNetworkConfig;
 }
 
 /**
@@ -418,6 +420,26 @@ export interface AgentConfig {
   provider?: string;
 }
 
+/**
+ * Phase 8F: Per-provider proxy mode.
+ * - inherit: preserve current behavior (full shell env inheritance).
+ * - none: unset all proxy-related env vars for the child process.
+ * - auto: TCP-probe candidate_ports on 127.0.0.1; set proxy if open.
+ * - custom: set proxy vars to the configured proxy_url.
+ */
+export type ProxyMode = 'inherit' | 'none' | 'auto' | 'custom';
+
+/**
+ * Phase 8F: Per-provider network/proxy configuration.
+ */
+export interface ProviderNetworkConfig {
+  proxy_mode: ProxyMode;
+  /** Ports to probe in auto mode. Defaults to DEFAULT_CANDIDATE_PORTS if omitted. */
+  candidate_ports?: number[];
+  /** Required when proxy_mode === 'custom'. */
+  proxy_url?: string;
+}
+
 export interface ProviderConfig {
   enabled: boolean;
   command_template?: string[];
@@ -426,6 +448,10 @@ export interface ProviderConfig {
   permission_mode?: string;
   allowed_tools?: string;
   transcript_mode?: 'stdout_stderr' | 'jsonl' | 'none';
+  /** Non-secret environment overrides only. Do not store API keys here. */
+  env?: Record<string, string>;
+  /** Phase 8F: Per-provider network/proxy configuration. */
+  network?: ProviderNetworkConfig;
 }
 
 export interface ProviderProfile {
@@ -444,6 +470,9 @@ export interface ProviderProfile {
   sensitive_task_allowed?: boolean;
   worker_roles?: string[];
   escalation_target?: string;
+  env?: Record<string, string>;
+  /** Phase 8F: Per-provider network/proxy configuration. */
+  network?: ProviderNetworkConfig;
 }
 
 export interface ProgressData {
@@ -558,6 +587,8 @@ export interface ProcessRunnerInput {
   stdout_path: string;
   stderr_path: string;
   env?: Record<string, string>;
+  /** Phase 8F: Keys to delete from the child process environment after copying process.env. */
+  delete_env?: string[];
   signal?: AbortSignal;
   kill_grace_seconds?: number;
   max_log_bytes?: number;

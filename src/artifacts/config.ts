@@ -6,7 +6,7 @@ import fs from 'fs-extra';
 import yaml from 'js-yaml';
 import { Ajv } from 'ajv';
 import path from 'path';
-import type { ReviewLoopConfig } from '../types.js';
+import type { ReviewLoopConfig, ProviderNetworkConfig, ProviderConfig } from '../types.js';
 
 const CONFIG_SCHEMA = {
   type: 'object',
@@ -105,6 +105,24 @@ const CONFIG_SCHEMA = {
         permission_mode: { type: 'string' },
         allowed_tools: { type: 'string' },
         transcript_mode: { type: 'string', enum: ['stdout_stderr', 'jsonl', 'none'] },
+        env: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+        },
+        network: { $ref: '#/$defs/networkConfig' },
+      },
+      additionalProperties: false,
+    },
+    networkConfig: {
+      type: 'object',
+      required: ['proxy_mode'],
+      properties: {
+        proxy_mode: { type: 'string', enum: ['inherit', 'none', 'auto', 'custom'] },
+        candidate_ports: {
+          type: 'array',
+          items: { type: 'number', minimum: 1 },
+        },
+        proxy_url: { type: 'string', minLength: 1 },
       },
       additionalProperties: false,
     },
@@ -212,6 +230,9 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     // Enforce MVP constraints — Design doc §5.1
     validateMvpConstraints(config);
 
+    // Phase 8F: Validate network config — custom mode requires proxy_url
+    validateNetworkConfig(config);
+
     return config;
   } catch (err) {
     if (err instanceof ConfigError) throw err;
@@ -269,5 +290,22 @@ export function validateMvpConstraints(config: ReviewLoopConfig): void {
     throw new ConfigError(
       'git.push is not supported in MVP. Remote push is explicitly excluded from the current scope.',
     );
+  }
+}
+
+/**
+ * Phase 8F: Validate network config for all providers.
+ * custom mode requires a non-empty proxy_url.
+ */
+export function validateNetworkConfig(config: ReviewLoopConfig): void {
+  if (!config.providers) return;
+  for (const [providerId, providerConfig] of Object.entries(config.providers)) {
+    const network = (providerConfig as ProviderConfig & { network?: ProviderNetworkConfig }).network;
+    if (!network) continue;
+    if (network.proxy_mode === 'custom' && (!network.proxy_url || network.proxy_url.length === 0)) {
+      throw new ConfigError(
+        `Provider "${providerId}" has proxy_mode "custom" but no proxy_url is configured. A non-empty proxy_url is required for custom proxy mode.`,
+      );
+    }
   }
 }

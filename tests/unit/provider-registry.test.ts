@@ -87,6 +87,68 @@ describe('ProviderRegistry', () => {
     expect(custom!.provider_id).toBe('mytool');
     expect(custom!.command_template).toEqual(['mytool', 'run', '{prompt_file}']);
   });
+
+  // Phase 8F: network block threading
+  it('threads network config through mergeProviderConfig for builtin providers', () => {
+    const config: ReviewLoopConfig = {
+      version: 1,
+      agents: { planner: { command: ['x'], timeout_seconds: 60 }, developer: { command: ['x'], timeout_seconds: 60 }, auditor: { command: ['x'], timeout_seconds: 60 }, final_auditor: { command: ['x'], timeout_seconds: 60 } },
+      providers: {
+        claude: {
+          enabled: true,
+          network: { proxy_mode: 'none' },
+        },
+      },
+      loop: { max_iterations: 3, archive_history: true, stop_on_infrastructure_error: true },
+      git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: 'a/{run_id}', commit_on_pass: true, commit_template: 'x', create_tag: false, tag_template: 't', push: false },
+      runtime: { kill_grace_seconds: 10, max_log_bytes: 1024, lock_stale_seconds: 60 },
+    };
+    const registry = createProviderRegistry(config);
+    const claude = registry.resolve('claude');
+    expect(claude).not.toBeNull();
+    expect(claude!.network).toBeDefined();
+    expect(claude!.network!.proxy_mode).toBe('none');
+  });
+
+  it('threads network config through buildCustomProfile for custom providers', () => {
+    const config: ReviewLoopConfig = {
+      version: 1,
+      agents: { planner: { command: ['x'], timeout_seconds: 60 }, developer: { command: ['x'], timeout_seconds: 60 }, auditor: { command: ['x'], timeout_seconds: 60 }, final_auditor: { command: ['x'], timeout_seconds: 60 } },
+      providers: {
+        myproxy: {
+          enabled: true,
+          command_template: ['myproxy', 'run', '{prompt_file}'],
+          prompt_transport: 'prompt_file',
+          network: { proxy_mode: 'custom', proxy_url: 'http://my-proxy:3128' },
+        },
+      },
+      loop: { max_iterations: 3, archive_history: true, stop_on_infrastructure_error: true },
+      git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: 'a/{run_id}', commit_on_pass: true, commit_template: 'x', create_tag: false, tag_template: 't', push: false },
+      runtime: { kill_grace_seconds: 10, max_log_bytes: 1024, lock_stale_seconds: 60 },
+    };
+    const registry = createProviderRegistry(config);
+    const provider = registry.resolve('myproxy');
+    expect(provider).not.toBeNull();
+    expect(provider!.network).toBeDefined();
+    expect(provider!.network!.proxy_mode).toBe('custom');
+    expect(provider!.network!.proxy_url).toBe('http://my-proxy:3128');
+  });
+
+  it('preserves undefined network when not configured', () => {
+    const config: ReviewLoopConfig = {
+      version: 1,
+      agents: { planner: { command: ['x'], timeout_seconds: 60 }, developer: { command: ['x'], timeout_seconds: 60 }, auditor: { command: ['x'], timeout_seconds: 60 }, final_auditor: { command: ['x'], timeout_seconds: 60 } },
+      providers: {
+        claude: { enabled: true },
+      },
+      loop: { max_iterations: 3, archive_history: true, stop_on_infrastructure_error: true },
+      git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: 'a/{run_id}', commit_on_pass: true, commit_template: 'x', create_tag: false, tag_template: 't', push: false },
+      runtime: { kill_grace_seconds: 10, max_log_bytes: 1024, lock_stale_seconds: 60 },
+    };
+    const registry = createProviderRegistry(config);
+    const claude = registry.resolve('claude');
+    expect(claude!.network).toBeUndefined();
+  });
 });
 
 describe('resolveCommandForAgent', () => {

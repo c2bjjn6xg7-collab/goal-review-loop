@@ -9,6 +9,7 @@ import { mkdir } from 'node:fs/promises';
 import { runProcess } from '../runtime/process-runner.js';
 import { computeDigest, recordArtifactDigests, verifyArtifactDigests, type Digest, type ArtifactDigestRecord } from '../runtime/digest.js';
 import { renderCommand, type CommandRenderValues } from './command-renderer.js';
+import { resolveProviderEnv } from '../providers/network-env.js';
 import type { AgentRunInput, AgentRunResult, ErrorCategory } from '../types.js';
 
 /** Pre-call artifact state for stale detection. */
@@ -220,6 +221,27 @@ export async function runAgent(
 
   // Step 5: Execute via Process Runner
   try {
+    // Phase 8F: Resolve provider network/proxy environment
+    let processEnv: Record<string, string> | undefined;
+    let deleteEnv: string[] | undefined;
+    if (input.network) {
+      const fakeProfile = {
+        provider_id: '',
+        display_name: '',
+        execution_mode: 'cli' as const,
+        command_template: [],
+        prompt_transport: 'stdin' as const,
+        permission_modes: [],
+        transcript_mode: 'stdout_stderr' as const,
+        enabled: true,
+        network: input.network,
+        env: undefined,
+      };
+      const resolved = await resolveProviderEnv(fakeProfile);
+      processEnv = resolved.env;
+      deleteEnv = resolved.deleteEnv.length > 0 ? resolved.deleteEnv : undefined;
+    }
+
     const processResult = await runProcess(
       {
         argv,
@@ -228,6 +250,8 @@ export async function runAgent(
         stdout_path: stdoutPath,
         stderr_path: stderrPath,
         signal: input.signal,
+        env: processEnv,
+        delete_env: deleteEnv,
       },
       resolvedRoot,
     );

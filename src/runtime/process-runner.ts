@@ -329,6 +329,12 @@ export async function runProcess(input: ProcessRunnerInput, projectRoot?: string
       env[key] = value;
     }
   }
+  // Phase 8F: delete specified keys from the child environment
+  if (input.delete_env) {
+    for (const key of input.delete_env) {
+      delete env[key];
+    }
+  }
 
   for (const [key, value] of Object.entries(env)) {
     if (SENSITIVE_KEY_PATTERN.test(key) && value) {
@@ -588,6 +594,12 @@ export async function runProcessRaw(input: ProcessRunnerInput, projectRoot?: str
   if (input.env) {
     for (const [key, value] of Object.entries(input.env)) {
       env[key] = value;
+    }
+  }
+  // Phase 8F: delete specified keys from the child environment
+  if (input.delete_env) {
+    for (const key of input.delete_env) {
+      delete env[key];
     }
   }
 
