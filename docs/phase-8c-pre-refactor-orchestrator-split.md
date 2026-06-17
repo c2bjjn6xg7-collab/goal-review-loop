@@ -53,7 +53,7 @@ This is a **pure relocation refactor**. No behavior change. No new feature. No n
 2. `src/orchestrator/run-orchestrator.ts` imports `runTaskGraphLoop` from the new module and contains zero inline implementation of the task-graph loop body.
 3. `runOrchestrator` retains the existing dispatch logic: single-task GOAL still routes to `runIterationLoop` in `run-orchestrator.ts`; task-graph GOAL routes to the imported `runTaskGraphLoop`.
 4. Shared helpers (state machine, lock, archive, scope guard wrappers) remain in `run-orchestrator.ts` if they are used by both paths. If a helper is used only by the task-graph path, move it.
-5. `run-orchestrator.ts` line count drops below 2700.
+5. `run-orchestrator.ts` line count drops below 2800 (adjusted: runFinalization is a ~700-line shared helper called by both runIterationLoop and runTaskGraphLoop, so it must remain in run-orchestrator.ts per criterion 4).
 6. `task-graph-loop.ts` line count is between 400 and 900 (the existing implementation is roughly 480 lines).
 7. No public type or runtime behavior changes. `state.json` schema, `progress.json` schema, CLI flags, and resume semantics are byte-identical to current main.
 8. All existing tests pass without modification: `tests/unit/task-graph.test.ts`, `tests/unit/task-prompt-builder.test.ts`, `tests/integration/task-graph.test.ts`, plus full suite.
@@ -121,7 +121,7 @@ Before declaring success, the developer must confirm:
 ## Definition of Done
 
 - All 5 verification gates pass
-- `run-orchestrator.ts` is under 2700 lines
+- `run-orchestrator.ts` is under 2800 lines (runFinalization is shared, cannot be moved)
 - `task-graph-loop.ts` is between 400 and 900 lines
 - Auditor confirms no behavior change against the behavioral equivalence checklist
 - Phase 8C concurrency work can begin against the new module without further restructuring
