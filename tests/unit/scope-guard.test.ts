@@ -435,3 +435,63 @@ describe('ScopeGuard', () => {
     });
   });
 });
+
+// ─── Phase 8B: per-task scope guard ───────────────────────────
+
+describe('Phase 8B: per-task scope guard', () => {
+  const createChangedFiles = (files: Array<{ path: string; status: string }>): ChangedFilesSchema => ({
+    schema_version: 1,
+    base_commit: 'abc123',
+    files: files.map((f) => ({
+      path: f.path,
+      status: f.status as any,
+      tracked: true,
+      additions: 1,
+      deletions: 0,
+    })),
+  });
+
+  it('enforces narrow per-task allowed_changes (denies other modules)', () => {
+    // Task A only allowed to touch src/module-a/**, but Developer also touched src/module-b/**
+    const changedFiles = createChangedFiles([
+      { path: 'src/module-a/foo.ts', status: 'modified' },
+      { path: 'src/module-b/bar.ts', status: 'modified' },
+    ]);
+    const result = checkScope({
+      allowedChanges: ['src/module-a/**'],
+      disallowedChanges: ['.git/**'],
+      changedFiles,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.report.denied.some((d) => d.path === 'src/module-b/bar.ts')).toBe(true);
+    expect(result.report.allowed).toContain('src/module-a/foo.ts');
+  });
+
+  it('passes when all changes fall within the task scope', () => {
+    const changedFiles = createChangedFiles([
+      { path: 'src/module-a/foo.ts', status: 'modified' },
+      { path: 'src/module-a/sub/baz.ts', status: 'added' },
+    ]);
+    const result = checkScope({
+      allowedChanges: ['src/module-a/**'],
+      disallowedChanges: ['.git/**'],
+      changedFiles,
+    });
+    expect(result.passed).toBe(true);
+    expect(result.report.denied).toHaveLength(0);
+  });
+
+  it('a second task with a different scope would deny the first task files', () => {
+    // Demonstrates scope isolation between tasks using the same checkScope API
+    const changedFiles = createChangedFiles([
+      { path: 'src/module-a/foo.ts', status: 'modified' },
+    ]);
+    const result = checkScope({
+      allowedChanges: ['src/module-b/**'],
+      disallowedChanges: ['.git/**'],
+      changedFiles,
+    });
+    expect(result.passed).toBe(false);
+    expect(result.report.denied.some((d) => d.path === 'src/module-a/foo.ts')).toBe(true);
+  });
+});
