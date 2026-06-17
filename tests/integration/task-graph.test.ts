@@ -170,3 +170,91 @@ describe('Phase 8B: Task Graph sequential execution', () => {
     expect(progressMd).toMatch(/Task Graph/i);
   }, 120000);
 });
+
+// ─── Resume: BLOCKED on a task records the failed task index ──
+describe('Phase 8B: Task Graph resume', () => {
+  let repoDir: string;
+
+  afterEach(() => {
+    if (repoDir) {
+      try { rmSync(repoDir, { recursive: true }); } catch { /* ok */ }
+    }
+  });
+
+  it('records current_task_index pointing at the failed task on BLOCKED', async () => {
+    repoDir = createTestRepo('seq-blocked', {
+      planner: 'task-graph',
+      developer: 'blocked-handoff',
+    });
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a multi-part feature',
+      task_slug: 'multi-blocked',
+      max_iterations: 2,
+    });
+
+    expect(result.phase).toBe('BLOCKED');
+
+    // state.json must record task_graph_state with current_task_index = 0
+    // (task-1 is the first task and the developer blocks on it).
+    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    expect(state.task_graph_state).toBeTruthy();
+    expect(state.task_graph_state.current_task_index).toBe(0);
+    expect(state.task_graph_state.task_statuses['task-1']).toBe('failed');
+    // task-2 and task-3 should remain pending (not yet attempted)
+    expect(state.task_graph_state.task_statuses['task-2']).toBe('pending');
+    expect(state.task_graph_state.task_statuses['task-3']).toBe('pending');
+
+    // task-results.json records the failed task
+    const tr = JSON.parse(readFileSync(join(repoDir, '.agent', 'task-results.json'), 'utf8'));
+    expect(tr.results.some((r: { task_id: string; status: string }) => r.task_id === 'task-1' && r.status === 'failed')).toBe(true);
+  }, 120000);
+
+  it('resumes from the failed task index, skipping passed tasks', async () => {
+    // First run: developer blocks once on task-1 (task-block-once behavior),
+    // then succeeds on resume. Run BLOCKED at task index 0.
+    repoDir = createTestRepo('seq-resume', {
+      planner: 'task-graph',
+      developer: 'task-block-once',
+    });
+    const first = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a multi-part feature',
+      task_slug: 'resume-test',
+      max_iterations: 1,
+    });
+    expect(first.phase).toBe('BLOCKED');
+
+    // Capture state before resume
+    const stateBefore = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    const failedIndex = stateBefore.task_graph_state.current_task_index;
+    expect(failedIndex).toBe(0);
+
+    // Resume: developer now succeeds (sentinel exists). Should restart from the
+    // failed task (index 0) and complete all remaining tasks. No config change.
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      task_slug: 'resume-test',
+      max_iterations: 3,
+      resume_from: {
+        run_id: stateBefore.run_id,
+        iteration: stateBefore.iteration,
+        phase: stateBefore.phase,
+        branch: stateBefore.branch,
+        base_commit: stateBefore.base_commit,
+        task_slug: stateBefore.task_slug,
+        goal_digest: stateBefore.goal_digest,
+      },
+    });
+
+    // Resume should complete all tasks and end in PASSED.
+    expect(resumeResult.phase).toBe('PASSED');
+    expect(resumeResult.commit_sha).toBeTruthy();
+
+    // All tasks passed after resume
+    const stateAfter = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    const statuses = stateAfter.task_graph_state.task_statuses;
+    expect(Object.values(statuses).every((v: string) => v === 'passed')).toBe(true);
+  }, 180000);
+});

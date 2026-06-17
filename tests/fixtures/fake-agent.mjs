@@ -608,6 +608,36 @@ try {
           }
           writeFileSync(join(projectRoot, 'src', 'test-impl.ts'), '// Fixed implementation\nexport const testFn = () => true;\n', 'utf8');
           break;
+        case 'task-block-once':
+          // Phase 8B: block on the first attempt, then succeed on resume.
+          // Uses a sentinel file in .agent/ (orchestrator-owned) to track state.
+          {
+            const debugDir = join(agentDir, 'debug');
+            if (!existsSync(debugDir)) mkdirSync(debugDir, { recursive: true });
+            const sentinel = join(debugDir, 'task-block-sentinel');
+            if (existsSync(sentinel)) {
+              // Subsequent run (resume): succeed.
+              writeCompletedHandoff();
+              const promptFile = getArg('prompt-file');
+              let taskDir = join(projectRoot, 'src');
+              if (promptFile && existsSync(promptFile)) {
+                try {
+                  const content = readFileSync(promptFile, 'utf8');
+                  const m = content.match(/- `((?:src|tests)[^`]*?)\*\*`/);
+                  if (m) {
+                    taskDir = join(projectRoot, m[1].replace(/\/+$/, '').replace(/\/\*\*$/, ''));
+                  }
+                } catch { /* ignore */ }
+              }
+              mkdirSync(taskDir, { recursive: true });
+              writeFileSync(join(taskDir, 'impl.ts'), '// Task implementation\nexport const taskFn = () => true;\n', 'utf8');
+            } else {
+              // First run: block.
+              writeFileSync(sentinel, '1', 'utf8');
+              writeBlockedHandoff();
+            }
+          }
+          break;
         case 'rework-fail':
           // Phase 4: Developer in rework mode — still can't fix the issue
           writeBlockedHandoff();

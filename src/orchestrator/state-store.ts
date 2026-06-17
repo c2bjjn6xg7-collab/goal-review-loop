@@ -225,6 +225,41 @@ export class StateStore {
   }
 
   /**
+   * Force a phase transition without enforcing the legal-transition table.
+   *
+   * Phase 8B: used ONLY to resume a task-graph run that BLOCKED on a task.
+   * A BLOCKED phase has no outgoing legal transitions, but the task graph
+   * must be able to restart from the failed task. This method performs the
+   * same stage bookkeeping as transition() but skips validateTransition().
+   */
+  async forceTransitionForResume(newPhase: Phase): Promise<RunState> {
+    const current = await this.read();
+    const now = new Date().toISOString();
+
+    const stageKey = phaseToStageKey(newPhase);
+    const updatedStages = { ...current.stages };
+    if (stageKey && updatedStages[stageKey]) {
+      const prev = updatedStages[stageKey];
+      updatedStages[stageKey] = {
+        ...prev,
+        status: isTerminal(newPhase) ? StageStatus.COMPLETED : StageStatus.RUNNING,
+        attempts: prev.attempts + 1,
+        at: now,
+      };
+    }
+
+    const newState: RunState = {
+      ...current,
+      phase: newPhase,
+      updated_at: now,
+      stages: updatedStages,
+    };
+
+    await this.writeInternal(newState);
+    return newState;
+  }
+
+  /**
    * Update non-phase fields on the current state.
    * Rejects if the caller tries to change the phase field.
    */

@@ -294,6 +294,12 @@ export async function runOrchestrator(params: {
       if (goalValidation.taskGraph) {
         const tgState = await stateStore.read();
         const resumeTaskIndex = tgState.task_graph_state?.current_task_index ?? 0;
+        // Phase 8B: a task-graph run may have BLOCKED on a failed task. BLOCKED has
+        // no outgoing legal transitions, so force the phase back to DEVELOPING to
+        // restart from the failed task. Successfully completed tasks are skipped.
+        if (tgState.phase === PhaseEnum.BLOCKED) {
+          await stateStore.forceTransitionForResume(PhaseEnum.DEVELOPING);
+        }
         return await runTaskGraphLoop({
           projectRoot,
           agentDir,

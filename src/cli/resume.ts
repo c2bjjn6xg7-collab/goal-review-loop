@@ -84,6 +84,9 @@ export async function executeResume(params: {
   if (isTerminal(state.phase)) {
     if (state.phase === 'BLOCKED' && state.final_commit_sha && !state.tag_created && state.tag_name) {
       // Allow resume from BLOCKED to retry tag creation
+    } else if (state.phase === 'BLOCKED' && state.task_graph_state) {
+      // Phase 8B: allow resume of a task-graph run that BLOCKED on a task.
+      // The orchestrator will restart from the failed task index.
     } else {
       throw new ResumeConsistencyError(`Run ${state.run_id} is already in terminal state: ${state.phase}. Cannot resume a completed run.`);
     }
