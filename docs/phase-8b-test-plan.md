@@ -1,5 +1,43 @@
 # Phase 8B 测试计划：Task Graph 顺序执行
 
+## 测试位置（先看这里）
+
+整轮测试涉及两个位置，**不要混用**。
+
+### 主仓库：`/Users/dengyidong/Desktop/cc劳工系统`
+
+用于：
+
+- 工程门禁（typecheck / lint / build / npm test / audit / pack）
+- 单元和集成测试聚焦（vitest 跑现有测试）
+- 边界与负面验证（写一个**临时** `.test.ts` 跑 `validateTaskGraph`，跑完用 `git checkout -- tests/` 清掉）
+
+约束：
+
+- 当前 main HEAD：`628ac50 docs: add phase 8b test plan for developer ai`
+- 在 main 分支上工作，**不允许** commit、push、或留下未跟踪的临时文件
+- **不允许** 修改 `src/`、`tests/`、`prompts/`、`docs/phase-8b-*` 中已有内容
+- 边界验证写的临时测试文件**不要 git add**，跑完立即删除或 checkout 还原
+- **不允许** 在主仓库执行 `review-loop start`
+
+### 临时 Smoke 仓库：`/tmp/phase-8b-smoke`
+
+用于：
+
+- 真实模型 dogfood（让 review-loop 真实写代码、提交、运行 vitest）
+
+约束：
+
+- 必须由你在测试开始时 `mkdir` 创建并 `git init`，不要复用任何旧目录
+- 这是一次性目录，review-loop 会在里面 `git commit`、写 `src/`、`tests/`，这是预期行为
+- 测试结束后可以删除整个目录，**不要** 把里面任何内容拷回主仓库
+
+### 测试报告位置
+
+- 报告文件名：`phase-8b-test-report.md`
+- 报告路径：写在 `/tmp/` 下或你自己的工作区，**绝对不要** 提交到主仓库
+- 报告内容必须包含真实数字和时间戳
+
 ## 给开发师 AI 的总体说明
 
 Phase 8B 已经合并到 `main`（commits `61ef05a..fd7c71a`）。本轮你不是开发新功能，而是**作为测试者**对已合并代码做端到端验证。
