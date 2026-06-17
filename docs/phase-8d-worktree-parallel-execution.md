@@ -218,6 +218,86 @@ false positive from over-tight `allowed_changes` (the overlap algorithm in
 > ... BLOCKED，不自动换弱模型"). Retrying LLM work against a broken provider
 > only wastes calls.
 
+### 7.3 Run-Level Consecutive Failure Guard (Pre-Concurrency Prerequisite)
+
+> Originally specified in `docs/phase-8d-consecutive-failure-guard.md`. Merged
+> here as §7.3 on 2026-06-17; that document is now a historical record.
+
+**Motivation.** The 1-C + 2-C policy (§7.2) handles *per-task* failure. It
+does not catch *systemic flakiness*: an Auditor that BLOCKs every wave, a
+Developer that empty-responses every retry, an infra error every attempt.
+Under concurrency the blast radius multiplies — one runaway task per wave
+across N waves burns the full budget before stopping. A deterministic
+run-wide counter closes that gap. This guard is a **prerequisite** to
+concurrency: ship it before §7.1/§7.2, because §7.2 makes each task eligible
+for up to two retries + one escalation, which without a run-wide cap can
+stack badly.
+
+**What is missing today** (audit against `main`, 2026-06-17, still accurate):
+
+- No counter for "same failure class N times in a row" across iterations.
+- The single-iteration Developer AGENT_ERROR retry is hard-coded to `1`
+  (`MAX_DEVELOPER_RETRIES` at `src/orchestrator/run-orchestrator.ts:930`).
+- No early-exit reason distinguishing "iteration budget exhausted" from
+  "consecutive failure threshold tripped".
+
+**New config keys** under `config.loop` (both optional, defaults applied if
+absent):
+
+- `max_consecutive_failures` — integer 1..10, default 3.
+- `max_agent_retries` — integer 1..10, default 1.
+
+**New state field:** `consecutive_failure_count` on `state.json`. Reset to 0
+on any iteration that produces a passing Auditor decision or a passing
+per-task result. Increments by 1 on every iteration ending in BLOCKED for a
+tracked class. Persisted across resume (state-store whitelist).
+
+**Early exit:** when `consecutive_failure_count >= max_consecutive_failures`,
+the orchestrator exits to BLOCKED with `last_error.code =
+"CONSECUTIVE_FAILURE_LIMIT"` and a message naming the threshold + repeated
+class.
+
+**Tracked failure classes** (exactly these four, deliberately collapsed for
+simplicity):
+
+- Auditor decision = BLOCK
+- Developer reported `status: BLOCKED` in handoff
+- Verification command failure
+- Infrastructure / `AGENT_ERROR`
+
+Other terminal phases (PASSED, CANCELLED, manual abort) reset the counter.
+
+**Reconciliation with §7.2 — this is the key design point.** `max_agent_retries`
+replaces the hard-coded `MAX_DEVELOPER_RETRIES` AND it is the same knob that
+bounds §7.2's 2-C step 1 ("Rework once on the original provider"). There is
+exactly **one** retry budget per task on the original provider, not two:
+
+- §7.2 step 1 retries = `max_agent_retries` attempts (default 1 = current
+  behavior, byte-identical to today).
+- After those attempts exhaust, step 2 escalates to `escalation_target`
+  (one attempt), then step 3 BLOCKED.
+
+So the full per-task retry budget on the original provider is
+`max_agent_retries` (same-provider) + 1 (escalation) before BLOCKED. Setting
+`max_agent_retries = 2` widens the same-provider budget to 2+1; the default
+(1) keeps the 1+1 ladder exactly as §7.2 describes. No double-counting.
+
+**Task-graph / wave mode:** the counter is **per-run, not per-task**. A
+single task failing once and a different task failing in the next wave
+together count as 2 toward the threshold. Rationale: the guard reacts to
+systemic flakiness, not one stubborn task — and per-task escalation (§7.2)
+already handles the stubborn-task case.
+
+> Note on routing: the original sub-doc framed this counter as feeding
+> "Phase 9 routing." That is stale — Phase 9 is the event-stream/UI phase and
+> owns no routing. Model routing lives in §7.2's escalation and in Phase 8E.
+> The counter's consumer is the early-exit branch only.
+
+**Non-goals** (carry over from sub-doc): do not change `max_iterations` or
+its 1..10 cap; no per-task or per-agent counters (one run-wide counter); no
+automatic model escalation beyond §7.2; no backoff/jitter/exponential delay;
+no new CLI flags (YAML-only config).
+
 ## 8. Cancellation
 
 Cancellation must:
@@ -402,6 +482,43 @@ Phase 8D is complete when:
 34. **Worktree path guard:** a worker whose `allowed_changes` nominally
     permits `.agent/worktrees/other-task/**` is still denied (scope guard
     treats `.agent/worktrees/**` as system-protected).
+
+### 12.2 Added acceptance (run-level consecutive failure guard, §7.3)
+
+35. **Counter increment on Auditor BLOCK:** across iterations, each BLOCK
+    increments `consecutive_failure_count`; a unit test drives three BLOCKs
+    and asserts the count.
+36. **Counter reset on PASS:** any iteration reaching PASS resets the counter
+    to 0; verified by a unit test.
+37. **Early-exit threshold:** with `max_consecutive_failures = 3`, the run
+    terminates with `last_error.code = "CONSECUTIVE_FAILURE_LIMIT"` at
+    exactly the third consecutive failure, not before. An integration test
+    drives three Auditor BLOCKs end-to-end and asserts the code.
+38. **Defaults apply:** when both new keys are absent, `max_consecutive_failures`
+    defaults to 3 and `max_agent_retries` to 1; behavior is byte-identical to
+    current main on existing tests.
+39. **Schema range:** config schema rejects `max_consecutive_failures` and
+    `max_agent_retries` values outside 1..10.
+40. **Resume restores count:** resume from a BLOCKED state with non-zero
+    counter restores both the count and the threshold; the counter is in the
+    state-store whitelist (unit test pins this — drift here silently zeroes
+    the counter and is the highest-severity bug in this sub-feature).
+41. **`max_agent_retries` bounds 2-C step 1:** a task failing on the original
+    provider is retried exactly `max_agent_retries` times on that provider
+    before escalation (§7.2 step 2). With `max_agent_retries = 2`, that is
+    2 same-provider attempts; with the default 1, it is 1 (current behavior).
+    A fake-agent test asserts the attempt count and that escalation follows.
+42. **No double-counting:** the single-iteration AGENT_ERROR retry and the
+    run-wide counter coexist without double-counting (the in-iteration retry
+    does not increment the cross-iteration counter). Unit test covers the
+    interaction.
+43. **Per-run, not per-task, under waves:** in task-graph/wave mode, failures
+    across different tasks in different waves accumulate into the single
+    run-wide counter; a test drives one failure in wave 0 (task A) and one
+    in wave 1 (task B) and asserts count = 2.
+44. **Status surfacing:** CLI `status` and `progress.md` surface the current
+    count and threshold when non-zero, and are byte-identical to today when
+    the counter is 0.
 
 ## 13. Suggested Review Loop Request
 

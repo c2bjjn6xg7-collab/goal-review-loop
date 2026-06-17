@@ -1,5 +1,24 @@
 # Phase 8D Pre-Concurrency: Consecutive Failure Guard
 
+> **⚠ Merged 2026-06-17 — this document is now a historical record.**
+> Its content has been folded into the main Phase 8D doc as **§7.3 Run-Level
+> Consecutive Failure Guard** (`docs/phase-8d-worktree-parallel-execution.md`).
+> The merge resolved two issues present in this original draft:
+>
+> 1. **Retry-budget conflict.** This draft's `max_agent_retries` and the main
+>    doc's 2-C step 1 ("rework once on original provider") described the same
+>    retry with two different knobs. §7.3 unifies them: `max_agent_retries`
+>    *is* the §7.2 step-1 budget (default 1 = current behavior). There is one
+>    same-provider budget per task, not two.
+> 2. **Stale routing reference.** This draft framed the counter as feeding
+>    "Phase 9 routing." Phase 9 is the event-stream/UI phase and owns no
+>    routing — model routing lives in §7.2 escalation + Phase 8E. The counter's
+>    only consumer is the early-exit branch.
+>
+> The Stock Audit (§查现状) and Test Coverage sections below remain accurate
+> and are the implementation reference. Treat §7.3 as authoritative where the
+> two disagree; this file is kept for history.
+
 ## Why this is in scope before Phase 9 routing
 
 The orchestrator currently has exactly one safeguard against runaway iteration:
