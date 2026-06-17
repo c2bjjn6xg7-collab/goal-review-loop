@@ -13,7 +13,8 @@ import { join } from 'node:path';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { computeDigest, type Digest } from '../runtime/digest.js';
 import { parsePlan, parseGoal, normalizeGoalCommands } from '../artifacts/artifact-schemas.js';
-import type { AgentRunInput, GoalFrontMatter, VerificationCommand } from '../types.js';
+import type { AgentRunInput, GoalFrontMatter, VerificationCommand, TaskGraph } from '../types.js';
+import { loadTaskGraph, taskGraphExists } from '../scheduler/task-graph.js';
 
 /** Planner expected artifacts (relative to project root). */
 const PLANNER_ARTIFACTS = ['.agent/plan.md', '.agent/GOAL.md'];
@@ -123,12 +124,33 @@ export function validatePlannerOutput(
     }
   }
 
+  // Phase 8B: validate task-graph.json if present.
+  let taskGraph: TaskGraph | null = null;
+  if (taskGraphExists(projectRoot)) {
+    const tgResult = loadTaskGraph(projectRoot);
+    if (!tgResult.valid) {
+      errors.push(`task-graph.json validation failed: ${tgResult.errors.join('; ')}`);
+    } else {
+      const tg = tgResult.graph!;
+      // Cross-check run_id consistency
+      if (tg.run_id !== runId) {
+        errors.push(`task-graph.json run_id "${tg.run_id}" does not match expected "${runId}"`);
+      } else if (goalDigest && tg.goal_digest !== goalDigest) {
+        // Cross-check goal_digest consistency
+        errors.push(`task-graph.json goal_digest "${tg.goal_digest}" does not match GOAL.md digest "${goalDigest}"`);
+      } else {
+        taskGraph = tg;
+      }
+    }
+  }
+
   return {
     valid: errors.length === 0,
     errors,
     goalFrontMatter: goalFm,
     goalDigest,
     verificationCommands,
+    taskGraph,
   };
 }
 
@@ -138,6 +160,8 @@ export interface PlannerValidationResult {
   goalFrontMatter: GoalFrontMatter | null;
   goalDigest: Digest | null;
   verificationCommands: VerificationCommand[] | null;
+  /** Phase 8B: validated task graph, or null when absent/invalid. */
+  taskGraph: TaskGraph | null;
 }
 
 /**

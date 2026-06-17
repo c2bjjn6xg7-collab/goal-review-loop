@@ -106,6 +106,8 @@ export interface RunState {
   /** Whether the tag was successfully created. */
   tag_created: boolean;
   stages: Record<string, StageInfo>;
+  /** Phase 8B: task graph execution state, or null when no task graph. */
+  task_graph_state: TaskGraphState | null;
 }
 
 /**
@@ -475,6 +477,20 @@ export interface ProviderProfile {
   network?: ProviderNetworkConfig;
 }
 
+/**
+ * Phase 8B: Task graph progress info attached to progress.json.
+ */
+export interface TaskProgressInfo {
+  current_task_id: string | null;
+  current_task_title: string | null;
+  /** Human-readable label, e.g. "Task 2 of 5". */
+  task_index: string;
+  /** running | passed | failed | rework. */
+  task_status: string;
+  /** Overall graph progress label, e.g. "1/5 complete". */
+  overall_progress: string;
+}
+
 export interface ProgressData {
   schema_version: 1;
   run_id: string;
@@ -490,6 +506,8 @@ export interface ProgressData {
   stages: Record<string, StageInfo>;
   commit_sha: string | null;
   final_audit_decision: string | null;
+  /** Phase 8B: task graph progress, when a task graph is active. */
+  task_graph?: TaskProgressInfo | null;
 }
 
 export interface TranscriptEntry {
@@ -867,4 +885,120 @@ export interface StatusOutput {
   tag_created: boolean;
   push_enabled: boolean;
   finalization_next_step: string | null;
+}
+
+
+// ─── Phase 8B: Task Graph Types ──────────────────────────────
+
+/**
+ * Phase 8B: Task difficulty — hints at required effort/context.
+ * Not used for worker assignment in this phase (Phase 9).
+ */
+export const TaskDifficulty = {
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+} as const;
+
+export type TaskDifficulty = (typeof TaskDifficulty)[keyof typeof TaskDifficulty];
+
+/**
+ * Phase 8B: Task risk — hints at blast radius of changes.
+ */
+export const TaskRisk = {
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  CRITICAL: 'critical',
+} as const;
+
+export type TaskRisk = (typeof TaskRisk)[keyof typeof TaskRisk];
+
+/**
+ * Phase 8B: Task status within the task graph.
+ */
+export const TaskStatus = {
+  PENDING: 'pending',
+  RUNNING: 'running',
+  PASSED: 'passed',
+  FAILED: 'failed',
+  SKIPPED: 'skipped',
+} as const;
+
+export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
+
+/**
+ * Phase 8B: Per-task verification command (external protocol format).
+ * Mirrors GoalVerificationCommand but scoped to a single task.
+ */
+export interface TaskVerificationCommand {
+  id: string;
+  command: string[];
+  cwd: string;
+  required: boolean;
+  timeout_seconds: number;
+}
+
+/**
+ * Phase 8B: Task node — a single decomposed unit of work.
+ * Each task maps to one scoped Developer run.
+ */
+export interface TaskNode {
+  id: string;
+  title: string;
+  description: string;
+  difficulty: TaskDifficulty;
+  risk: TaskRisk;
+  parallelizable: boolean;
+  depends_on: string[];
+  allowed_changes: string[];
+  disallowed_changes: string[];
+  verification_commands: TaskVerificationCommand[];
+  status: TaskStatus;
+}
+
+/**
+ * Phase 8B: Task graph — DAG of TaskNodes produced by the Planner.
+ * Sequential execution only (no parallelism).
+ */
+export interface TaskGraph {
+  schema_version: 1;
+  run_id: string;
+  goal_digest: string;
+  tasks: TaskNode[];
+  created_at: string;
+}
+
+/**
+ * Phase 8B: Per-task execution result, accumulated in .agent/task-results.json.
+ */
+export interface TaskResult {
+  task_id: string;
+  status: TaskStatus;
+  attempts: number;
+  started_at: string;
+  finished_at: string;
+  verification_passed: boolean;
+  error: string | null;
+}
+
+/**
+ * Phase 8B: Accumulated task results file schema.
+ */
+export interface TaskResultsFile {
+  schema_version: 1;
+  run_id: string;
+  results: TaskResult[];
+}
+
+/**
+ * Phase 8B: Task graph execution state, persisted in state.json.
+ */
+export interface TaskGraphState {
+  /** Index of the current task in topological order (0-based). */
+  current_task_index: number;
+  /** Per-task status map keyed by task id. */
+  task_statuses: Record<string, TaskStatus>;
+  /** Per-task attempt counts keyed by task id. */
+  task_attempts: Record<string, number>;
 }

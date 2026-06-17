@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { existsSync, writeFileSync } from 'node:fs';
 import { atomicWriteJSON } from './atomic-file.js';
-import type { ProgressData } from '../types.js';
+import type { ProgressData, TaskProgressInfo } from '../types.js';
 
 export function buildProgressData(params: {
   run_id: string;
@@ -15,6 +15,7 @@ export function buildProgressData(params: {
   commit_sha?: string | null;
   final_audit_decision?: string | null;
   last_event?: string;
+  task_graph?: TaskProgressInfo | null;
 }): ProgressData {
   const now = new Date().toISOString();
   return {
@@ -32,6 +33,7 @@ export function buildProgressData(params: {
     stages: params.stages,
     commit_sha: params.commit_sha ?? null,
     final_audit_decision: params.final_audit_decision ?? null,
+    task_graph: params.task_graph ?? null,
   };
 }
 
@@ -71,6 +73,12 @@ export function writeProgressMarkdown(projectRoot: string, data: ProgressData): 
   }
   if (data.final_audit_decision) {
     lines.push('', `**Final Audit**: ${data.final_audit_decision}`);
+  }
+  if (data.task_graph) {
+    lines.push('', '## Task Graph', '');
+    lines.push(`| Current Task | Status | Overall |`);
+    lines.push(`|--------------|--------|---------|`);
+    lines.push(`| ${data.task_graph.task_index} | ${data.task_graph.task_status} | ${data.task_graph.overall_progress} |`);
   }
 
   lines.push('');

@@ -9,6 +9,7 @@ const SYSTEM_PROTECTED_PATHS = [
   '.agent/state.json',
   '.agent/plan.md',
   '.agent/GOAL.md',
+  '.agent/task-graph.json',
   '.agent/audit-report.md',
   '.agent/final-audit.md',
   '.agent/run.lock',
@@ -28,6 +29,7 @@ const DEVELOPER_HANDOFF_EXCEPTION = '.agent/developer-handoff.md';
 const ORCHESTRATOR_OWNED_PATTERNS = [
   '.agent/plan.md',
   '.agent/GOAL.md',
+  '.agent/task-graph.json',
   '.agent/state.json',
   '.agent/run.lock',
   '.agent/audit-report.md',

@@ -44,7 +44,7 @@ const STATE_SCHEMA = {
     'schema_version', 'run_id', 'task_slug', 'phase', 'iteration',
     'max_iterations', 'project_root', 'base_commit', 'branch',
     'goal_digest', 'audited_diff_digest', 'started_at', 'updated_at',
-    'last_error', 'cancel_requested_at', 'final_commit_sha', 'final_commit_message', 'finalized_at', 'commit_skipped', 'skip_reason', 'tag_name', 'tag_created', 'stages',
+    'last_error', 'cancel_requested_at', 'final_commit_sha', 'final_commit_message', 'finalized_at', 'commit_skipped', 'skip_reason', 'tag_name', 'tag_created', 'stages', 'task_graph_state',
   ],
   properties: {
     schema_version: { type: 'number', const: 1 },
@@ -83,6 +83,22 @@ const STATE_SCHEMA = {
           at: { type: 'string' },
         },
       },
+    },
+    task_graph_state: {
+      type: ['object', 'null'],
+      properties: {
+        current_task_index: { type: 'number', minimum: 0 },
+        task_statuses: {
+          type: 'object',
+          additionalProperties: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped'] },
+        },
+        task_attempts: {
+          type: 'object',
+          additionalProperties: { type: 'number', minimum: 0 },
+        },
+      },
+      required: ['current_task_index', 'task_statuses', 'task_attempts'],
+      additionalProperties: false,
     },
   },
   additionalProperties: false,
@@ -285,6 +301,7 @@ export class StateStore {
       tag_name: null,
       tag_created: false,
       stages: defaultStages,
+      task_graph_state: null,
     };
   }
 

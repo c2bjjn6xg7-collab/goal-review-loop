@@ -403,3 +403,105 @@ export class PromptBuilderError extends Error {
     this.name = 'PromptBuilderError';
   }
 }
+
+// ─── Phase 8B: Per-task Developer prompt ─────────────────────
+
+/**
+ * Context for a per-task Developer prompt (Phase 8B).
+ * Each task is a narrow, independently-verifiable unit of work.
+ */
+export interface TaskDeveloperPromptContext {
+  run_id: string;
+  project_root: string;
+  /** 1-based index of this task within the topological order. */
+  task_index: number;
+  task_total: number;
+  task_id: string;
+  task_title: string;
+  task_description: string;
+  allowed_changes: string[];
+  disallowed_changes: string[];
+  /** Verification commands serialized as human-readable strings. */
+  verification_commands: Array<{ id: string; command: string[]; cwd: string; required: boolean; timeout_seconds: number }>;
+  /** GOAL success criteria lines, for context. */
+  goal_success_criteria: string[];
+  goal_path: string;
+  handoff_path: string;
+}
+
+/**
+ * Build a Developer prompt scoped to a single task node.
+ *
+ * This prompt intentionally excludes the full plan and other tasks to keep
+ * the Developer's context short enough for the domestic API to handle.
+ */
+export function buildTaskDeveloperPrompt(context: TaskDeveloperPromptContext): string {
+  const allowedList = context.allowed_changes.map((p) => `- \`${p}\``).join('\n');
+  const disallowedList = context.disallowed_changes.length > 0
+    ? context.disallowed_changes.map((p) => `- \`${p}\``).join('\n')
+    : '(none)';
+  const verificationList = context.verification_commands.map((vc) => {
+    const cmd = vc.command.join(' ');
+    return `- id: \`${vc.id}\` — \`${cmd}\` (cwd: \`${vc.cwd}\`, required: ${vc.required}, timeout: ${vc.timeout_seconds}s)`;
+  }).join('\n');
+  const criteriaList = context.goal_success_criteria.length > 0
+    ? context.goal_success_criteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
+    : '(see GOAL.md)';
+
+  return `# Developer Task — Run ${context.run_id}
+
+You are the **Developer** executing task **${context.task_index} of ${context.task_total}** for run \`${context.run_id}\`.
+
+## Task
+
+- **ID**: \`${context.task_id}\`
+- **Title**: ${context.task_title}
+- **Description**:
+${context.task_description}
+
+## Scope — ONLY modify these paths
+
+You MUST NOT modify any file outside the paths listed below. The Scope Guard will reject changes outside this list.
+
+${allowedList}
+
+### Disallowed changes
+
+${disallowedList}
+
+## Verification — these commands MUST pass before you finish
+
+After making your changes, ensure every required verification command below passes. Do not claim success without running them.
+
+${verificationList}
+
+## GOAL Context (for reference only)
+
+The overall GOAL success criteria (do NOT implement other tasks — only this one):
+
+${criteriaList}
+
+Full GOAL: \`${context.goal_path}\`
+
+## Rules
+
+1. ONLY modify files within the allowed_changes listed above.
+2. Do NOT execute git commit, tag, push, or any destructive Git command.
+3. Do NOT delete, skip, or weaken tests.
+4. Do NOT modify \`.agent/state.json\`, \`.agent/GOAL.md\`, \`.agent/plan.md\`, \`.agent/task-graph.json\`, or any orchestrator-owned file.
+5. When done, write your handoff to \`${context.handoff_path}\` with front matter:
+
+\`\`\`yaml
+---
+schema_version: 1
+run_id: "${context.run_id}"
+iteration: ${context.task_index}
+author_role: "developer"
+status: "COMPLETED"
+---
+\`\`\`
+
+Set \`status: "BLOCKED"\` only if you genuinely cannot proceed.
+6. Keep your work focused and minimal — this is one narrow task, not the whole goal.
+`;
+}
