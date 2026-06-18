@@ -3,6 +3,7 @@ import {
   validateChangedFiles,
   validateDiffMetadata,
   validateVerificationManifest,
+  validateStatusOutput,
 } from '../../src/artifacts/json-schemas.js';
 
 describe('JSON Schemas', () => {
@@ -197,6 +198,181 @@ describe('JSON Schemas', () => {
         ...validManifest,
         commands: [{ ...validManifest.commands[0], id: '../escaped' }],
       })).toBe(false);
+    });
+  });
+
+  describe('statusOutputSchema', () => {
+    const emptyFeedbackSummary = {
+      blocks_total: 0,
+      parse_warnings: 0,
+      unknown_role_blocks: 0,
+      by_type: {
+        clarify: 0,
+        followup_task: 0,
+        risk_note: 0,
+        scope_concern: 0,
+        verification_suggestion: 0,
+      },
+      by_role: {
+        planner: 0,
+        developer: 0,
+        auditor: 0,
+        final_auditor: 0,
+      },
+      present_files: [],
+    };
+
+    const validStatus = {
+      run_id: 'run-001',
+      phase: 'DEVELOPING',
+      iteration: 1,
+      max_iterations: 3,
+      branch: 'agent/run-001',
+      base_commit: 'abc123',
+      goal_digest: null,
+      audited_diff_digest: null,
+      last_error: null,
+      lock_status: 'none',
+      lock_info: null,
+      started_at: '2026-06-13T10:00:00.000Z',
+      updated_at: '2026-06-13T10:05:00.000Z',
+      next_step: 'Developer is running.',
+      final_audit_decision: null,
+      final_audit_path: null,
+      commit_on_pass: true,
+      commit_skipped: false,
+      final_commit_sha: null,
+      tag_requested: false,
+      tag_name: null,
+      tag_created: false,
+      push_enabled: false,
+      finalization_next_step: null,
+      feedback_summary: emptyFeedbackSummary,
+    };
+
+    it('accepts a status output with an empty feedback_summary', () => {
+      expect(validateStatusOutput(validStatus)).toBe(true);
+    });
+
+    it('accepts a status output with a populated feedback_summary', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: {
+            blocks_total: 3,
+            parse_warnings: 1,
+            unknown_role_blocks: 1,
+            by_type: {
+              clarify: 1,
+              followup_task: 1,
+              risk_note: 0,
+              scope_concern: 0,
+              verification_suggestion: 1,
+            },
+            by_role: {
+              planner: 1,
+              developer: 1,
+              auditor: 0,
+              final_auditor: 0,
+            },
+            present_files: [
+              '.agent/clarifications.md',
+              '.agent/followups.md',
+              '.agent/parse-warnings.md',
+            ],
+          },
+        }),
+      ).toBe(true);
+    });
+
+    it('rejects a status output missing feedback_summary', () => {
+      const { feedback_summary, ...withoutSummary } = validStatus;
+      void feedback_summary;
+      expect(validateStatusOutput(withoutSummary)).toBe(false);
+    });
+
+    it('rejects a feedback_summary missing canonical type keys', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: {
+            ...emptyFeedbackSummary,
+            by_type: {
+              clarify: 0,
+              followup_task: 0,
+              risk_note: 0,
+              scope_concern: 0,
+              // verification_suggestion missing
+            },
+          },
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects a feedback_summary with an unknown role key', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: {
+            ...emptyFeedbackSummary,
+            by_role: {
+              planner: 0,
+              developer: 0,
+              auditor: 0,
+              final_auditor: 0,
+              orchestrator: 1,
+            },
+          },
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects negative counts in feedback_summary', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: { ...emptyFeedbackSummary, blocks_total: -1 },
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects fractional counts in feedback_summary', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: { ...emptyFeedbackSummary, parse_warnings: 1.5 },
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects unsafe paths in feedback_summary.present_files', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: {
+            ...emptyFeedbackSummary,
+            present_files: ['../escaped/path.md'],
+          },
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects extra fields on feedback_summary', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          feedback_summary: { ...emptyFeedbackSummary, extra: 'field' },
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects extra fields on the status output itself', () => {
+      expect(
+        validateStatusOutput({
+          ...validStatus,
+          unexpected_field: 'nope',
+        }),
+      ).toBe(false);
     });
   });
 });

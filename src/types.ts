@@ -917,6 +917,28 @@ export interface CancelRequest {
 }
 
 /**
+ * Phase 10: Status-side summary of accumulated feedback byproducts.
+ *
+ * Structurally compatible with the `FeedbackSummary` shape produced by
+ * `src/cli/status-feedback-summary.ts`. Defined here so `StatusOutput`
+ * stays self-contained in the public types surface.
+ */
+export interface StatusFeedbackSummary {
+  /** Total accepted feedback blocks across the three block files. */
+  blocks_total: number;
+  /** Number of parse-warning entries (separate from blocks_total). */
+  parse_warnings: number;
+  /** Number of blocks whose origin role could not be determined. */
+  unknown_role_blocks: number;
+  /** Per-type counts for the canonical feedback types. */
+  by_type: Record<FeedbackType, number>;
+  /** Per-role counts (only includes blocks with a known role). */
+  by_role: Record<FeedbackRole, number>;
+  /** Project-relative paths of byproduct files that exist on disk, sorted. */
+  present_files: string[];
+}
+
+/**
  * Phase 4: Status Output — §10
  * Structured output for `review-loop status --json`.
  */
@@ -945,6 +967,8 @@ export interface StatusOutput {
   tag_created: boolean;
   push_enabled: boolean;
   finalization_next_step: string | null;
+  /** Phase 10: byproduct feedback summary; always present, may be empty. */
+  feedback_summary: StatusFeedbackSummary;
 }
 
 

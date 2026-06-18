@@ -284,6 +284,49 @@ export const reworkInstructionsFrontMatterSchema: Schema = {
   additionalProperties: false,
 };
 
+/**
+ * Phase 10: Status-side feedback byproduct summary.
+ * Counts derived from .agent/{clarifications,feedback-notes,followups,parse-warnings}.md.
+ * by_type and by_role enumerate all canonical keys (no additional properties).
+ */
+const statusFeedbackSummarySchema: Schema = {
+  type: 'object',
+  properties: {
+    blocks_total: { type: 'integer', minimum: 0 },
+    parse_warnings: { type: 'integer', minimum: 0 },
+    unknown_role_blocks: { type: 'integer', minimum: 0 },
+    by_type: {
+      type: 'object',
+      properties: {
+        clarify: { type: 'integer', minimum: 0 },
+        followup_task: { type: 'integer', minimum: 0 },
+        risk_note: { type: 'integer', minimum: 0 },
+        scope_concern: { type: 'integer', minimum: 0 },
+        verification_suggestion: { type: 'integer', minimum: 0 },
+      },
+      required: ['clarify', 'followup_task', 'risk_note', 'scope_concern', 'verification_suggestion'],
+      additionalProperties: false,
+    },
+    by_role: {
+      type: 'object',
+      properties: {
+        planner: { type: 'integer', minimum: 0 },
+        developer: { type: 'integer', minimum: 0 },
+        auditor: { type: 'integer', minimum: 0 },
+        final_auditor: { type: 'integer', minimum: 0 },
+      },
+      required: ['planner', 'developer', 'auditor', 'final_auditor'],
+      additionalProperties: false,
+    },
+    present_files: {
+      type: 'array',
+      items: { type: 'string', format: 'safe-file-path' },
+    },
+  },
+  required: ['blocks_total', 'parse_warnings', 'unknown_role_blocks', 'by_type', 'by_role', 'present_files'],
+  additionalProperties: false,
+};
+
 export const statusOutputSchema: Schema = {
   type: 'object',
   properties: {
@@ -311,8 +354,9 @@ export const statusOutputSchema: Schema = {
     tag_created: { type: 'boolean' },
     push_enabled: { type: 'boolean' },
     finalization_next_step: { type: ['string', 'null'] },
+    feedback_summary: statusFeedbackSummarySchema,
   },
-  required: ['run_id', 'phase', 'iteration', 'max_iterations', 'branch', 'base_commit', 'goal_digest', 'audited_diff_digest', 'last_error', 'lock_status', 'lock_info', 'started_at', 'updated_at', 'next_step', 'final_audit_decision', 'final_audit_path', 'commit_on_pass', 'commit_skipped', 'final_commit_sha', 'tag_requested', 'tag_name', 'tag_created', 'push_enabled', 'finalization_next_step'],
+  required: ['run_id', 'phase', 'iteration', 'max_iterations', 'branch', 'base_commit', 'goal_digest', 'audited_diff_digest', 'last_error', 'lock_status', 'lock_info', 'started_at', 'updated_at', 'next_step', 'final_audit_decision', 'final_audit_path', 'commit_on_pass', 'commit_skipped', 'final_commit_sha', 'tag_requested', 'tag_name', 'tag_created', 'push_enabled', 'finalization_next_step', 'feedback_summary'],
   additionalProperties: false,
 };
 

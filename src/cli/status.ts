@@ -11,6 +11,10 @@ import { LockManager } from '../runtime/lock-manager.js';
 import type { RunState, StatusOutput, ReviewLoopError } from '../types.js';
 import { Phase as PhaseEnum } from '../types.js';
 import { isTerminal } from '../orchestrator/state-machine.js';
+import {
+  readFeedbackSummary,
+  feedbackSummaryHasContent,
+} from './status-feedback-summary.js';
 
 export function createStatusCommand(): Command {
   const cmd = new Command('status');
@@ -172,6 +176,7 @@ export async function executeStatus(params: {
     tag_created: state.tag_created,
     push_enabled: false,
     finalization_next_step: computeFinalizationNextStep(state),
+    feedback_summary: readFeedbackSummary(projectRoot),
   };
 
   return output;
@@ -242,7 +247,7 @@ function computeNextStep(phase: string, iteration: number, maxIterations: number
 /**
  * Print human-readable status output.
  */
-function printHumanReadable(status: StatusOutput): void {
+export function printHumanReadable(status: StatusOutput): void {
   console.log(`Run: ${status.run_id}`);
   console.log(`Phase: ${status.phase}`);
   console.log(`Iteration: ${status.iteration}/${status.max_iterations}`);
@@ -281,5 +286,43 @@ function printHumanReadable(status: StatusOutput): void {
   }
   if (status.final_audit_decision) {
     console.log(`Final Audit: ${status.final_audit_decision}`);
+  }
+
+  printFeedbackSummarySection(status);
+}
+
+/**
+ * Print the Phase 10 feedback byproduct summary, if any signal is present.
+ * Silent when no byproduct file exists and no counts are recorded.
+ */
+function printFeedbackSummarySection(status: StatusOutput): void {
+  const fs = status.feedback_summary;
+  if (!feedbackSummaryHasContent(fs)) return;
+
+  console.log('Phase 10 feedback:');
+  console.log(`  Blocks: ${fs.blocks_total} (parse warnings: ${fs.parse_warnings})`);
+
+  const typeParts: string[] = [];
+  for (const t of ['clarify', 'risk_note', 'followup_task', 'scope_concern', 'verification_suggestion'] as const) {
+    if (fs.by_type[t] > 0) typeParts.push(`${t}=${fs.by_type[t]}`);
+  }
+  if (typeParts.length > 0) {
+    console.log(`  By type: ${typeParts.join(', ')}`);
+  }
+
+  const roleParts: string[] = [];
+  for (const r of ['planner', 'developer', 'auditor', 'final_auditor'] as const) {
+    if (fs.by_role[r] > 0) roleParts.push(`${r}=${fs.by_role[r]}`);
+  }
+  if (roleParts.length > 0 || fs.unknown_role_blocks > 0) {
+    const unknown = fs.unknown_role_blocks > 0 ? `unknown=${fs.unknown_role_blocks}` : '';
+    const all = unknown ? [...roleParts, unknown] : roleParts;
+    if (all.length > 0) {
+      console.log(`  By role: ${all.join(', ')}`);
+    }
+  }
+
+  if (fs.present_files.length > 0) {
+    console.log(`  Files: ${fs.present_files.join(', ')}`);
   }
 }
