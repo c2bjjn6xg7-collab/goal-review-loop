@@ -15,6 +15,11 @@ coverage/
 .agent/history/
 .agent/debug/
 .agent/transcripts/
+# Phase 10 feedback-protocol byproducts (run产物, 不进仓库)
+.agent/feedback-notes.md
+.agent/clarifications.md
+.agent/followups.md
+.agent/parse-warnings.md
 
 # Local test report
 review-loop-test-report.md
