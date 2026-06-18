@@ -67,6 +67,17 @@ export class LockManager {
   /**
    * Acquire the lock atomically using exclusive file creation (wx flag).
    * This is a true atomic operation: either we create the file exclusively, or it already exists.
+   *
+   * Known limitation — stale-lock recovery TOCTOU window:
+   * There is a TOCTOU (time-of-check to time-of-use) window during stale-lock recovery
+   * between detecting that the existing lock is stale (dead PID + past staleness threshold)
+   * and completing recovery (unlinking the stale lock and re-running the exclusive create).
+   * Within that window, the original holder may become active again — for example, the OS
+   * may reuse the original PID for a new unrelated process, or, in pathological cases, the
+   * original process may be observed as dead and then resume — and recovery would then
+   * displace a lock that is no longer actually stale. This is a known limitation and is
+   * not being fixed in this change; callers needing strict guarantees against this race
+   * should coordinate at a higher level (e.g., external orchestration or operator review).
    */
   async acquire(runId: string, staleSeconds = 86400): Promise<void> {
     const lockInfo: LockInfo = {
