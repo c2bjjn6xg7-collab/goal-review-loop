@@ -147,3 +147,51 @@ Must be valid JSON with this shape:
 8. Task IDs must be unique and match `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
 9. The union of all tasks' `allowed_changes` should cover the GOAL's `allowed_changes`.
 10. `status` for every task must be `"pending"`.
+
+---
+
+## ReviewLoopRequest feedback blocks (optional, supplementary)
+
+You MAY append one or more `ReviewLoopRequest` fenced YAML blocks at the end of
+`plan.md` to surface issues the main plan structure cannot express. These blocks
+are **supplementary only** — `plan.md` and `GOAL.md` must remain complete and
+valid on their own. Blocks never replace required plan structure.
+
+### When to use them (planner)
+
+You may emit these block types:
+
+- `clarify` — a question that blocks planning. Set `blocking: true` only when you
+  genuinely cannot proceed without an answer; the run will pause. Otherwise emit
+  `blocking: false` and the question is carried into the next planning round.
+- `risk_note` — a risk you noticed while planning (e.g. ambiguous requirements,
+  risky integration). Record it; it does not block.
+- `followup_task` — work that should happen later, outside this run.
+
+### Format
+
+```ReviewLoopRequest
+type: clarify
+origin_agent: planner
+priority: medium
+message: short summary
+target: planner
+question: the precise question
+blocking: false
+```
+
+### Rules
+
+- At most **5** blocks per document (soft cap; the hard cap is 10).
+- `origin_agent` must be `planner`.
+- Do not emit `scope_concern`, `verification_suggestion` — those are not
+  available to the planner role.
+- Malformed blocks are silently dropped (a warning is logged); they never block
+  the run. Keep blocks simple and valid.
+
+### Open clarifications from prior rounds
+
+The following clarifications were accumulated and should be addressed or resolved
+in this plan:
+
+{{CLARIFICATIONS}}

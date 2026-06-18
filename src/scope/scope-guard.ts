@@ -23,6 +23,10 @@ const SYSTEM_PROTECTED_PATHS = [
   '.agent/verification/**',
   '.agent/history/**',
   '.agent/debug/**',
+  '.agent/clarifications.md',
+  '.agent/followups.md',
+  '.agent/feedback-notes.md',
+  '.agent/parse-warnings.md',
 ];
 
 const DEVELOPER_HANDOFF_EXCEPTION = '.agent/developer-handoff.md';
@@ -45,6 +49,10 @@ const ORCHESTRATOR_OWNED_PATTERNS = [
   '.agent/history/**',
   '.agent/debug/**',
   '.agent/iteration-log.md',
+  '.agent/clarifications.md',
+  '.agent/followups.md',
+  '.agent/feedback-notes.md',
+  '.agent/parse-warnings.md',
 ];
 
 // F-315R1: Only UNTRACKED dependency cache files are excluded.

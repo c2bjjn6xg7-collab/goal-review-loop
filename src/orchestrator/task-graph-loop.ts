@@ -33,6 +33,8 @@ import { orderedTasks, initialTaskStatuses, initialTaskAttempts } from '../sched
 import { runAgent } from '../agents/agent-adapter.js';
 import { resolveCommandForAgent } from '../providers/provider-registry.js';
 import { normalizeGoalCommands } from '../artifacts/artifact-schemas.js';
+import { dispatchFeedbackBlocks } from './feedback-dispatcher.js';
+import { readFeedbackNotesForAudit } from './feedback-dispatcher.js';
 import { buildProgressData, writeProgress, writeProgressMarkdown } from '../runtime/progress-writer.js';
 import type { Digest } from '../runtime/digest.js';
 import type {
@@ -285,6 +287,14 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
         break;
       }
 
+      // Phase 10: dispatch ReviewLoopRequest feedback blocks from developer-handoff.md (best-effort).
+      await dispatchFeedbackBlocks({
+        projectRoot, runId, role: 'developer',
+        artifactPath: join(projectRoot, '.agent/developer-handoff.md'),
+        config: config.feedback_protocol,
+        registry: orchestratorRegistry,
+      }).catch(() => { /* failure-safe */ });
+
       // ── Per-task scope guard (enforces task.allowed_changes) ──
       // Collect full diff for evidence/metadata, but scope-check ONLY the files
       // this Developer run changed (task-scoped), so prior tasks' files — which
@@ -463,6 +473,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     let auditorCleanupResult: PromptCleanupResult | undefined;
     try {
       const iterStr = String(auditIteration).padStart(2, '0');
+      const taskGraphFeedbackNotes = await readFeedbackNotesForAudit(projectRoot);
       const promptResult = await buildPrompt(
         projectRoot,
         'auditor.md',
@@ -482,6 +493,8 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
           audit_report_path: join(projectRoot, '.agent/audit-report.md'),
           goal_digest: goalDigest,
           diff_digest: diffDigest,
+          feedback_notes: taskGraphFeedbackNotes,
+          feedback_notes_path: '.agent/feedback-notes.md',
         }),
         { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
       );

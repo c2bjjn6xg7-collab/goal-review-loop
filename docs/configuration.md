@@ -188,3 +188,61 @@ runtime:
   max_log_bytes: 10485760
   lock_stale_seconds: 86400
 ```
+
+---
+
+## Phase 10: Feedback Block Protocol (`feedback_protocol`)
+
+The `feedback_protocol` block configures the ReviewLoopRequest feedback block
+protocol — an optional, supplementary channel that lets agents surface issues
+(questions, risks, follow-up tasks, scope concerns, verification suggestions)
+via fenced YAML blocks appended to their primary artifacts.
+
+This protocol is **failure-safe**: parse errors never block the main loop. When
+`enabled: false`, the parser is not invoked and prompts carry no hint — behavior
+is byte-identical to pre-Phase-10.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Master switch. When `false`, the protocol is fully inert. |
+| `self_correction` | `boolean` | `false` | When `true`, a failed block is sent back to the agent for a single-block rewrite (1 retry, no recursion). |
+| `max_blocks_per_document` | `integer` (1–50) | `10` | Hard cap on accepted blocks per artifact; excess tail is ignored and warned. |
+| `allowed_types_per_role` | `Record<Role, FeedbackType[]>` | see below | Per-role allowlist of permitted block types. |
+
+### Default per-role allowlist
+
+```yaml
+feedback_protocol:
+  enabled: true
+  self_correction: false
+  max_blocks_per_document: 10
+  allowed_types_per_role:
+    planner: [clarify, risk_note, followup_task]
+    developer: [scope_concern, verification_suggestion, risk_note, followup_task]
+    auditor: [risk_note, followup_task]
+    final_auditor: [risk_note, followup_task]
+```
+
+### Block types
+
+- `clarify` — planner-only; a question. `blocking: true` pauses the run.
+- `followup_task` — deferred work accumulated across runs in `.agent/followups.md`.
+- `risk_note` — a disclosed risk. Treated as a diligence signal, not a defect.
+- `scope_concern` — developer-flagged scope issue; does not auto-expand scope.
+- `verification_suggestion` — a command the auditor should run.
+
+### Byproduct files
+
+The dispatcher writes four orchestrator-owned files (whitelisted by the scope
+guard so they are never treated as Developer scope violations):
+
+- `.agent/clarifications.md` — planner clarifications, injected into the next planner prompt.
+- `.agent/followups.md` — checkbox log of actionable follow-ups (`followup_task`, `verification_suggestion`).
+- `.agent/feedback-notes.md` — non-blocking audit notes (`risk_note`, `scope_concern`); visible to Auditor and Final Auditor prompts. A `risk_note` is a diligence signal, not a defect.
+- `.agent/parse-warnings.md` — append-only log of parse failures with line numbers and excerpts.
+
+### risk_note anti-incentive handling
+
+The auditor and final-auditor prompts explicitly frame a developer-disclosed
+`risk_note` as a positive diligence signal. REWORK/FAIL is only issued when the
+risk is independently verified — never merely because a `risk_note` exists.

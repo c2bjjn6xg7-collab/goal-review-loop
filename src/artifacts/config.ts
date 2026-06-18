@@ -6,7 +6,28 @@ import fs from 'fs-extra';
 import yaml from 'js-yaml';
 import { Ajv } from 'ajv';
 import path from 'path';
-import type { ReviewLoopConfig, ProviderNetworkConfig, ProviderConfig } from '../types.js';
+import type { ReviewLoopConfig, ProviderNetworkConfig, ProviderConfig, FeedbackRole, FeedbackType } from '../types.js';
+
+
+/**
+ * Phase 10: default per-role feedback-type allowlist (Design doc §9).
+ */
+export const DEFAULT_FEEDBACK_ALLOWED_TYPES: Record<FeedbackRole, FeedbackType[]> = {
+  planner: ['clarify', 'risk_note', 'followup_task'],
+  developer: ['scope_concern', 'verification_suggestion', 'risk_note', 'followup_task'],
+  auditor: ['risk_note', 'followup_task'],
+  final_auditor: ['risk_note', 'followup_task'],
+};
+
+/**
+ * Phase 10: default feedback_protocol configuration.
+ */
+export const DEFAULT_FEEDBACK_PROTOCOL = {
+  enabled: true,
+  self_correction: false,
+  max_blocks_per_document: 10,
+  allowed_types_per_role: DEFAULT_FEEDBACK_ALLOWED_TYPES,
+};
 
 const CONFIG_SCHEMA = {
   type: 'object',
@@ -66,6 +87,27 @@ const CONFIG_SCHEMA = {
         max_log_bytes: { type: 'number', minimum: 1024 },
         lock_stale_seconds: { type: 'number', minimum: 60 },
         cancel_grace_seconds: { type: 'number', minimum: 1 },
+      },
+      additionalProperties: false,
+    },
+    feedback_protocol: {
+      type: 'object',
+      required: ['enabled', 'self_correction', 'max_blocks_per_document', 'allowed_types_per_role'],
+      properties: {
+        enabled: { type: 'boolean' },
+        self_correction: { type: 'boolean' },
+        max_blocks_per_document: { type: 'integer', minimum: 1, maximum: 50 },
+        allowed_types_per_role: {
+          type: 'object',
+          required: ['planner', 'developer', 'auditor', 'final_auditor'],
+          properties: {
+            planner: { type: 'array', items: { type: 'string' } },
+            developer: { type: 'array', items: { type: 'string' } },
+            auditor: { type: 'array', items: { type: 'string' } },
+            final_auditor: { type: 'array', items: { type: 'string' } },
+          },
+          additionalProperties: false,
+        },
       },
       additionalProperties: false,
     },
@@ -184,6 +226,12 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     lock_stale_seconds: 86400, // 24h
     cancel_grace_seconds: 10,
   },
+  feedback_protocol: {
+    enabled: true,
+    self_correction: false,
+    max_blocks_per_document: 10,
+    allowed_types_per_role: DEFAULT_FEEDBACK_ALLOWED_TYPES,
+  },
 };
 
 /**
@@ -226,6 +274,32 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     if (!config.agents.final_auditor) {
       config.agents.final_auditor = config.agents.auditor;
     }
+
+    // Phase 10 backward compat: fill in feedback_protocol with defaults if missing
+    if (!config.feedback_protocol) {
+      config.feedback_protocol = {
+        enabled: DEFAULT_FEEDBACK_PROTOCOL.enabled,
+        self_correction: DEFAULT_FEEDBACK_PROTOCOL.self_correction,
+        max_blocks_per_document: DEFAULT_FEEDBACK_PROTOCOL.max_blocks_per_document,
+        allowed_types_per_role: DEFAULT_FEEDBACK_ALLOWED_TYPES,
+      };
+    } else {
+      if (config.feedback_protocol.enabled === undefined) {
+        config.feedback_protocol.enabled = DEFAULT_FEEDBACK_PROTOCOL.enabled;
+      }
+      if (config.feedback_protocol.self_correction === undefined) {
+        config.feedback_protocol.self_correction = DEFAULT_FEEDBACK_PROTOCOL.self_correction;
+      }
+      if (config.feedback_protocol.max_blocks_per_document === undefined) {
+        config.feedback_protocol.max_blocks_per_document = DEFAULT_FEEDBACK_PROTOCOL.max_blocks_per_document;
+      }
+      if (!config.feedback_protocol.allowed_types_per_role) {
+        config.feedback_protocol.allowed_types_per_role = DEFAULT_FEEDBACK_ALLOWED_TYPES;
+      }
+    }
+
+    // Phase 10: validate allowed_types_per_role values are legal FeedbackType subset
+    validateFeedbackTypes(config);
 
     // Enforce MVP constraints — Design doc §5.1
     validateMvpConstraints(config);
@@ -290,6 +364,44 @@ export function validateMvpConstraints(config: ReviewLoopConfig): void {
     throw new ConfigError(
       'git.push is not supported in MVP. Remote push is explicitly excluded from the current scope.',
     );
+  }
+}
+
+const LEGAL_FEEDBACK_TYPES: ReadonlySet<string> = new Set<FeedbackType>([
+  'clarify', 'followup_task', 'risk_note', 'scope_concern', 'verification_suggestion',
+]);
+const LEGAL_FEEDBACK_ROLES: ReadonlySet<string> = new Set<FeedbackRole>([
+  'planner', 'developer', 'auditor', 'final_auditor',
+]);
+
+/**
+ * Phase 10: Validate feedback_protocol.allowed_types_per_role.
+ * Each role key must be legal; each type value must be a legal FeedbackType.
+ */
+export function validateFeedbackTypes(config: ReviewLoopConfig): void {
+  const { allowed_types_per_role } = config.feedback_protocol;
+  for (const role of Object.keys(allowed_types_per_role)) {
+    if (!LEGAL_FEEDBACK_ROLES.has(role)) {
+      throw new ConfigError(
+        `feedback_protocol.allowed_types_per_role has unknown role "${role}"`,
+      );
+    }
+    const types = allowed_types_per_role[role as FeedbackRole];
+    for (const t of types) {
+      if (!LEGAL_FEEDBACK_TYPES.has(t)) {
+        throw new ConfigError(
+          `feedback_protocol.allowed_types_per_role["${role}"] has unknown feedback type "${t}"`,
+        );
+      }
+    }
+  }
+  // Ensure all four roles present
+  for (const r of ['planner', 'developer', 'auditor', 'final_auditor']) {
+    if (!allowed_types_per_role[r as FeedbackRole]) {
+      throw new ConfigError(
+        `feedback_protocol.allowed_types_per_role missing role "${r}"`,
+      );
+    }
   }
 }
 

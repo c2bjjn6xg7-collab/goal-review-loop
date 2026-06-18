@@ -112,6 +112,7 @@ export function buildPlannerPrompt(
   result = replaceAllTokens(result, '{{CLAUDE_MD_PATH}}', context.claude_md_path || '(not available)');
   result = replaceAllTokens(result, '{{CLAUDE_MD_CONTENT}}', context.claude_md_content || '(not available)');
   result = replaceAllTokens(result, '{{PACKAGE_JSON_SUMMARY}}', context.package_json_summary || '(not available)');
+  result = replaceAllTokens(result, '{{CLARIFICATIONS}}', context.clarifications || '(none)');
   result = replaceAllTokens(result, '{{TEMPLATE_VERSION}}', String(PROMPT_TEMPLATE_VERSION));
   return result;
 }
@@ -178,6 +179,8 @@ export function buildAuditorPrompt(
   result = replaceAllTokens(result, '{{AUDIT_REPORT_PATH}}', context.audit_report_path);
   result = replaceAllTokens(result, '{{GOAL_DIGEST}}', context.goal_digest);
   result = replaceAllTokens(result, '{{DIFF_DIGEST}}', context.diff_digest);
+  result = replaceAllTokens(result, '{{FEEDBACK_NOTES_PATH}}', context.feedback_notes_path || '.agent/feedback-notes.md');
+  result = replaceAllTokens(result, '{{FEEDBACK_NOTES}}', context.feedback_notes || '(none)');
   result = replaceAllTokens(result, '{{TEMPLATE_VERSION}}', String(PROMPT_TEMPLATE_VERSION));
   return result;
 }
@@ -208,6 +211,8 @@ export function buildFinalAuditorPrompt(
   result = replaceAllTokens(result, '{{DIFF_DIGEST}}', context.diff_digest);
   result = replaceAllTokens(result, '{{AUDIT_REPORT_DIGEST}}', context.audit_report_digest);
   result = replaceAllTokens(result, '{{VERIFICATION_MANIFEST_DIGEST}}', context.verification_manifest_digest);
+  result = replaceAllTokens(result, '{{FEEDBACK_NOTES_PATH}}', context.feedback_notes_path || '.agent/feedback-notes.md');
+  result = replaceAllTokens(result, '{{FEEDBACK_NOTES}}', context.feedback_notes || '(none)');
   result = replaceAllTokens(result, '{{TEMPLATE_VERSION}}', String(PROMPT_TEMPLATE_VERSION));
   return result;
 }
@@ -218,6 +223,8 @@ export interface PlannerPromptContext {
   run_id: string;
   project_root: string;
   base_commit: string;
+  /** Phase 10: accumulated clarifications to address in this plan. */
+  clarifications?: string;
   project_files_summary?: string;
   agents_md_path?: string;
   agents_md_content?: string;
@@ -263,6 +270,10 @@ export interface AuditorPromptContext {
   audit_report_path: string;
   goal_digest: string;
   diff_digest: string;
+  /** Phase 10: content of .agent/feedback-notes.md for audit visibility. */
+  feedback_notes?: string;
+  /** Phase 10: path to the feedback notes file. */
+  feedback_notes_path?: string;
 }
 
 /** Context for Final Auditor prompt. Phase 5 §7. */
@@ -284,6 +295,10 @@ export interface FinalAuditorPromptContext {
   diff_digest: string;
   audit_report_digest: string;
   verification_manifest_digest: string;
+  /** Phase 10: content of .agent/feedback-notes.md for audit visibility. */
+  feedback_notes?: string;
+  /** Phase 10: path to the feedback notes file. */
+  feedback_notes_path?: string;
 }
 
 /**

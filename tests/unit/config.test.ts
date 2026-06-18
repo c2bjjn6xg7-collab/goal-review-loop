@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs-extra';
+import yaml from 'js-yaml';
 import path from 'path';
 import os from 'os';
 import {
@@ -584,5 +585,62 @@ providers:
     it('validateNetworkConfig passes when no providers configured', () => {
       expect(() => validateNetworkConfig(DEFAULT_CONFIG)).not.toThrow();
     });
+  });
+});
+describe('Phase 10 feedback_protocol', () => {
+  it('DEFAULT_CONFIG includes feedback_protocol with defaults', () => {
+    expect(DEFAULT_CONFIG.feedback_protocol.enabled).toBe(true);
+    expect(DEFAULT_CONFIG.feedback_protocol.self_correction).toBe(false);
+    expect(DEFAULT_CONFIG.feedback_protocol.max_blocks_per_document).toBe(10);
+    expect(DEFAULT_CONFIG.feedback_protocol.allowed_types_per_role.auditor).not.toContain('clarify');
+  });
+
+  it('fills feedback_protocol defaults when absent from yaml', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rl-cfg-'));
+    try {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      // Minimal valid config without feedback_protocol
+      await fs.writeFile(configPath, [
+        'version: 1',
+        'agents:',
+        '  planner: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+        '  developer: { command: ["sh","-lc","x"], timeout_seconds: 600 }',
+        '  auditor: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+        'loop: { max_iterations: 3 }',
+        'git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: "b", commit_on_pass: true, commit_template: "c", create_tag: false, tag_template: "t", push: false }',
+        'runtime: { kill_grace_seconds: 10, max_log_bytes: 1048576, lock_stale_seconds: 86400 }',
+      ].join('\n'), 'utf8');
+      const config = await loadConfig(configPath);
+      expect(config.feedback_protocol.enabled).toBe(true);
+      expect(config.feedback_protocol.max_blocks_per_document).toBe(10);
+      expect(config.feedback_protocol.allowed_types_per_role.planner).toContain('clarify');
+    } finally {
+      await fs.remove(tmpDir);
+    }
+  });
+
+  it('rejects unknown feedback type in allowlist', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rl-cfg-'));
+    try {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const base = DEFAULT_CONFIG;
+      const bad = { ...base, feedback_protocol: { ...base.feedback_protocol, allowed_types_per_role: { ...base.feedback_protocol.allowed_types_per_role, auditor: ['risk_note', 'bogus'] } } };
+      await fs.writeFile(configPath, yaml.dump(bad), 'utf8');
+      await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+    } finally {
+      await fs.remove(tmpDir);
+    }
+  });
+
+  it('rejects max_blocks_per_document out of range', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rl-cfg-'));
+    try {
+      const configPath = path.join(tmpDir, 'review-loop.yaml');
+      const bad = { ...DEFAULT_CONFIG, feedback_protocol: { ...DEFAULT_CONFIG.feedback_protocol, max_blocks_per_document: 0 } };
+      await fs.writeFile(configPath, yaml.dump(bad), 'utf8');
+      await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+    } finally {
+      await fs.remove(tmpDir);
+    }
   });
 });

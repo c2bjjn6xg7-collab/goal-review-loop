@@ -33,6 +33,9 @@ import { buildPlannerInput, validatePlannerOutput, snapshotWorkspaceBeforePlanne
 import { buildDeveloperInput, validateDeveloperOutput } from '../agents/developer-adapter.js';
 import { buildAuditorInput, validateAuditorOutput } from '../agents/auditor-adapter.js';
 import { buildFinalAuditorInput, validateFinalAuditorOutput } from '../agents/final-auditor-adapter.js';
+import { dispatchFeedbackBlocks } from './feedback-dispatcher.js';
+import { readClarificationsForPlanner } from './feedback-dispatcher.js';
+import { readFeedbackNotesForAudit } from './feedback-dispatcher.js';
 import {
   renderCommitMessage,
   renderTagName,
@@ -404,6 +407,10 @@ export async function runOrchestrator(params: {
 
     let plannerPrompt: string;
     let plannerPromptFile: string | undefined;
+    // Phase 10: read accumulated clarifications to inject into the Planner prompt.
+    const plannerClarifications = config.feedback_protocol.enabled
+      ? await readClarificationsForPlanner(projectRoot)
+      : '';
     try {
       const promptResult = await buildPrompt(
         projectRoot,
@@ -413,6 +420,7 @@ export async function runOrchestrator(params: {
           run_id: runId,
           project_root: projectRoot,
           base_commit: baseCommit,
+          clarifications: plannerClarifications,
         }),
         { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'planner' },
       );
@@ -496,6 +504,13 @@ export async function runOrchestrator(params: {
     }
 
     await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'PASS');
+    // Phase 10: dispatch ReviewLoopRequest feedback blocks from plan.md (best-effort).
+    await dispatchFeedbackBlocks({
+      projectRoot, runId, role: 'planner',
+      artifactPath: join(projectRoot, '.agent/plan.md'),
+      config: config.feedback_protocol,
+      registry: orchestratorRegistry,
+    }).catch(() => { /* failure-safe */ });
 
     // F-307R2: Register Planner agent log files in the orchestrator registry.
     // These are created by the Process Runner infrastructure, not by the Planner agent itself.
@@ -1014,6 +1029,13 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       }
 
       await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'PASS');
+      // Phase 10: dispatch ReviewLoopRequest feedback blocks from developer-handoff.md (best-effort).
+      await dispatchFeedbackBlocks({
+        projectRoot, runId, role: 'developer',
+        artifactPath: join(projectRoot, '.agent/developer-handoff.md'),
+        config: config.feedback_protocol,
+        registry: orchestratorRegistry,
+      }).catch(() => { /* failure-safe */ });
     }
 
     // ── VERIFYING ──
@@ -1242,6 +1264,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     let auditorPromptFile: string | undefined;
     try {
       const iterStr = String(iteration).padStart(2, '0');
+      const feedbackNotes = await readFeedbackNotesForAudit(projectRoot);
       const promptResult = await buildPrompt(
         projectRoot,
         'auditor.md',
@@ -1261,6 +1284,8 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
           audit_report_path: join(projectRoot, '.agent/audit-report.md'),
           goal_digest: goalDigest,
           diff_digest: diffDigest,
+          feedback_notes: feedbackNotes,
+          feedback_notes_path: '.agent/feedback-notes.md',
         }),
         { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
       );
@@ -1378,6 +1403,13 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     if (decision === 'PASS') {
       await stateStore.transition(PhaseEnum.FINALIZING);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'PASS');
+      // Phase 10: dispatch ReviewLoopRequest feedback blocks from audit-report.md (best-effort).
+      await dispatchFeedbackBlocks({
+        projectRoot, runId, role: 'auditor',
+        artifactPath: join(projectRoot, '.agent/audit-report.md'),
+        config: config.feedback_protocol,
+        registry: orchestratorRegistry,
+      }).catch(() => { /* failure-safe */ });
 
       // Phase 5: Run the finalization pipeline
       return await runFinalization({
@@ -2080,6 +2112,7 @@ export async function runFinalization(params: {
   let finalAuditorPromptFile: string | undefined;
   try {
     const iterStr = String(iteration).padStart(2, '0');
+    const finalFeedbackNotes = await readFeedbackNotesForAudit(projectRoot);
     const promptResult = await buildPrompt(
       projectRoot,
       'final-auditor.md',
@@ -2101,6 +2134,8 @@ export async function runFinalization(params: {
         diff_digest: currentDiffDigest,
         audit_report_digest: currentAuditReportDigest,
         verification_manifest_digest: verificationManifestDigest,
+        feedback_notes: finalFeedbackNotes,
+        feedback_notes_path: '.agent/feedback-notes.md',
       }),
       { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'final-auditor' },
     );
@@ -2197,6 +2232,13 @@ export async function runFinalization(params: {
   }
 
   await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final audit completed', 'PASS');
+  // Phase 10: dispatch ReviewLoopRequest feedback blocks from final-audit.md (best-effort).
+  await dispatchFeedbackBlocks({
+    projectRoot, runId, role: 'final_auditor',
+    artifactPath: join(projectRoot, '.agent/final-audit.md'),
+    config: config.feedback_protocol,
+    registry: orchestratorRegistry,
+  }).catch(() => { /* failure-safe */ });
 
   // F-501R2: Verify Final Auditor workspace immutability via exhaustive digest comparison.
   // Pass 1: For EVERY file in the pre-snapshot, re-compute current digest regardless of

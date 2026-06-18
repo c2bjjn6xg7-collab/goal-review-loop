@@ -421,6 +421,8 @@ export interface ReviewLoopConfig {
   };
   git: GitConfig;
   runtime: RuntimeConfig;
+  /** Phase 10: Agent feedback block protocol (ReviewLoopRequest). */
+  feedback_protocol: FeedbackProtocolConfig;
 }
 
 export interface AgentConfig {
@@ -549,6 +551,57 @@ export interface RuntimeConfig {
   lock_stale_seconds: number;
   /** Grace period in seconds for cancel to take effect before force-killing. Default: 10. */
   cancel_grace_seconds: number;
+}
+
+// ─── Phase 10: ReviewLoopRequest Feedback Block Protocol ──────
+
+/** Roles that may emit feedback blocks. */
+export type FeedbackRole = 'planner' | 'developer' | 'auditor' | 'final_auditor';
+
+/** Feedback block types (Design doc §4.2). */
+export type FeedbackType =
+  | 'clarify'
+  | 'followup_task'
+  | 'risk_note'
+  | 'scope_concern'
+  | 'verification_suggestion';
+
+/** Per-role allowed feedback types. */
+export type AllowedTypesPerRole = Record<FeedbackRole, FeedbackType[]>;
+
+/** Phase 10 configuration — Design doc §9. */
+export interface FeedbackProtocolConfig {
+  /** Master switch. When false, parser is not invoked and prompts carry no hint. */
+  enabled: boolean;
+  /** Enable single-block self-correction rewrite on parse failure (off by default). */
+  self_correction: boolean;
+  /** Hard cap on blocks parsed per document; excess tail ignored + warned. */
+  max_blocks_per_document: number;
+  /** Per-role allowlist of permitted feedback types. */
+  allowed_types_per_role: AllowedTypesPerRole;
+}
+
+/** A parsed ReviewLoopRequest feedback block. */
+export interface FeedbackBlock {
+  type: FeedbackType;
+  priority: 'low' | 'medium' | 'high';
+  origin_agent: FeedbackRole;
+  message: string;
+  fields: Record<string, unknown>;
+  source_line: number;
+}
+
+/** A feedback block parse/validation error. */
+export interface FeedbackParseError {
+  source_line: number;
+  reason: string;
+  raw_excerpt: string;
+}
+
+/** Result of parsing feedback blocks from a document. */
+export interface ParsedFeedbackBlocks {
+  blocks: FeedbackBlock[];
+  errors: FeedbackParseError[];
 }
 
 /**
