@@ -1,8 +1,8 @@
 ---
 schema_version: 1
-run_id: "20260619132548-t8fsjx"
-goal_id: "phase-8d-p5-round2c-task-runner-extraction"
-title: "Phase 8D P5 Round 2C Task Runner Extraction"
+run_id: "20260619154814-dqif9k"
+goal_id: "phase-8d-p8-task-run-result-handoff"
+title: "Phase 8D P8 Task Run Result Handoff Storage"
 allowed_changes:
   - "src/**"
   - "tests/**"
@@ -13,6 +13,9 @@ disallowed_changes:
   - ".agent/audit-report.md"
   - ".agent/final-audit.md"
   - "src/orchestrator/run-orchestrator.ts"
+  - "src/orchestrator/task-graph-loop.ts"
+  - "src/scheduler/wave-executor.ts"
+  - "src/scheduler/worktree-manager.ts"
   - "src/cli/start.ts"
   - "prompts/**"
   - ".agent/task-runs/**"
@@ -44,45 +47,46 @@ verification_commands:
     timeout_seconds: 120
 ---
 
-# Phase 8D P5 Round 2C Task Runner Extraction
+# Phase 8D P8 Task Run Result Handoff Storage
 
 ## Objective
 
-Implement Phase 8D P5 Round 2C only: extract the existing serial per-task Developer/verification attempt loop from `runTaskGraphLoop` into an exported helper named `runTaskGraphTaskSerial` in `src/orchestrator/task-graph-loop.ts`, while preserving all current task graph behavior. Follow `docs/superpowers/plans/2026-06-19-phase-8d-p5-round2c-task-runner-extraction.md` as the implementation guide.
+Implement Phase 8D P8 only: add a small, tested task-run result handoff storage module so future workers can write `.agent/task-runs/{task_id}/result.json` safely for scheduler code to consume later. Follow `docs/superpowers/plans/2026-06-19-phase-8d-p8-task-run-result-handoff.md`.
 
 ## Success Criteria
 
-1. `src/orchestrator/task-graph-loop.ts` exports `RunTaskGraphTaskSerialParams`, `RunTaskGraphTaskSerialResult`, and `runTaskGraphTaskSerial`.
-2. `runTaskGraphTaskSerial` contains the serial per-task Developer/verification attempt loop that was previously inline in `runTaskGraphLoop`.
-3. `runTaskGraphLoop` calls `runTaskGraphTaskSerial` and no longer contains the `for (let attempt = 1; attempt <= maxIterations; attempt++)` loop.
-4. `runTaskGraphLoop` remains responsible for task ordering, `current_task_index`, task status writes, task-result persistence, BLOCKED transition, final integration verification, audit, and finalization.
-5. Existing serial behavior is preserved, including Developer retries, prompt cleanup handling, system protected path verification, Developer handoff validation, feedback block dispatch, task-scoped scope guard, per-task verification, cancellation handling, and artifact registration.
-6. `tests/unit/task-graph-loop-structure.test.ts` exists and verifies that `runTaskGraphTaskSerial` is exported and owns the per-task attempt loop.
-7. `tests/integration/task-graph.test.ts` is modified only to strengthen the existing passing fake-agent task graph assertions.
-8. In the passing fake-agent task graph integration test, task result order remains `task-1`, `task-2`, `task-3`, attempts remain `[1, 1, 1]`, and every result has `verification_passed === true`.
-9. `src/orchestrator/run-orchestrator.ts` is not modified and does not call `runWaveExecutorCore`.
-10. `src/cli/start.ts` is not modified.
-11. No worktrees, parallel Developer/Auditor execution, resume behavior, `.agent/task-runs`, prompt changes, or `current_task_index` semantic changes are introduced.
-12. Targeted regression tests pass: `npm test -- tests/unit/task-graph-loop-structure.test.ts`, `npm test -- tests/integration/task-graph.test.ts`, and `npm test -- tests/unit/wave-executor.test.ts tests/unit/parallel-execution.test.ts`.
-13. Required gates pass: `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, and `git diff --check`.
+1. `src/scheduler/task-run-result.ts` exists and exports `TaskRunResultStatus`, `TaskRunResult`, `MissingTaskRunResult`, `FoundTaskRunResult`, `InvalidTaskRunResult`, `ReadTaskRunResultOutcome`, `TaskRunResultError`, `taskRunResultPath`, `writeTaskRunResult`, and `readTaskRunResult`.
+2. `taskRunResultPath(projectRoot, taskId)` validates `taskId` with safe task ID rules and returns `<projectRoot>/.agent/task-runs/<taskId>/result.json`.
+3. Empty task IDs, path traversal IDs, slash-separated IDs, backslash-separated IDs, and other IDs failing `/^[A-Za-z0-9._-]+$/` are rejected with `TaskRunResultError` code `invalid-task-id` before filesystem access.
+4. `writeTaskRunResult(projectRoot, result)` validates `result.task_id`, writes the result JSON atomically with the existing `atomicWriteJSON` helper, and returns the absolute path written.
+5. `readTaskRunResult(projectRoot, runId, taskId)` validates `taskId` and returns `found:true` with a valid `TaskRunResult` for valid stored results.
+6. `readTaskRunResult` returns `found:false,error:null` for missing result files.
+7. `readTaskRunResult` returns `found:false,error.code === "invalid-result-json"` for malformed JSON, invalid schema versions, invalid statuses, or invalid field types.
+8. `readTaskRunResult` returns `found:false,error.code === "result-run-id-mismatch"` when the stored `run_id` does not match the requested run ID.
+9. `readTaskRunResult` returns `found:false,error.code === "result-task-id-mismatch"` when the stored `task_id` does not match the requested task ID.
+10. `tests/unit/task-run-result.test.ts` covers valid path construction, unsafe task IDs, write/read round trip, missing result, malformed JSON, invalid schema/status, run mismatch, and task mismatch.
+11. `src/index.ts` is modified only if needed for package export consistency.
+12. The following files are not modified: `src/orchestrator/run-orchestrator.ts`, `src/orchestrator/task-graph-loop.ts`, `src/scheduler/wave-executor.ts`, `src/scheduler/worktree-manager.ts`, `src/cli/start.ts`, and `prompts/**`.
+13. No wave execution wiring, worker spawning, worktree creation, branch merging, resume behavior changes, or checked-in `.agent/task-runs` files are introduced.
+14. Required gates pass: `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, and `git diff --check`.
 
 ## Non-Goals
 
-- Do not wire `runWaveExecutorCore` into the orchestrator.
-- Do not modify `src/orchestrator/run-orchestrator.ts`.
-- Do not modify `src/cli/start.ts`.
+- Do not wire P5 wave execution.
+- Do not spawn workers.
 - Do not create worktrees.
-- Do not run Developer or Auditor agents in parallel.
-- Do not add resume behavior.
-- Do not add or use `.agent/task-runs`.
-- Do not change prompts.
-- Do not change `current_task_index` semantics.
-- Do not perform unrelated refactors outside the extraction needed for this round.
+- Do not merge branches.
+- Do not change resume behavior.
+- Do not modify orchestrator or CLI behavior.
+- Do not modify prompts.
+- Do not create checked-in `.agent/task-runs` files.
+- Do not introduce a new JSON schema dependency.
+- Do not perform unrelated refactors.
 
 ## Constraints
 
-- Keep implementation changes tightly scoped to `src/orchestrator/task-graph-loop.ts`.
-- Keep test changes scoped to `tests/unit/task-graph-loop-structure.test.ts` and the existing passing serial assertions in `tests/integration/task-graph.test.ts`.
-- Preserve the Round 2B fail-closed wave guard and confirm `run-orchestrator.ts` has no `runWaveExecutorCore` usage.
-- Preserve existing TypeScript ESM style, Vitest patterns, and local orchestrator helper APIs.
-- Do not perform git commits, tags, pushes, destructive git commands, worktree creation, or broad formatting churn.
+- Keep code changes tightly scoped to `src/scheduler/task-run-result.ts`, `tests/unit/task-run-result.test.ts`, and optional `src/index.ts` export consistency.
+- Use existing project style: TypeScript ESM imports, `fs-extra`, `path` from `node:path`, Vitest tests, and the existing `atomicWriteJSON` helper.
+- Implement validation locally with readable `TaskRunResultError` messages.
+- Preserve the documented data contract exactly so later scheduler phases can consume it without compatibility shims.
+- Do not perform git commits, tags, pushes, destructive git commands, or broad formatting churn.
