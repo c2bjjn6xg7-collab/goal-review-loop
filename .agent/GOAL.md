@@ -1,18 +1,23 @@
 ---
 schema_version: 1
-run_id: "20260617042618-f2zvcf"
-goal_id: "phase-8f-provider-network-proxy-mode"
-title: "Phase 8F: Per-Provider Network/Proxy Mode Support"
+run_id: "20260619121841-cwn99t"
+goal_id: "phase-8d-p5-round2b-parallel-opt-in-guard"
+title: "Phase 8D P5 Round 2B Parallel Opt-In Guard"
 allowed_changes:
-  - "src/**"
-  - "tests/**"
-  - "docs/configuration.md"
+  - "src/scheduler/parallel-execution.ts"
+  - "src/cli/start.ts"
+  - "src/orchestrator/run-orchestrator.ts"
+  - "tests/unit/parallel-execution.test.ts"
+  - "tests/integration/no-commit-bypass.test.ts"
 disallowed_changes:
   - ".git/**"
   - ".agent/state.json"
   - ".agent/GOAL.md"
   - ".agent/audit-report.md"
   - ".agent/final-audit.md"
+  - "src/orchestrator/task-graph-loop.ts"
+  - ".agent/task-runs/**"
+  - "prompts/**"
 verification_commands:
   - id: "unit-tests"
     command: ["npm", "test"]
@@ -41,47 +46,46 @@ verification_commands:
     timeout_seconds: 120
 ---
 
-# Phase 8F: Per-Provider Network/Proxy Mode Support
+# Phase 8D P5 Round 2B Parallel Opt-In Guard
 
 ## Objective
 
-Implement Phase 8F per `docs/phase-8f-provider-network-proxy-mode-support.md` (the source of truth). Add per-provider network/proxy configuration supporting 4 proxy modes — `inherit`, `none`, `auto`, `custom` — so different provider CLIs (Codex, Claude, OpenCode, CodeBuddy, custom) can have independent proxy behavior within a single Review Loop run. Update the YAML/JSON config schema, provider resolution, and command spawning to honor `proxy_mode`. Add unit tests for all 4 modes and an integration test verifying environment isolation between Codex and Claude provider commands. Create `docs/configuration.md` with examples. Do not modify provider business logic, authentication, command execution semantics, or child-process security — only adjust environment variables at child-process launch time.
+Implement Phase 8D P5 Round 2B only: add an explicit parallel opt-in resolver, CLI plumbing for `--parallel` and `--max-parallel-workers`, and a fail-closed orchestrator guard for requested wave mode. Follow `docs/superpowers/plans/2026-06-19-phase-8d-p5-round2b-parallel-opt-in-seam.md` as the implementation guide.
 
 ## Success Criteria
 
-1. `ProviderConfig` and `ProviderProfile` types in `src/types.ts` include an optional `network` block with `proxy_mode` (`inherit` | `none` | `auto` | `custom`), optional `candidate_ports`, and optional `proxy_url`; a `ProxyMode` type and `ProviderNetworkConfig` interface are exported.
-2. The config schema in `src/artifacts/config.ts` validates the `network` block: `proxy_mode` is one of the 4 values; `candidate_ports` is an array of positive integers; `custom` mode requires a non-empty `proxy_url` (rejected with a `ConfigError` otherwise). An absent `network` block is valid and defaults to `inherit`.
-3. Provider resolution in `src/providers/provider-registry.ts` threads the `network` block through `mergeProviderConfig` and `buildCustomProfile`, so a resolved `ProviderProfile` carries its configured `network` settings.
-4. A pure, testable env-resolver (e.g. `src/providers/network-env.ts`) computes the provider child-process environment from the parent env and the profile's `network` config, WITHOUT mutating the parent env, implementing all 4 modes:
-   - `inherit`: no proxy variable modification (current behavior preserved).
-   - `none`: unsets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `all_proxy`; preserves `NO_PROXY`/`no_proxy`.
-   - `auto`: TCP-probes `candidate_ports` (default `[7890, 7897, 7899, 1080, 1087, 8080]`) on `127.0.0.1`; on an open port sets both-case `HTTP_PROXY`/`HTTPS_PROXY` to `http://127.0.0.1:<port>`; on no open port falls back to `none` behavior.
-   - `custom`: sets both-case `HTTP_PROXY`/`HTTPS_PROXY` to the configured `proxy_url`.
-5. Command spawning honors `proxy_mode`: the agent adapter (`src/agents/agent-adapter.ts`) passes the resolved provider env into the process runner so the provider child process receives the modified proxy variables. Both uppercase and lowercase variants are set for cross-platform consistency.
-6. Environment modifications apply ONLY to the provider child process — the parent `process.env` is never mutated (verified by test).
-7. `proxy_mode: inherit` (and absent `network` block) produces behavior identical to pre-Phase-8F (no regressions; verified by a regression test).
-8. Unit tests cover all 4 proxy modes plus default `candidate_ports`, custom `proxy_url`, both-case variable handling, `NO_PROXY` preservation, parent-env immutability, and port-probe open/closed branches (using a local `127.0.0.1` ephemeral server — no external network access).
-9. An integration test verifies environment isolation between two provider commands (e.g. a Codex-like provider with a proxy mode and a Claude-like provider with `none`) launched in the same run: each child sees only its own proxy env, and the parent env is unchanged.
-10. `docs/configuration.md` is created and documents the `network` block, all 4 modes, `candidate_ports`, `proxy_url`, cross-platform notes, and per-provider YAML examples (Codex `auto`, domestic Claude `none`, custom opencode `custom`).
-11. No changes are made to provider business logic, command execution, authentication, Verification Runner, Scope Guard, or child-process security/isolation beyond environment variable handling.
-12. All required verification gates pass: `unit-tests` (`npm test`), `typecheck` (`npm run typecheck`), `lint` (`npm run lint`), `build` (`npm run build`), and `diff-check` (`git diff --check`).
+1. `src/scheduler/parallel-execution.ts` exists and exports a pure resolver API for deciding between `serial` and `wave` mode from `ReviewLoopConfig.parallel` plus CLI overrides.
+2. The resolver validates worker counts as integers from 1 to 16 and throws `ParallelExecutionConfigError` for invalid counts.
+3. Default config with no CLI flags resolves to disabled serial mode and preserves existing orchestrator behavior.
+4. `max_parallel_workers` alone does not enable parallelism when config `parallel.enabled` is false or absent.
+5. `--max-parallel-workers` alone does not enable parallelism when `--parallel` is not passed and config parallel is not enabled.
+6. `--parallel` or `config.parallel.enabled: true` is required for explicit parallel opt-in.
+7. Explicit opt-in with a resolved worker count of 1 resolves to serial mode, not wave mode.
+8. Explicit opt-in with a resolved worker count greater than 1 resolves to wave mode.
+9. `src/cli/start.ts` parses `--parallel` and `--max-parallel-workers <n>`, exposes them on `StartOptions`, validates invalid CLI worker counts before orchestrator work, and passes valid overrides to `runOrchestrator`.
+10. `tests/integration/no-commit-bypass.test.ts` extends existing Commander parsing coverage to assert the new flags parse as `parallel === true` and `maxParallelWorkers === 3`.
+11. `src/orchestrator/run-orchestrator.ts` accepts optional CLI overrides, resolves the parallel decision after `loadConfigWithDefaults(...)`, converts resolver config errors into clear `CONFIG_ERROR` blocked results, and blocks `decision.mode === 'wave'` with a clear message stating that worktree-backed wave execution is not wired until Phase 8D P5 Round 2C.
+12. `runOrchestrator` does not call `runWaveExecutorCore` and does not silently fall back to serial when real wave mode is requested.
+13. No changes are made to `src/orchestrator/task-graph-loop.ts`, prompts, worktree creation, resume behavior, `.agent/task-runs`, or parallel Developer/Auditor execution.
+14. Required gates pass: `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, and `git diff --check`.
 
 ## Non-Goals
 
-- Do not implement a built-in proxy client, VPN, or network tunneling.
-- Do not modify proxy software or system network configuration.
-- Do not change provider/model API calling logic or authentication handling.
-- Do not push to remote or perform destructive git operations.
-- Do not modify Verification Runner, Scope Guard, or other non-provider core behavior.
-- Do not weaken existing child-process security or isolation.
-- Do not require external network access for implementation or tests (all proxy tests use `127.0.0.1`).
+- Do not implement real worktree-backed wave execution.
+- Do not call `runWaveExecutorCore` from `run-orchestrator.ts`.
+- Do not create worktrees.
+- Do not run Developer or Auditor agents in parallel.
+- Do not add resume behavior.
+- Do not create or use `.agent/task-runs`.
+- Do not change prompts.
+- Do not modify `src/orchestrator/task-graph-loop.ts`.
+- Do not modify files outside the allowed implementation and test files listed in front matter.
 
 ## Constraints
 
-- Source of truth: `docs/phase-8f-provider-network-proxy-mode-support.md`.
-- TypeScript ESM project; build via `tsc`, tests via `vitest run`, lint via `eslint src/ --max-warnings=0`.
-- Keep changes minimal and consistent with existing code style.
-- Only edit files under `src/**`, `tests/**`, and `docs/configuration.md`.
-- Do not create or edit `.agent/verification/**`.
-- Do not edit `.agent/state.json`, `.agent/GOAL.md`, `.agent/audit-report.md`, `.agent/final-audit.md`, or anything under `.git/**`.
-- Preserve backwards compatibility: providers without a `network` block behave exactly as before.
+- Keep changes tightly scoped to the five allowed files.
+- Preserve default serial behavior when no explicit parallel opt-in is provided.
+- Treat worker-count-only settings as sizing data, not an opt-in signal.
+- Fail closed for requested `wave` mode until Phase 8D P5 Round 2C wires actual worktree-backed execution.
+- Use existing project style, TypeScript ESM imports, Commander conventions, and Vitest test patterns.
+- Do not perform git commits, tags, pushes, destructive git operations, or broad refactors.

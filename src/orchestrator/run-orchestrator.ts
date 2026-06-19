@@ -22,6 +22,10 @@ import { runTaskGraphLoop } from './task-graph-loop.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { ArtifactStore, ARTIFACT_FILES } from '../artifacts/artifact-store.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
+import {
+  resolveParallelExecution,
+  ParallelExecutionConfigError,
+} from '../scheduler/parallel-execution.js';
 import type { ReviewLoopConfig, ReworkFinding, CancelRequest } from '../types.js';
 import { preflight, createTaskBranch, runGit } from '../git/git-manager.js';
 import { collectDiff, writeDiffArtifacts } from '../git/diff-collector.js';
@@ -119,6 +123,19 @@ export async function runOrchestrator(params: {
   tag?: boolean;
   signal?: AbortSignal;
   resume_from?: ResumeContext;
+  /**
+   * Phase 8D P5 Round 2B: explicit `--parallel` opt-in. On its own, this
+   * requests parallel mode; combined with a worker count > 1 (from config or
+   * `max_parallel_workers`) it resolves to `wave` mode, which the orchestrator
+   * blocks here until Round 2C wires real worktree-backed execution.
+   */
+  parallel?: boolean;
+  /**
+   * Phase 8D P5 Round 2B: integer override in [1, 16] for the resolver. Alone
+   * does not enable parallelism — `parallel === true` or `config.parallel.enabled`
+   * is still required.
+   */
+  max_parallel_workers?: number;
 }): Promise<OrchestratorResult> {
   const projectRoot = resolve(params.project_root);
   const agentDir = join(projectRoot, '.agent');
@@ -170,6 +187,38 @@ export async function runOrchestrator(params: {
       config = await loadConfigWithDefaults(projectRoot, params.config_path);
     } catch (err) {
       return makeBlockedResult('', projectRoot, `Configuration error: ${err instanceof Error ? err.message : String(err)}`, 'CONFIG_ERROR');
+    }
+
+    // Phase 8D P5 Round 2B: resolve the parallel-execution decision from config
+    // + CLI overrides. Invalid worker counts surface here as a clear CONFIG_ERROR
+    // before any agent or git work begins. Wave-mode requests fail closed until
+    // Round 2C wires worktree-backed execution; serial decisions (the default
+    // and one-worker explicit opt-in) flow through to the existing path
+    // unchanged.
+    let parallelDecision;
+    try {
+      parallelDecision = resolveParallelExecution(config, {
+        parallel: params.parallel,
+        maxParallelWorkers: params.max_parallel_workers,
+      });
+    } catch (err) {
+      if (err instanceof ParallelExecutionConfigError) {
+        return makeBlockedResult(
+          '',
+          projectRoot,
+          `Parallel execution configuration error: ${err.message}`,
+          'CONFIG_ERROR',
+        );
+      }
+      throw err;
+    }
+    if (parallelDecision.mode === 'wave') {
+      return makeBlockedResult(
+        '',
+        projectRoot,
+        `Parallel wave mode requested (${parallelDecision.maxParallelWorkers} workers, source=${parallelDecision.source}) but worktree-backed wave execution is not wired until Phase 8D P5 Round 2C. Re-run without --parallel or set config.parallel.enabled=false to use the existing serial path.`,
+        'CONFIG_ERROR',
+      );
     }
 
     // Phase 6: Emit permission mode warnings

@@ -3,19 +3,44 @@
  * Phase 3 §11: review-loop start
  *
  * Parameters:
- * --request <text>          User request text (mutually exclusive with --request-file)
- * --request-file <path>     Path to user request file
- * --task-slug <slug>        Optional task short name
- * --max-iterations <n>      Max rework iterations (default from config)
- * --config <path>           Config file path
- * --no-commit               Skip commit on pass (default: commit on pass)
- * --tag                     Create local tag on pass (default: no tag)
+ * --request <text>             User request text (mutually exclusive with --request-file)
+ * --request-file <path>        Path to user request file
+ * --task-slug <slug>           Optional task short name
+ * --max-iterations <n>         Max rework iterations (default from config)
+ * --config <path>              Config file path
+ * --no-commit                  Skip commit on pass (default: commit on pass)
+ * --tag                        Create local tag on pass (default: no tag)
+ * --parallel                   Phase 8D P5 Round 2B: explicit opt-in to parallel
+ *                              (wave) execution. Without this flag (or
+ *                              `parallel.enabled: true` in config) the
+ *                              orchestrator stays on the existing serial path.
+ * --max-parallel-workers <n>   Override `parallel.max_parallel_workers` from
+ *                              config. Integer in [1, 16]. Does NOT enable
+ *                              parallelism on its own — `--parallel` or config
+ *                              opt-in is still required.
  */
 
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import { resolve } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { runOrchestrator, type OrchestratorResult } from '../orchestrator/run-orchestrator.js';
+
+/**
+ * Strict integer parser for `--max-parallel-workers`.
+ *
+ * `parseInt` would silently truncate "1.5" → 1, hide "abc" as NaN, and accept
+ * leading-sign / trailing-garbage values. The resolver enforces the [1, 16]
+ * range; here we only guarantee the parsed value is a non-negative integer
+ * literal so range validation in `executeStart` operates on a clean number.
+ */
+function parseWorkerCount(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new InvalidArgumentError(
+      `--max-parallel-workers must be a positive integer, got "${value}"`,
+    );
+  }
+  return Number(value);
+}
 
 export function createStartCommand(): Command {
   const cmd = new Command('start');
@@ -29,6 +54,12 @@ export function createStartCommand(): Command {
     .option('--config <path>', 'Config file path')
     .option('--no-commit', 'Do not commit on pass')
     .option('--tag', 'Create local tag on pass')
+    .option('--parallel', 'Opt in to wave (parallel) execution (Phase 8D P5 Round 2B seam)')
+    .option(
+      '--max-parallel-workers <n>',
+      'Override parallel.max_parallel_workers (integer in [1, 16]); requires --parallel or config opt-in',
+      parseWorkerCount,
+    )
     .option('--watch', 'Display progress updates during execution')
     .option('--watch-interval <ms>', 'Watch polling interval in ms', parseInt, 2000)
     .action(async (options) => {
@@ -79,6 +110,17 @@ export async function executeStart(options: StartOptions): Promise<OrchestratorR
     throw new Error('max-iterations must be a positive integer');
   }
 
+  // Phase 8D P5 Round 2B: validate CLI worker count up-front so invalid values
+  // (0, 17, NaN, fractional, non-integer) never reach `runOrchestrator`. The
+  // pure resolver also enforces [1, 16] for config worker counts, but failing
+  // here keeps the CLI error message close to the user's invocation.
+  if (options.maxParallelWorkers !== undefined) {
+    const n = options.maxParallelWorkers;
+    if (!Number.isInteger(n) || n < 1 || n > 16) {
+      throw new Error(`--max-parallel-workers must be an integer from 1 to 16, got ${n}`);
+    }
+  }
+
   // Run orchestrator
   const projectRoot = process.cwd();
 
@@ -114,6 +156,11 @@ export async function executeStart(options: StartOptions): Promise<OrchestratorR
       // back to the config default, so the flag would never take effect.
       no_commit: options.commit === false,
       tag: options.tag ?? false,
+      // Phase 8D P5 Round 2B: forward parallel CLI overrides verbatim. The
+      // orchestrator (Round 2C task) resolves them against config and fails
+      // closed with CONFIG_ERROR when wave mode is requested.
+      parallel: options.parallel === true ? true : undefined,
+      max_parallel_workers: options.maxParallelWorkers,
     });
 
     if (watchInterval) clearInterval(watchInterval);
@@ -162,4 +209,8 @@ export interface StartOptions {
   tag?: boolean;
   watch?: boolean;
   watchInterval?: number;
+  /** Phase 8D P5 Round 2B: explicit `--parallel` opt-in (wave-mode request). */
+  parallel?: boolean;
+  /** Phase 8D P5 Round 2B: integer override in [1, 16]; alone does not enable parallelism. */
+  maxParallelWorkers?: number;
 }

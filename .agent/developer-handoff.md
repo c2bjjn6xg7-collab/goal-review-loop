@@ -1,63 +1,101 @@
 ---
 schema_version: 1
-run_id: "20260617042618-f2zvcf"
-iteration: 1
+run_id: "20260619121841-cwn99t"
+iteration: 4
 author_role: "developer"
 status: "COMPLETED"
 ---
 
-# Phase 8F: Per-Provider Network/Proxy Mode Support
+# Developer Handoff — Task 4 of 4: Verify scope and gates
 
-## Summary of Changes
+## Summary
 
-Implemented Phase 8F per-provider network/proxy configuration supporting 4 proxy modes (`inherit`, `none`, `auto`, `custom`) so different provider CLIs can have independent proxy behavior within a single Review Loop run.
+Ran the final scope review and all required engineering gates against the
+Phase 8D P5 Round 2B working tree. All gates pass on the existing
+implementation; no code fixes were required.
 
-## Files Changed
+## Scope review
 
-### New Files
+Tracked changes (relative to `main`) are confined to the allowed paths:
 
-- **`src/providers/network-env.ts`** — Core env-resolver module with `resolveProviderEnv()`, `probeProxyPort()`, `DEFAULT_CANDIDATE_PORTS`, `PROXY_ENV_KEYS`, `NO_PROXY_KEYS`, and `ResolvedProviderEnv` interface. Implements all 4 proxy modes without mutating any external state.
+- `src/cli/start.ts` — adds `--parallel` / `--max-parallel-workers <n>` CLI
+  parsing, validates worker counts, and forwards overrides to
+  `runOrchestrator`.
+- `src/orchestrator/run-orchestrator.ts` — accepts the new optional CLI
+  overrides, resolves the parallel decision after `loadConfigWithDefaults(...)`,
+  converts `ParallelExecutionConfigError` into a clear `CONFIG_ERROR` blocked
+  result, and blocks `decision.mode === 'wave'` with a message stating
+  worktree-backed wave execution is not wired until Phase 8D P5 Round 2C.
+- `tests/integration/no-commit-bypass.test.ts` — extends Commander parsing
+  coverage for the new flags (`parallel === true`, `maxParallelWorkers === 3`).
 
-- **`tests/unit/network-env.test.ts`** — Unit tests covering all 4 proxy modes, default candidate ports, custom proxy_url, both-case variable handling, NO_PROXY preservation, port-probe open/closed branches (using ephemeral `net.Server`), and regression test for inherit mode.
+Untracked additions are also in scope:
 
-- **`tests/integration/provider-network.test.ts`** — Integration test verifying env isolation between Codex-like (none mode) and Claude-like (custom mode) provider commands, parent env immutability, and inherit mode regression.
+- `src/scheduler/parallel-execution.ts` — pure resolver API
+  (`resolveParallelExecution`) that decides between `serial` and `wave` mode
+  from `ReviewLoopConfig.parallel` plus CLI overrides, validating worker counts
+  as integers in `[1, 16]` and throwing `ParallelExecutionConfigError` for
+  invalid counts.
+- `tests/unit/parallel-execution.test.ts` — unit tests covering the resolver
+  matrix from the GOAL (defaults, CLI-only flags, opt-in with worker count 1
+  vs >1, validation errors).
 
-- **`docs/configuration.md`** — Documentation for the `network` block, all 4 modes, `candidate_ports`, `proxy_url`, cross-platform notes, and per-provider YAML examples.
+No changes were made to disallowed paths (`src/orchestrator/task-graph-loop.ts`,
+`prompts/**`, `.agent/state.json`, `.agent/GOAL.md`, `.agent/audit-report.md`,
+`.agent/final-audit.md`, `.agent/task-runs/**`, or `.git/**`). Pre-existing
+orchestrator-owned modifications on the branch (`.agent/GOAL.md`,
+`.agent/plan.md`, `.agent/task-graph.json`, `.agent/task-results.json`,
+`.agent/developer-handoff.md`) come from earlier tasks/orchestrator activity in
+this run and were not touched by this task.
 
-### Modified Files
+## GOAL criteria verification
 
-- **`src/types.ts`** — Added `ProxyMode` type, `ProviderNetworkConfig` interface, `network?: ProviderNetworkConfig` to `ProviderConfig` and `ProviderProfile`, `network?: ProviderNetworkConfig` to `AgentRunInput`, `delete_env?: string[]` to `ProcessRunnerInput`.
+Cross-checked against the 14 GOAL success criteria:
 
-- **`src/artifacts/config.ts`** — Added `networkConfig` subschema to `CONFIG_SCHEMA` with `proxy_mode` enum, `candidate_ports` array, `proxy_url` string. Added `validateNetworkConfig()` function that rejects `custom` mode without `proxy_url`. Imported `ProviderNetworkConfig` and `ProviderConfig` types.
+1. ✅ `src/scheduler/parallel-execution.ts` exists and exports the resolver API.
+2. ✅ Resolver validates worker counts as integers in `[1, 16]` and throws
+   `ParallelExecutionConfigError` for invalid values.
+3. ✅ Default config + no CLI flags → `enabled: false`, `mode: 'serial'`.
+4. ✅ `max_parallel_workers` alone (config) does not enable parallelism when
+   `parallel.enabled` is false/absent.
+5. ✅ `--max-parallel-workers` alone (CLI) does not enable parallelism without
+   `--parallel` or config opt-in.
+6. ✅ `--parallel` or `config.parallel.enabled: true` is required for explicit
+   opt-in.
+7. ✅ Explicit opt-in with worker count of 1 → `mode: 'serial'`.
+8. ✅ Explicit opt-in with worker count > 1 → `mode: 'wave'`.
+9. ✅ `src/cli/start.ts` parses the new flags, exposes them on
+   `StartOptions`, validates invalid worker counts before orchestrator work, and
+   passes valid overrides to `runOrchestrator`.
+10. ✅ `tests/integration/no-commit-bypass.test.ts` covers the new Commander
+    flags (`parallel === true`, `maxParallelWorkers === 3`).
+11. ✅ `runOrchestrator` accepts CLI overrides, resolves the parallel decision
+    after `loadConfigWithDefaults(...)`, converts resolver errors into
+    `CONFIG_ERROR` blocked results, and blocks `decision.mode === 'wave'` with
+    a Round 2C message.
+12. ✅ `runOrchestrator` does not call `runWaveExecutorCore` and does not
+    silently fall back to serial when wave mode is requested.
+13. ✅ No changes to `src/orchestrator/task-graph-loop.ts`, prompts, worktree
+    creation, resume behavior, `.agent/task-runs`, or parallel
+    Developer/Auditor execution.
+14. ✅ Required gates pass (see below).
 
-- **`src/providers/provider-registry.ts`** — Threaded `network` field through `mergeProviderConfig()` and `buildCustomProfile()`.
+## Verification results
 
-- **`src/runtime/process-runner.ts`** — Added `delete_env` handling in both `runProcess()` and `runProcessRaw()`: after copying `process.env` and applying `input.env` overlay, deletes keys listed in `input.delete_env`.
+All required gates pass:
 
-- **`src/agents/agent-adapter.ts`** — Imported `resolveProviderEnv`. When `input.network` is set, resolves provider env and passes `env`/`delete_env` to `runProcess`.
+| Gate | Command | Result |
+| --- | --- | --- |
+| `typecheck` | `npm run typecheck` | ✅ pass (no output, exit 0) |
+| `lint` | `npm run lint` | ✅ pass (no warnings) |
+| `build` | `npm run build` | ✅ pass |
+| `unit-tests` | `npm test` | ✅ pass — 63 files, 962 tests |
+| `diff-check` | `git diff --check` | ✅ pass (exit 0, no whitespace issues) |
 
-- **`tests/unit/provider-registry.test.ts`** — Added 3 tests for network block threading through `mergeProviderConfig`, `buildCustomProfile`, and undefined network preservation.
+No narrowly scoped fixes were needed; the prior tasks' implementation already
+satisfies every GOAL criterion and every gate.
 
-- **`tests/unit/config.test.ts`** — Added 8 tests for network config validation: valid modes (inherit, none, auto, custom), invalid proxy_mode, custom without proxy_url, backward compat (no network block), and `validateNetworkConfig` unit tests.
+## Status
 
-- **`tests/unit/process-runner.test.ts`** — Added 3 tests for `delete_env`: deleting specified keys, empty delete_env array, and non-existent keys.
-
-## Verification Performed
-
-All 5 required verification gates passed:
-
-1. **`npm test`** — 55 test files, 917 tests passed (including all new tests)
-2. **`npm run typecheck`** — TypeScript compilation with no errors
-3. **`npm run lint`** — ESLint with 0 warnings/errors
-4. **`npm run build`** — `tsc` build succeeded
-5. **`git diff --check`** — No whitespace errors
-
-## Risks
-
-- **Auto-mode port probing**: TCP probes against `127.0.0.1` could be racy in CI environments with slow networking. Mitigated by short timeout (200ms) and safe fallback to `none` mode when no port is open.
-- **Env deletion semantics**: The `delete_env` mechanism deletes keys from the child env after copying `process.env`. If a future change modifies the env construction order, the deletion must still happen after the overlay.
-- **Backward compatibility**: Providers without a `network` block default to `inherit` (no changes). Verified by regression test.
-
-## Unresolved Issues
-
-None. All success criteria from the GOAL are met.
+COMPLETED — Phase 8D P5 Round 2B parallel opt-in seam is fully implemented,
+scoped, and verified. Ready for the auditor.

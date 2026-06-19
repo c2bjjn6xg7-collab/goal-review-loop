@@ -1,68 +1,49 @@
 ---
 schema_version: 1
-run_id: "20260617042618-f2zvcf"
-iteration: 1
+run_id: "20260619121841-cwn99t"
+iteration: 5
 author_role: "auditor"
 decision: "PASS"
-audited_goal_digest: "sha256:e133225a7017b463acced7f4217f369fbe5f87fe1b4cc0ce2b3c1538d3e989b7"
-audited_diff_digest: "sha256:0d9a3a446060c5701c47a64c28fd7c4df8ff9c256cd0f6c7a044e3355bad6723"
+audited_goal_digest: "sha256:204ee69877b2e26bbe6cb434aa7e6811e4036e362541ab9a6e00046f9096098a"
+audited_diff_digest: "sha256:e0d8a66bd0f1e1743f678058e78368d2c796e4679272b67531da3110e84ff74b"
 ---
 
-# Audit Report — Phase 8F: Per-Provider Network/Proxy Mode Support
+## Decision
 
-## Decision: PASS
+PASS. The implementation meets the GOAL success criteria for Phase 8D P5 Round 2B. The resolver is a pure API, validates worker counts, preserves disabled serial defaults, treats worker-count-only settings as sizing data, and resolves explicit multi-worker opt-in to `wave`. The CLI parses and validates the new flags before calling `runOrchestrator`, and the orchestrator resolves the parallel decision immediately after configuration load, returning clear `CONFIG_ERROR` blocked results for invalid parallel config or requested wave mode. Required verification gates passed.
 
-The Developer's implementation meets all 12 Success Criteria defined in the GOAL. All 5 required verification gates passed (unit-tests, typecheck, lint, build, diff-check). The implementation is minimal, consistent with existing code style, and stays within the allowed scope (`src/**`, `tests/**`, `docs/configuration.md`). No disallowed files were modified. The only findings are low-severity observations that do not affect correctness or the conclusion.
+Digest verification:
+
+- GOAL digest: `sha256:204ee69877b2e26bbe6cb434aa7e6811e4036e362541ab9a6e00046f9096098a`
+- Diff digest: `sha256:e0d8a66bd0f1e1743f678058e78368d2c796e4679272b67531da3110e84ff74b`
 
 ## Success Criteria Review
 
 | # | Criterion | Result | Evidence |
-|---|-----------|--------|----------|
-| 1 | `ProviderConfig`/`ProviderProfile` include optional `network` block with `proxy_mode`, `candidate_ports`, `proxy_url`; `ProxyMode` type and `ProviderNetworkConfig` interface exported | PASS | `src/types.ts:437` (`ProxyMode`), `src/types.ts:442` (`ProviderNetworkConfig`), `src/types.ts:486` (`ProviderConfig.network`), `src/types.ts:514` (`ProviderProfile.network`) |
-| 2 | Config schema validates `network` block; `proxy_mode` enum of 4 values; `candidate_ports` array of positive numbers; `custom` requires non-empty `proxy_url` (rejected with `ConfigError`); absent block valid (defaults to inherit) | PASS | `src/artifacts/config.ts:158-170` (schema), `src/artifacts/config.ts:560-568` (`validateNetworkConfig` throws `ConfigError`), `src/artifacts/config.ts:336` (called from `loadConfig`); tests at `tests/unit/config.test.ts:268-585` |
-| 3 | Provider resolution threads `network` through `mergeProviderConfig` and `buildCustomProfile` | PASS | `src/providers/provider-registry.ts:98` (`mergeProviderConfig`), `src/providers/provider-registry.ts:127` (`buildCustomProfile`); tests at `tests/unit/provider-registry.test.ts:150-208` |
-| 4 | Pure env-resolver `src/providers/network-env.ts` computes child env without mutating parent env; implements all 4 modes (inherit/none/auto/custom) | PASS | `src/providers/network-env.ts:69-130` (`resolveProviderEnv`); `none` deletes all 6 proxy keys (`PROXY_ENV_KEYS`), preserves `NO_PROXY`; `auto` probes `candidate_ports` on `127.0.0.1` via TCP, falls back to `none`; `custom` sets both-case `HTTP_PROXY`/`HTTPS_PROXY` |
-| 5 | Command spawning honors `proxy_mode`; agent adapter passes resolved env into process runner; both uppercase and lowercase variants set | PASS | `src/agents/agent-adapter.ts:227-254` resolves env via `resolveProviderEnv` and passes `env`/`delete_env` to `runProcess`; `src/runtime/process-runner.ts:320-337` and `:587-604` apply overlay then delete keys in both `runProcess` and `runProcessRaw` |
-| 6 | Env modifications apply ONLY to child process; parent `process.env` never mutated (verified by test) | PASS | `resolveProviderEnv` returns overlay/delete lists without touching `process.env`; process-runner copies `process.env` into a local `env` object (`process-runner.ts:320,587`) before applying changes; verified by `tests/integration/provider-network.test.ts:94-106` and `tests/unit/network-env.test.ts:16-26` |
-| 7 | `inherit` and absent `network` block produce pre-8F behavior (no regressions; verified by regression test) | PASS | `src/providers/network-env.ts:78-84` returns empty overlay + empty delete list for `inherit`/absent; regression tests at `tests/unit/network-env.test.ts:119-125` and `tests/integration/provider-network.test.ts:108-125` |
-| 8 | Unit tests cover all 4 modes, default ports, custom proxy_url, both-case handling, NO_PROXY preservation, parent-env immutability, port-probe open/closed branches (local `127.0.0.1` server, no external network) | PASS | `tests/unit/network-env.test.ts` — 18 tests covering all 4 modes, `probeProxyPort` open/closed/timeout, `DEFAULT_CANDIDATE_PORTS`, `PROXY_ENV_KEYS`, `NO_PROXY` preservation, parent-env immutability; auto-mode tests use ephemeral `net.Server` on `127.0.0.1` |
-| 9 | Integration test verifies env isolation between two provider commands (Codex-like + Claude-like) launched in same run; each child sees only its own proxy env; parent env unchanged | PASS | `tests/integration/provider-network.test.ts:43-91` — launches two `runProcess` children with `none` and `custom` modes, asserts isolated proxy envs; `:94-106` asserts parent `process.env` unchanged |
-| 10 | `docs/configuration.md` created; documents `network` block, all 4 modes, `candidate_ports`, `proxy_url`, cross-platform notes, per-provider YAML examples (Codex `auto`, Claude `none`, OpenCode `custom`) | PASS | `docs/configuration.md` (5687 bytes) — contains `network` block table, all 4 mode sections with YAML examples, cross-platform notes, environment isolation section, per-provider examples matching the 3 required scenarios |
-| 11 | No changes to provider business logic, command execution, auth, Verification Runner, Scope Guard, or child-process security beyond env var handling | PASS | Scope report (`scope-report.json`) confirms only `src/types.ts`, `src/artifacts/config.ts`, `src/providers/network-env.ts`, `src/providers/provider-registry.ts`, `src/runtime/process-runner.ts`, `src/agents/agent-adapter.ts`, test files, and `docs/configuration.md` modified; process-runner changes are additive (`delete_env` application after env copy); no auth/execution/security logic altered |
-| 12 | All required verification gates pass: `npm test`, `npm run typecheck`, `npm run lint`, `npm run build`, `git diff --check` | PASS | `verification/manifest.json` — all 5 commands `status: "success"`, `exit_code: 0`; unit-tests: 55 files / 917 tests passed; typecheck/lint/build clean; diff-check clean |
+| --- | --- | --- | --- |
+| 1 | `src/scheduler/parallel-execution.ts` exists and exports a pure resolver API. | PASS | Resolver module exports mode/source types, CLI override and decision interfaces, error class, and `resolveParallelExecution`; it imports only a type from `../types.js`. `src/scheduler/parallel-execution.ts:1`, `src/scheduler/parallel-execution.ts:17`, `src/scheduler/parallel-execution.ts:25`, `src/scheduler/parallel-execution.ts:36`, `src/scheduler/parallel-execution.ts:49`, `src/scheduler/parallel-execution.ts:77` |
+| 2 | Worker counts are integers from 1 to 16 and invalid counts throw `ParallelExecutionConfigError`. | PASS | Config and CLI worker counts are validated before decision return, and invalid values throw the required error. `src/scheduler/parallel-execution.ts:94`, `src/scheduler/parallel-execution.ts:97`, `src/scheduler/parallel-execution.ts:132`; tests cover invalid values. `tests/unit/parallel-execution.test.ts:96`, `tests/unit/parallel-execution.test.ts:106` |
+| 3 | Default config with no CLI flags resolves to disabled serial mode and preserves existing behavior. | PASS | Defaults are disabled with one worker, absent config is filled to that default, resolver returns disabled serial when not requested, and orchestrator default path continues past the parallel guard. `src/artifacts/config.ts:245`, `src/artifacts/config.ts:321`, `src/scheduler/parallel-execution.ts:103`, `tests/unit/parallel-execution.test.ts:18`, `tests/unit/parallel-execution.test.ts:178` |
+| 4 | Config `max_parallel_workers` alone does not enable parallelism when config is false or absent. | PASS | Resolver computes `requested` only from CLI/config enabled flags and returns disabled serial when not requested. `src/scheduler/parallel-execution.ts:82`, `src/scheduler/parallel-execution.ts:103`; test covers disabled config with workers 4. `tests/unit/parallel-execution.test.ts:29` |
+| 5 | CLI `--max-parallel-workers` alone does not enable parallelism without `--parallel` or config opt-in. | PASS | CLI worker override is validation/sizing data; resolver still requires `overrides.parallel === true` or config enabled. `src/scheduler/parallel-execution.ts:82`, `src/scheduler/parallel-execution.ts:103`; resolver and orchestrator tests cover CLI worker-only serial behavior. `tests/unit/parallel-execution.test.ts:71`, `tests/unit/parallel-execution.test.ts:195` |
+| 6 | `--parallel` or `config.parallel.enabled: true` is required for explicit opt-in. | PASS | `requested` is derived only from `overrides.parallel === true` or `config.parallel.enabled === true`. `src/scheduler/parallel-execution.ts:83`, `src/scheduler/parallel-execution.ts:84`, `src/scheduler/parallel-execution.ts:85`; CLI forwards `parallel` only when true. `src/cli/start.ts:162` |
+| 7 | Explicit opt-in with worker count 1 resolves to serial mode. | PASS | Opt-in with `requestedWorkers <= 1` returns enabled serial with one worker. `src/scheduler/parallel-execution.ts:113`; test covers config opt-in with one worker. `tests/unit/parallel-execution.test.ts:39` |
+| 8 | Explicit opt-in with worker count greater than 1 resolves to wave mode. | PASS | Opt-in with workers above one returns `mode: 'wave'`. `src/scheduler/parallel-execution.ts:123`; tests cover config wave, CLI wave, and override wave. `tests/unit/parallel-execution.test.ts:49`, `tests/unit/parallel-execution.test.ts:59`, `tests/unit/parallel-execution.test.ts:84` |
+| 9 | `src/cli/start.ts` parses/validates/plumbs `--parallel` and `--max-parallel-workers`. | PASS | Start command defines both flags, uses strict parser, validates range before orchestrator call, exposes fields on `StartOptions`, and forwards overrides to `runOrchestrator`. `src/cli/start.ts:36`, `src/cli/start.ts:57`, `src/cli/start.ts:117`, `src/cli/start.ts:148`, `src/cli/start.ts:162`, `src/cli/start.ts:201` |
+| 10 | Integration Commander parsing coverage asserts `parallel === true` and `maxParallelWorkers === 3`. | PASS | Existing Commander parsing test now parses `--parallel --max-parallel-workers 3` and asserts both option values. `tests/integration/no-commit-bypass.test.ts:142`, `tests/integration/no-commit-bypass.test.ts:148`, `tests/integration/no-commit-bypass.test.ts:149` |
+| 11 | `runOrchestrator` accepts overrides, resolves after config load, converts resolver errors to `CONFIG_ERROR`, and blocks wave with Round 2C message. | PASS | Params include `parallel` and `max_parallel_workers`; resolver runs after `loadConfigWithDefaults`; `ParallelExecutionConfigError` returns `CONFIG_ERROR`; wave returns blocked `CONFIG_ERROR` with Round 2C wording. `src/orchestrator/run-orchestrator.ts:116`, `src/orchestrator/run-orchestrator.ts:184`, `src/orchestrator/run-orchestrator.ts:198`, `src/orchestrator/run-orchestrator.ts:204`, `src/orchestrator/run-orchestrator.ts:215`; tests cover wave and invalid CLI workers. `tests/unit/parallel-execution.test.ts:146`, `tests/unit/parallel-execution.test.ts:164` |
+| 12 | `runOrchestrator` does not call `runWaveExecutorCore` and does not silently fall back to serial for requested wave mode. | PASS | The only wave handling in `run-orchestrator.ts` is the fail-closed guard returning `CONFIG_ERROR`; `rg` found no `runWaveExecutorCore` reference in the file. `src/orchestrator/run-orchestrator.ts:215`; test asserts wave requests block before preflight. `tests/unit/parallel-execution.test.ts:146` |
+| 13 | No changes to disallowed execution surfaces. | PASS | Scope report passed with no denied paths; allowed implementation/test files plus orchestrator-owned metadata are identified separately. `.agent/evidence/iteration-05/scope-report.json:3`, `.agent/evidence/iteration-05/scope-report.json:12`, `.agent/evidence/iteration-05/scope-report.json:19`; changed files are confined to expected source/test files plus metadata. `.agent/evidence/iteration-05/changed-files.json:41`, `.agent/evidence/iteration-05/changed-files.json:48`, `.agent/evidence/iteration-05/changed-files.json:55`, `.agent/evidence/iteration-05/changed-files.json:62`, `.agent/evidence/iteration-05/changed-files.json:69` |
+| 14 | Required gates pass. | PASS | Verification manifest reports `passed: true`; all required commands have `status: "success"` and exit code 0. `.agent/verification/manifest.json:5`, `.agent/verification/manifest.json:17`, `.agent/verification/manifest.json:33`, `.agent/verification/manifest.json:49`, `.agent/verification/manifest.json:65`, `.agent/verification/manifest.json:81` |
 
 ## Findings
 
-### Low Severity
-
-**L-1: `candidate_ports` schema accepts non-integer numbers**
-- **Evidence**: `src/artifacts/config.ts:166` — `candidate_ports` items schema is `{ type: 'number', minimum: 1 }` rather than `{ type: 'integer', minimum: 1 }`.
-- **Impact**: The GOAL (criterion 2) specifies "array of positive integers." A config value like `[1.5]` would pass schema validation. In practice, a fractional port number would fail at TCP-probe time (the `net.createConnection` call would reject it), so there is no functional security or correctness risk. The runtime behavior degrades gracefully.
-- **Fix requirement (optional, not blocking)**: Change `type: 'number'` to `type: 'integer'` in the `candidate_ports` items schema at `src/artifacts/config.ts:166` to match the spec exactly. Add a unit test asserting `[1.5]` is rejected.
-
-**L-2: `auto` mode does not set `ALL_PROXY` (by design)**
-- **Evidence**: `src/providers/network-env.ts:103-111` — `auto` mode sets only `HTTP_PROXY`/`HTTPS_PROXY` (both cases), not `ALL_PROXY`.
-- **Impact**: None. The GOAL criterion 4 explicitly specifies only `HTTP_PROXY`/`HTTPS_PROXY` for `auto` mode. `ALL_PROXY` is only unset in `none` mode (and `auto`-fallback-to-`none`), which is correct. This is documented behavior, not a defect.
+None.
 
 ## Scope Review
 
-The scope report (`scope-report.json`) confirms:
-- **Allowed files (13)**: All modified/new files are within `src/**`, `tests/**`, `docs/configuration.md`, and `.agent/developer-handoff.md` (standard developer-role artifact).
-- **Excluded orchestrator-owned (2)**: `.agent/GOAL.md` and `.agent/plan.md` — correctly excluded from scope evaluation.
-- **Denied (0)**: No disallowed files were modified.
-- **Warnings (0)**: No scope warnings.
-
-The `.agent/GOAL.md` and `.agent/plan.md` changes visible in `tracked.diff` are orchestrator-owned metadata updates (run_id/goal_id/title changes) and were correctly excluded from the developer's scope. The developer did not touch any disallowed paths (`.git/**`, `.agent/state.json`, `.agent/audit-report.md`, `.agent/final-audit.md`, `.agent/verification/**`).
-
-## Verification Evidence
-
-All 5 required verification gates passed per `verification/manifest.json`:
-- `unit-tests` (`npm test`): 917 tests passed across 55 files (71.96s)
-- `typecheck` (`npm run typecheck`): clean (0.60s)
-- `lint` (`npm run lint`): clean, 0 warnings (0.65s)
-- `build` (`npm run build`): `tsc` succeeded (0.71s)
-- `diff-check` (`git diff --check`): no whitespace errors (0.01s)
+Scope passes. The scope report marks the run as passed with no denied files or warnings. The implementation changes are limited to `src/cli/start.ts`, `src/orchestrator/run-orchestrator.ts`, `src/scheduler/parallel-execution.ts`, `tests/integration/no-commit-bypass.test.ts`, and `tests/unit/parallel-execution.test.ts`; `.agent/GOAL.md`, `.agent/plan.md`, `.agent/task-graph.json`, and `.agent/task-results.json` are listed as orchestrator-owned exclusions. There is no evidence of changes to `src/orchestrator/task-graph-loop.ts`, `prompts/**`, `.agent/task-runs/**`, worktree creation, resume behavior, or parallel Developer/Auditor execution.
 
 ## Rework Instructions
 
-Not applicable — decision is PASS. The two low-severity findings are optional improvements that do not affect the conclusion.
+None. Decision is PASS.

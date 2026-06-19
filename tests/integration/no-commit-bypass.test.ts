@@ -138,6 +138,16 @@ describe('--no-commit bypass regression', () => {
     cmd2.action(() => { /* no-op */ });
     cmd2.parse(['--request', 'noop'], { from: 'user' });
     expect(cmd2.opts().commit).toBe(true);
+
+    // Phase 8D P5 Round 2B: Commander parses --parallel and
+    // --max-parallel-workers <n> into the new StartOptions fields. The strict
+    // worker parser yields a real number, not a string.
+    const cmd3 = createStartCommand();
+    cmd3.exitOverride();
+    cmd3.action(() => { /* no-op */ });
+    cmd3.parse(['--request', 'noop', '--parallel', '--max-parallel-workers', '3'], { from: 'user' });
+    expect(cmd3.opts().parallel).toBe(true);
+    expect(cmd3.opts().maxParallelWorkers).toBe(3);
   });
 
   it('executeStart({ commit: false }) reaches PASSED with no commit (HEAD unchanged)', async () => {
