@@ -300,7 +300,7 @@ describe('demoteConflicts', () => {
 ## 第二轮:Wave Executor + 接入 task-graph
 
 **目标**:把第一轮的 `computeWaves` 接入调度。风险最高,**必须保证
-`max_parallel_workers<=1` 时退化成串行且 byte-identical**。
+`parallel.enabled:false` 或 `max_parallel_workers<=1` 时退化成串行且 byte-identical**。
 
 ### 2.1 新文件 `src/scheduler/wave-executor.ts`
 
@@ -308,7 +308,7 @@ describe('demoteConflicts', () => {
 export interface WaveExecutorParams {
   // 复用现有 runTaskGraphLoop 的绝大多数参数(见 task-graph-loop.ts 签名)
   // ...
-  /** 全局并发上限(来自 config.max_parallel_workers)。 */
+  /** 全局并发上限(来自 CLI --max-parallel-workers 或 config.parallel.max_parallel_workers)。 */
   maxParallelWorkers: number;
 }
 
@@ -355,8 +355,13 @@ async function runOneTaskInWorktree(params: {
 
 现有两处 `runTaskGraphLoop(...)` 调用。改成:
 ```ts
-if (config.max_parallel_workers && config.max_parallel_workers > 1) {
-  return await runWaveExecutor({ ...params, maxParallelWorkers: config.max_parallel_workers });
+const parallelEnabled = cliFlags.parallel || config.parallel?.enabled === true;
+const maxParallelWorkers = parallelEnabled
+  ? (cliFlags.maxParallelWorkers ?? config.parallel?.max_parallel_workers ?? 1)
+  : 1;
+
+if (parallelEnabled && maxParallelWorkers > 1) {
+  return await runWaveExecutor({ ...params, maxParallelWorkers });
 } else {
   return await runTaskGraphLoop({ ...params });  // 旧串行,byte-identical
 }
