@@ -37,12 +37,14 @@ describe('State Store', () => {
       expect(state.phase).toBe(Phase.INITIALIZING);
       expect(state.iteration).toBe(0);
       expect(state.max_iterations).toBe(3);
+      expect(state.consecutive_failure_count).toBe(0);
       expect(state.goal_digest).toBeNull();
       expect(state.last_error).toBeNull();
 
       // Verify persisted
       const read = await store.read();
       expect(read.run_id).toBe('20260610-test');
+      expect(read.consecutive_failure_count).toBe(0);
     });
 
     it('should reject creating state when one already exists', async () => {
@@ -63,6 +65,62 @@ describe('State Store', () => {
         branch: 'main',
         max_iterations: 3,
       })).rejects.toThrow(StateStoreError);
+    });
+  });
+
+  // Phase 8D P6 Round 1: state.json persists the run-level failure guard
+  // counter. Later P6 wiring updates this value from real failure paths.
+  describe('consecutive_failure_count schema', () => {
+    it('persists a nonzero consecutive failure count', async () => {
+      await store.create({
+        run_id: '20260610-test',
+        task_slug: 'test-task',
+        project_root: '/tmp/test',
+        base_commit: 'abc123',
+        branch: 'main',
+        max_iterations: 3,
+      });
+
+      await store.update(() => ({ consecutive_failure_count: 2 }));
+
+      const read = await store.read();
+      expect(read.consecutive_failure_count).toBe(2);
+    });
+
+    it('rejects a negative consecutive failure count', async () => {
+      await store.create({
+        run_id: '20260610-test',
+        task_slug: 'test-task',
+        project_root: '/tmp/test',
+        base_commit: 'abc123',
+        branch: 'main',
+        max_iterations: 3,
+      });
+
+      const stateFile = path.join(agentDir, 'state.json');
+      const raw = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+      raw.consecutive_failure_count = -1;
+      await fs.writeFile(stateFile, JSON.stringify(raw), 'utf8');
+
+      await expect(store.read()).rejects.toThrow(StateStoreError);
+    });
+
+    it('rejects a non-integer consecutive failure count', async () => {
+      await store.create({
+        run_id: '20260610-test',
+        task_slug: 'test-task',
+        project_root: '/tmp/test',
+        base_commit: 'abc123',
+        branch: 'main',
+        max_iterations: 3,
+      });
+
+      const stateFile = path.join(agentDir, 'state.json');
+      const raw = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+      raw.consecutive_failure_count = 1.5;
+      await fs.writeFile(stateFile, JSON.stringify(raw), 'utf8');
+
+      await expect(store.read()).rejects.toThrow(StateStoreError);
     });
   });
 

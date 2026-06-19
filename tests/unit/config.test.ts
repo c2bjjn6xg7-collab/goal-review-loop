@@ -182,6 +182,8 @@ runtime:
     it('should have safe defaults', () => {
       expect(DEFAULT_CONFIG.version).toBe(1);
       expect(DEFAULT_CONFIG.loop.max_iterations).toBe(3);
+      expect(DEFAULT_CONFIG.loop.max_consecutive_failures).toBe(3);
+      expect(DEFAULT_CONFIG.loop.max_agent_retries).toBe(1);
       expect(DEFAULT_CONFIG.git.push).toBe(false);
       expect(DEFAULT_CONFIG.git.require_clean_worktree).toBe(true);
       expect(DEFAULT_CONFIG.git.commit_on_pass).toBe(true);
@@ -744,6 +746,82 @@ describe('Phase 8D P5 Round 1: parallel config', () => {
       max_parallel_workers: 4,
     };
     await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+});
+
+// Phase 8D P6 Round 1: failure policy config fields
+describe('Phase 8D P6 Round 1: failure policy config', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rl-failure-policy-'));
+  });
+
+  afterEach(async () => {
+    await fs.remove(tmpDir);
+  });
+
+  function configWithLoop(loop: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...DEFAULT_CONFIG,
+      loop: {
+        ...DEFAULT_CONFIG.loop,
+        ...loop,
+      },
+    };
+  }
+
+  it('fills failure policy defaults when absent from yaml', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    await fs.writeFile(configPath, [
+      'version: 1',
+      'agents:',
+      '  planner: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+      '  developer: { command: ["sh","-lc","x"], timeout_seconds: 600 }',
+      '  auditor: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+      'loop: { max_iterations: 3 }',
+      'git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: "b", commit_on_pass: true, commit_template: "c", create_tag: false, tag_template: "t", push: false }',
+      'runtime: { kill_grace_seconds: 10, max_log_bytes: 1048576, lock_stale_seconds: 86400 }',
+    ].join('\n'), 'utf8');
+
+    const config = await loadConfig(configPath);
+    expect(config.loop.max_consecutive_failures).toBe(3);
+    expect(config.loop.max_agent_retries).toBe(1);
+  });
+
+  it('accepts explicit boundary values', async () => {
+    for (const value of [1, 10]) {
+      const configPath = path.join(tmpDir, `review-loop-${value}.yaml`);
+      await fs.writeFile(configPath, yaml.dump(configWithLoop({
+        max_consecutive_failures: value,
+        max_agent_retries: value,
+      })), 'utf8');
+
+      const loaded = await loadConfig(configPath);
+      expect(loaded.loop.max_consecutive_failures).toBe(value);
+      expect(loaded.loop.max_agent_retries).toBe(value);
+    }
+  });
+
+  it.each([
+    ['max_consecutive_failures', 0],
+    ['max_consecutive_failures', 11],
+    ['max_consecutive_failures', 1.5],
+    ['max_agent_retries', 0],
+    ['max_agent_retries', 11],
+    ['max_agent_retries', 1.5],
+  ])('rejects invalid %s value %s', async (field, value) => {
+    const configPath = path.join(tmpDir, `review-loop-${field}-${value}.yaml`);
+    await fs.writeFile(configPath, yaml.dump(configWithLoop({ [field]: value })), 'utf8');
+
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('rejects unknown extra fields under loop', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    await fs.writeFile(configPath, yaml.dump(configWithLoop({ future_failure_policy: true })), 'utf8');
+
     await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
   });
 });

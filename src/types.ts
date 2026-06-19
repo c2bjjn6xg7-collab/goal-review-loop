@@ -81,6 +81,11 @@ export interface RunState {
   phase: Phase;
   iteration: number;
   max_iterations: number;
+  /**
+   * Phase 8D P6: consecutive tracked failure count for the run-level circuit
+   * breaker. Starts at 0 and is wired into failure paths in later P6 rounds.
+   */
+  consecutive_failure_count: number;
   project_root: string;
   base_commit: string;
   branch: string;
@@ -418,6 +423,10 @@ export interface ReviewLoopConfig {
     archive_history: boolean;
     /** Whether to stop on infrastructure errors instead of retrying. Default: true. */
     stop_on_infrastructure_error: boolean;
+    /** Phase 8D P6: run-level circuit breaker threshold. Default: 3. */
+    max_consecutive_failures: number;
+    /** Phase 8D P6: same-provider retry budget before escalation. Default: 1. */
+    max_agent_retries: number;
   };
   git: GitConfig;
   runtime: RuntimeConfig;

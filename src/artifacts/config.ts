@@ -56,6 +56,8 @@ const CONFIG_SCHEMA = {
         max_iterations: { type: 'number', minimum: 1, maximum: 10 },
         archive_history: { type: 'boolean' },
         stop_on_infrastructure_error: { type: 'boolean' },
+        max_consecutive_failures: { type: 'integer', minimum: 1, maximum: 10 },
+        max_agent_retries: { type: 'integer', minimum: 1, maximum: 10 },
       },
       additionalProperties: false,
     },
@@ -218,6 +220,8 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     max_iterations: 3,
     archive_history: true,
     stop_on_infrastructure_error: true,
+    max_consecutive_failures: 3,
+    max_agent_retries: 1,
   },
   git: {
     require_repository: true,
@@ -279,6 +283,12 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     }
     if (config.loop.stop_on_infrastructure_error === undefined) {
       config.loop.stop_on_infrastructure_error = DEFAULT_CONFIG.loop.stop_on_infrastructure_error;
+    }
+    if (config.loop.max_consecutive_failures === undefined) {
+      config.loop.max_consecutive_failures = DEFAULT_CONFIG.loop.max_consecutive_failures;
+    }
+    if (config.loop.max_agent_retries === undefined) {
+      config.loop.max_agent_retries = DEFAULT_CONFIG.loop.max_agent_retries;
     }
     if (config.runtime.cancel_grace_seconds === undefined) {
       config.runtime.cancel_grace_seconds = DEFAULT_CONFIG.runtime.cancel_grace_seconds;
