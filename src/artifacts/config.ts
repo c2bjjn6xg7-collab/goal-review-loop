@@ -111,6 +111,7 @@ const CONFIG_SCHEMA = {
       },
       additionalProperties: false,
     },
+    parallel: { $ref: '#/$defs/parallelConfig' },
   },
   additionalProperties: false,
   $defs: {
@@ -165,6 +166,15 @@ const CONFIG_SCHEMA = {
           items: { type: 'number', minimum: 1 },
         },
         proxy_url: { type: 'string', minLength: 1 },
+      },
+      additionalProperties: false,
+    },
+    parallelConfig: {
+      type: 'object',
+      required: ['enabled', 'max_parallel_workers'],
+      properties: {
+        enabled: { type: 'boolean' },
+        max_parallel_workers: { type: 'integer', minimum: 1, maximum: 16 },
       },
       additionalProperties: false,
     },
@@ -231,6 +241,10 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     self_correction: false,
     max_blocks_per_document: 10,
     allowed_types_per_role: DEFAULT_FEEDBACK_ALLOWED_TYPES,
+  },
+  parallel: {
+    enabled: false,
+    max_parallel_workers: 1,
   },
 };
 
@@ -300,6 +314,16 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
 
     // Phase 10: validate allowed_types_per_role values are legal FeedbackType subset
     validateFeedbackTypes(config);
+
+    // Phase 8D P5 Round 1: fill parallel defaults when absent. The schema
+    // requires both leaf fields when `parallel` is provided, so we don't
+    // patch a partial object here — only the entire default block.
+    if (!config.parallel) {
+      config.parallel = {
+        enabled: DEFAULT_CONFIG.parallel!.enabled,
+        max_parallel_workers: DEFAULT_CONFIG.parallel!.max_parallel_workers,
+      };
+    }
 
     // Enforce MVP constraints — Design doc §5.1
     validateMvpConstraints(config);

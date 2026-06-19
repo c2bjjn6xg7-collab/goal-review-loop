@@ -90,7 +90,7 @@ const STATE_SCHEMA = {
         current_task_index: { type: 'number', minimum: 0 },
         task_statuses: {
           type: 'object',
-          additionalProperties: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped'] },
+          additionalProperties: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped', 'blocked'] },
         },
         task_attempts: {
           type: 'object',

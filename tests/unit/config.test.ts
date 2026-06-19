@@ -644,3 +644,106 @@ describe('Phase 10 feedback_protocol', () => {
     }
   });
 });
+
+// Phase 8D P5 Round 1: parallel config block
+describe('Phase 8D P5 Round 1: parallel config', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rl-parallel-'));
+  });
+
+  afterEach(async () => {
+    await fs.remove(tmpDir);
+  });
+
+  it('DEFAULT_CONFIG includes parallel: { enabled: false, max_parallel_workers: 1 }', () => {
+    expect(DEFAULT_CONFIG.parallel).toEqual({ enabled: false, max_parallel_workers: 1 });
+  });
+
+  it('fills parallel defaults when absent from yaml', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    await fs.writeFile(configPath, [
+      'version: 1',
+      'agents:',
+      '  planner: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+      '  developer: { command: ["sh","-lc","x"], timeout_seconds: 600 }',
+      '  auditor: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+      'loop: { max_iterations: 3 }',
+      'git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: "b", commit_on_pass: true, commit_template: "c", create_tag: false, tag_template: "t", push: false }',
+      'runtime: { kill_grace_seconds: 10, max_log_bytes: 1048576, lock_stale_seconds: 86400 }',
+    ].join('\n'), 'utf8');
+    const config = await loadConfig(configPath);
+    expect(config.parallel).toEqual({ enabled: false, max_parallel_workers: 1 });
+  });
+
+  it('accepts an explicit parallel block', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg = { ...DEFAULT_CONFIG, parallel: { enabled: true, max_parallel_workers: 4 } };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    const loaded = await loadConfig(configPath);
+    expect(loaded.parallel).toEqual({ enabled: true, max_parallel_workers: 4 });
+  });
+
+  it('rejects max_parallel_workers below 1', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg = { ...DEFAULT_CONFIG, parallel: { enabled: false, max_parallel_workers: 0 } };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('rejects max_parallel_workers above 16', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg = { ...DEFAULT_CONFIG, parallel: { enabled: false, max_parallel_workers: 17 } };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('accepts the boundary max_parallel_workers values 1 and 16', async () => {
+    for (const n of [1, 16]) {
+      const configPath = path.join(tmpDir, `review-loop-${n}.yaml`);
+      const cfg = { ...DEFAULT_CONFIG, parallel: { enabled: true, max_parallel_workers: n } };
+      await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+      const loaded = await loadConfig(configPath);
+      expect(loaded.parallel?.max_parallel_workers).toBe(n);
+    }
+  });
+
+  it('rejects non-integer max_parallel_workers', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg = { ...DEFAULT_CONFIG, parallel: { enabled: false, max_parallel_workers: 1.5 } };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('rejects parallel block missing required fields', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    // Build a config with a partial parallel block (missing max_parallel_workers).
+    const cfg: Record<string, unknown> = { ...DEFAULT_CONFIG, parallel: { enabled: true } };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('rejects unknown extra fields under parallel', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg: Record<string, unknown> = {
+      ...DEFAULT_CONFIG,
+      parallel: { enabled: false, max_parallel_workers: 1, future_field: 'nope' },
+    };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('rejects loose top-level parallel fields outside the parallel block', async () => {
+    // Round 1 contract: schema validates parallel under the `parallel` property,
+    // not as loose top-level fields. additionalProperties: false at the root
+    // must reject these.
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg: Record<string, unknown> = {
+      ...DEFAULT_CONFIG,
+      max_parallel_workers: 4,
+    };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+});

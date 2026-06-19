@@ -241,4 +241,53 @@ describe('State Store', () => {
       expect(await store.isTerminal()).toBe(false);
     });
   });
+
+  // Phase 8D P5 Round 1: state.json schema must accept TaskStatus.BLOCKED in
+  // task_graph_state.task_statuses so wave-scheduled runs can persist a
+  // blocked task without rewriting the schema. The serial loop does not yet
+  // write 'blocked'; this test only proves the schema-level acceptance.
+  describe('task_graph_state task_statuses schema', () => {
+    it("accepts persisted task_statuses with value 'blocked'", async () => {
+      await store.create({
+        run_id: '20260610-test',
+        task_slug: 'test-task',
+        project_root: '/tmp/test',
+        base_commit: 'abc123',
+        branch: 'main',
+        max_iterations: 3,
+      });
+      await store.update(() => ({
+        task_graph_state: {
+          current_task_index: 0,
+          task_statuses: { t1: 'blocked', t2: 'pending' },
+          task_attempts: { t1: 1, t2: 0 },
+        },
+      }));
+      const read = await store.read();
+      expect(read.task_graph_state).not.toBeNull();
+      expect(read.task_graph_state!.task_statuses.t1).toBe('blocked');
+    });
+
+    it("rejects an unknown task status string", async () => {
+      await store.create({
+        run_id: '20260610-test',
+        task_slug: 'test-task',
+        project_root: '/tmp/test',
+        base_commit: 'abc123',
+        branch: 'main',
+        max_iterations: 3,
+      });
+      // Bypass StateStore guards by editing the JSON file directly, then
+      // confirming read() rejects on schema validation.
+      const stateFile = path.join(agentDir, 'state.json');
+      const raw = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+      raw.task_graph_state = {
+        current_task_index: 0,
+        task_statuses: { t1: 'bogus' },
+        task_attempts: { t1: 0 },
+      };
+      await fs.writeFile(stateFile, JSON.stringify(raw), 'utf8');
+      await expect(store.read()).rejects.toThrow(StateStoreError);
+    });
+  });
 });

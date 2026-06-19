@@ -151,6 +151,23 @@ describe('task-graph validation', () => {
     const r = validateTaskGraph('not a graph');
     expect(r.valid).toBe(false);
   });
+
+  // Phase 8D P5 Round 1: schema must accept the new TaskStatus.BLOCKED value.
+  it('accepts task.status === "blocked"', () => {
+    const g = makeGraph(makeTask({ status: 'blocked' }));
+    const r = validateTaskGraph(g);
+    expect(r.valid).toBe(true);
+    expect(r.errors).toEqual([]);
+  });
+
+  it('still rejects an unknown task.status value', () => {
+    const g = makeGraph(makeTask({
+      // intentionally invalid value — proves the enum is closed.
+      status: 'bogus' as unknown as TaskGraph['tasks'][number]['status'],
+    }));
+    const r = validateTaskGraph(g);
+    expect(r.valid).toBe(false);
+  });
 });
 
 describe('topologicalSort', () => {

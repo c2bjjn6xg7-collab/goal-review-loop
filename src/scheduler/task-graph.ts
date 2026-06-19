@@ -40,7 +40,7 @@ const taskNodeSchema = {
     allowed_changes: { type: 'array', items: { type: 'string', pattern: SAFE_GLOB_PATTERN, minLength: 1 }, minItems: 1 },
     disallowed_changes: { type: 'array', items: { type: 'string', pattern: SAFE_GLOB_PATTERN, minLength: 1 } },
     verification_commands: { type: 'array', items: taskVerificationCommandSchema, minItems: 1 },
-    status: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped'] },
+    status: { type: 'string', enum: ['pending', 'running', 'passed', 'failed', 'skipped', 'blocked'] },
   },
   required: [
     'id', 'title', 'description', 'difficulty', 'risk', 'parallelizable',

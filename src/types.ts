@@ -423,12 +423,30 @@ export interface ReviewLoopConfig {
   runtime: RuntimeConfig;
   /** Phase 10: Agent feedback block protocol (ReviewLoopRequest). */
   feedback_protocol: FeedbackProtocolConfig;
+  /**
+   * Phase 8D P5 Round 1: optional parallel-execution config. Round 1 only
+   * stores the configuration; downstream rounds opt the orchestrator into
+   * wave scheduling. When absent, defaults are
+   * `{ enabled: false, max_parallel_workers: 1 }`.
+   */
+  parallel?: ParallelConfig;
 }
 
 export interface AgentConfig {
   command: string[];
   timeout_seconds: number;
   provider?: string;
+}
+
+/**
+ * Phase 8D P5 Round 1: parallel-execution configuration. The orchestrator
+ * only acts on `enabled`; `max_parallel_workers` is configuration data that
+ * later rounds use to size wave-scheduled execution. `max_parallel_workers`
+ * is constrained to the range [1, 16].
+ */
+export interface ParallelConfig {
+  enabled: boolean;
+  max_parallel_workers: number;
 }
 
 /**
@@ -1007,6 +1025,13 @@ export const TaskStatus = {
   PASSED: 'passed',
   FAILED: 'failed',
   SKIPPED: 'skipped',
+  /**
+   * Phase 8D P5 Round 1: a wave-scheduled task may be marked BLOCKED when a
+   * parallel run cannot proceed (e.g. an upstream dependency failed). The
+   * serial task-graph loop does not currently write this value; it exists for
+   * schema/persistence compatibility ahead of wave-scheduling work.
+   */
+  BLOCKED: 'blocked',
 } as const;
 
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
