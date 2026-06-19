@@ -45,20 +45,93 @@
 **目标**:把 wave 分层逻辑做成纯函数,完全可测,不碰任何循环/IO。这一轮零风险,
 但它是第二轮 executor 的地基,必须先做扎实。
 
-### 1.1 新增配置 `max_parallel_workers`
+### 1.1 新增配置块 `parallel`(不是顶层)
 
-文件 `src/types.ts` 和 `src/artifacts/config.ts`:
+⚠️ **不要放顶层**。`src/artifacts/config.ts:50/60/80/91` 的 schema 顶层是
+`additionalProperties: false`——放顶层会配置校验失败。必须放进 `parallel` 块,
+且 schema 里新增对应 `$defs` 段。
 
+设计文档 §4(line 77-79)定义的形态:
+```yaml
+parallel:
+  enabled: false              # 默认 false(显式 opt-in, 见 §1.1a)
+  max_parallel_workers: 1     # 默认 1(=串行, byte-identical)
+```
+
+文件 `src/types.ts`:
 ```ts
-// ReviewLoopConfig 加顶层字段(或放 loop 段,看现有风格)
-interface ReviewLoopConfig {
-  // ...existing...
-  /** Phase 8D: 全局并发 worker 上限。默认 1(=串行,byte-identical)。 */
-  max_parallel_workers?: number;  // 1..16
+export interface ParallelConfig {
+  /** 显式开关。默认 false。设计文档 §4 要求 --parallel 或 config 显式开启。 */
+  enabled: boolean;
+  /** 全局并发 worker 上限。默认 1(=串行)。范围 1..16。 */
+  max_parallel_workers: number;
+}
+
+export interface ReviewLoopConfig {
+  // ...existing top-level fields...
+  parallel?: ParallelConfig;   // 可选, 缺省时当作 enabled:false
 }
 ```
 
-默认值 `1`(关键:默认 1 = 串行 = byte-identical)。schema 校验 1..16。
+文件 `src/artifacts/config.ts`:
+- 默认值:`parallel: { enabled: false, max_parallel_workers: 1 }`。
+- schema:新增 `$defs.parallelConfig`,顶层 schema 加 `parallel` 属性 `$ref` 它;
+  `max_parallel_workers` 校验 1..16;`enabled` 是 boolean。
+- 向后兼容:config 缺 `parallel` 段时,填充默认 `{enabled:false, max_parallel_workers:1}`
+  (现有 config 无此段 → 行为 byte-identical)。
+
+### 1.1a 显式 opt-in(设计文档 §4 line 40 要求)
+
+Wave 并发**默认关闭**,通过两种方式之一显式开启(两者满足其一即可):
+
+1. CLI flag:`review-loop start --parallel`(以及 `--max-parallel-workers N`)
+2. config:`parallel.enabled: true`
+
+判定逻辑(P5 第二轮接入时用,第一轮只需在 config 里体现):
+```ts
+const parallelEnabled = cliFlags.parallel || config.parallel?.enabled === true;
+const maxWorkers = parallelEnabled
+  ? (cliFlags.maxParallelWorkers ?? config.parallel?.max_parallel_workers ?? 1)
+  : 1;
+```
+
+**仅 `max_parallel_workers > 1` 不算开启**——必须 `enabled` 为真(或 --parallel)。
+这避免"用户只想调上限数字却意外开并发"的误操作。设计文档 §4 line 40 原话:
+"explicit parallel execution mode"。
+
+### 1.1b TaskStatus 扩展:新增 BLOCKED
+
+⚠️ **现状 `TaskStatus` 没有 blocked**。`src/types.ts:1004-1010` 只有
+`pending/running/passed/failed/skipped`。8B 串行路径(task-graph-loop.ts)只写
+passed/failed,从没产生 blocked。
+
+但设计文档 §7.2(2-C 升级阶梯)和 §7.3(熔断)明确用 blocked(task 升级耗尽
+→ blocked;连续失败 → run blocked)。所以本 phase 必须**新增 BLOCKED 到枚举**:
+
+```ts
+// src/types.ts:1004
+export const TaskStatus = {
+  PENDING: 'pending',
+  RUNNING: 'running',
+  PASSED: 'passed',
+  FAILED: 'failed',
+  BLOCKED: 'blocked',   // ← 新增
+  SKIPPED: 'skipped',
+} as const;
+```
+
+**影响面(开发师必须检查)**:
+- 任何 `switch(taskStatus)` / 穷举 TaskStatus 的地方要补 BLOCKED case。
+  grep `TaskStatus` 和 `: 'passed' | 'failed'` 找全。
+- `emitTaskProgress` 的 taskStatus 参数(task-graph-loop.ts:682)类型是
+  `'running'|'passed'|'failed'|'rework'` —— 需加 `'blocked'`,或 BLOCKED 走单独
+  的日志路径。
+- UI/状态展示(`status` 命令)要能显示 blocked。
+- **8B 串行路径不产生 BLOCKED**(它只 passed/failed),所以加这个枚举值对
+  现有 892 测试 byte-identical——前提是 BLOCKED 只在 wave 路径写入,串行路径不碰。
+
+本 brief 后文所有提到的 "blocked" 均指 `TaskStatus.BLOCKED`(本 phase 新增)。
+failed 指升级前的失败态;BLOCKED 指升级阶梯耗尽后的终态(见设计文档 §7.2)。
 
 ### 1.2 新文件 `src/scheduler/wave-compute.ts`
 
@@ -101,48 +174,117 @@ export function demoteConflicts(plan: WavePlan, conflicts: Map<string, string[]>
   + on-stack,遇环抛错)。
 - **parallelizable: false 的 task**:它出现在某个 wave,但该 wave 里只有它
   (其他 task 若拓扑同层,挤到下一 wave)。实现:先算所有 task 的 wave_index,
-  再把 non-parallelizable task 的 wave 调整为独占。
+  再把 non-parallelizable task 的 wave 调整为独占。**多条规则(写死,避免歧义)**:
+  1. 每个 np task 独占一个 singleton wave(该 wave 只有它一个 task)。
+  2. 多个 np task 同拓扑层时,**按拓扑序各自独占**(np_A 在 wave k,np_B 在
+     wave k+1,即使它们无依赖关系)——不要把两个 np 放同一 wave(它们都要求独占,
+     并放违背 np 语义)。
+  3. **parallel task 不得插入 np 的 singleton wave**。即 np task 所在 wave 绝不
+     混入 parallel task,即使该 parallel task 拓扑本可在此层。parallel task 顺延
+     到下一个非 np 独占的 wave。
+  4. 确定性:多个 np 同层时,按 task_id 字典序排独占顺序。
 - **demoteConflicts**:对每个 wave,查 conflicts,把冲突 task 移到下一 wave,
-  下一 wave 重新检测(级联)。设一个上限迭代(如 wave 数 × 2)防死循环,超了抛错
-  (说明冲突图病态,需人工)。
+  下一 wave 重新检测(级联)。**上限 = task 总数 × conflict 边数**(即
+  `tasks.length × Σ|conflicts[t]|`)——这是所有 demote 操作的理论上界(每次移动
+  至少消耗一条 conflict 边),到上限仍有冲突说明图病态(如 task A 和 B 在任何
+  wave 都必然冲突,需要人工拆分),抛 WaveComputeError。**不要用 `wave×2`**,
+  那会误杀合法的大冲突图(一个 task 可能要级联 demote 多次)。
 
 ### 1.4 验证(`tests/unit/wave-compute.test.ts`)
+
+测试里用一个 helper 构造 TaskNode,避免 `{ ... }` 占位导致开发师自由发挥:
+```ts
+import type { TaskNode } from '../../src/types.js';
+
+function makeTask(id: string, opts: {
+  dependsOn?: string[];
+  parallelizable?: boolean;
+} = {}): TaskNode {
+  return {
+    id,
+    title: id,
+    description: `${id} test`,
+    depends_on: opts.dependsOn ?? [],
+    parallelizable: opts.parallelizable ?? true,
+    allowed_changes: [],
+    disallowed_changes: [],
+    verification_commands: [],
+    risk: 'low',
+    slug: id,
+  } as unknown as TaskNode;  // 测试只填 wave-compute 关心的字段
+}
+```
+(实际 TaskNode 字段以 types.ts:1030 为准,helper 补全必填项即可。)
 
 ```ts
 describe('computeWaves', () => {
   it('T1,T2 roots + T3 depends T1 → wave [T1,T2] then [T3]', () => {
     const tasks = [
-      { id: 't1', depends_on: [], parallelizable: true, ... },
-      { id: 't2', depends_on: [], parallelizable: true, ... },
-      { id: 't3', depends_on: ['t1'], parallelizable: true, ... },
+      makeTask('t1'),
+      makeTask('t2'),
+      makeTask('t3', { dependsOn: ['t1'] }),
     ];
     const plan = computeWaves(tasks);
     expect(plan.waves).toEqual([['t1', 't2'], ['t3']]);
   });
 
-  it('chain t1→t2→t3 → three waves of one', () => { ... });
+  it('chain t1→t2→t3 → three waves of one', () => {
+    const tasks = [
+      makeTask('t1'),
+      makeTask('t2', { dependsOn: ['t1'] }),
+      makeTask('t3', { dependsOn: ['t2'] }),
+    ];
+    expect(computeWaves(tasks).waves).toEqual([['t1'], ['t2'], ['t3']]);
+  });
 
   it('throws on cycle t1→t2→t1', () => {
-    expect(() => computeWaves([...])).toThrow(/cycle/i);
+    const tasks = [makeTask('t1', { dependsOn: ['t2'] }), makeTask('t2', { dependsOn: ['t1'] })];
+    expect(() => computeWaves(tasks)).toThrow(/cycle/i);
   });
 
-  it('throws on missing dependency t2 depends_on ghost', () => { ... });
+  it('throws on missing dependency t2 depends_on ghost', () => {
+    const tasks = [makeTask('t2', { dependsOn: ['ghost'] })];
+    expect(() => computeWaves(tasks)).toThrow(/ghost|missing/i);
+  });
 
   it('non-parallelizable task occupies a wave alone', () => {
-    // t1(np) + t2(parallelizable) 同层 → t1 独占 wave0, t2 到 wave1
+    const tasks = [
+      makeTask('t1', { parallelizable: false }),
+      makeTask('t2', { parallelizable: true }),
+    ];
+    // t1(np) 独占 wave0; t2(parallel) 顺延到 wave1, 不混入 np 的 singleton
+    expect(computeWaves(tasks).waves).toEqual([['t1'], ['t2']]);
   });
 
-  it('empty task list → empty plan (not throw)', () => { ... });
+  it('two np tasks same layer → each alone, ordered by id', () => {
+    const tasks = [
+      makeTask('tB', { parallelizable: false }),
+      makeTask('tA', { parallelizable: false }),
+    ];
+    expect(computeWaves(tasks).waves).toEqual([['tA'], ['tB']]);  // id 字典序
+  });
+
+  it('empty task list → empty plan (not throw)', () => {
+    expect(computeWaves([]).waves).toEqual([]);
+  });
 });
 
 describe('demoteConflicts', () => {
   it('demotes lexically-larger task id on conflict', () => {
     // wave0=[auth, login], conflicts: auth↔login → login(t2) demote 到 wave1
+    const plan: WavePlan = { waves: [['auth', 'login']], waveIndexOfTask: new Map([['auth',0],['login',0]]) };
+    const conflicts = new Map([['auth', ['login']], ['login', ['auth']]]);
+    const out = demoteConflicts(plan, conflicts);
+    expect(out.waves[0]).toEqual(['auth']);       // auth 字典序小, 留 wave0
+    expect(out.waves[1]).toContain('login');       // login demote
   });
 
-  it('cascades: demoted task conflicts in next wave → demote again', () => { ... });
+  it('cascades: demoted task conflicts in next wave → demote again', () => { /* ... */ });
 
-  it('no conflicts → plan unchanged', () => { ... });
+  it('no conflicts → plan unchanged', () => {
+    const plan: WavePlan = { waves: [['a','b']], waveIndexOfTask: new Map() };
+    expect(demoteConflicts(plan, new Map())).toEqual(plan);
+  });
 });
 ```
 
@@ -178,7 +320,11 @@ export async function runWaveExecutor(params: WaveExecutorParams): Promise<Orche
 1. computeWaves(tasks) → WavePlan
 2. 对 conflicts 调 detectWaveConflicts(trackedFiles) → demoteConflicts(plan, conflicts)
 3. for each wave in plan:
-   a. 该 wave 的 task 数若 > maxParallelWorkers,超出部分排队等下一轮空位
+   a. **同一 wave 内分批执行**(不是"等下一轮 wave"):该 wave 的 task 数若 >
+      maxParallelWorkers,在**本 wave 内**分批,每批 maxParallelWorkers 个并发;
+      一批完成(全部 passed/blocked)再放下一批,本 wave 所有批次跑完才进拓扑
+      下一 wave。不要把超额 task 推到拓扑下一 wave——那会破坏依赖语义(下一 wave
+      的 task 可能 depends_on 本 wave 的超额 task)。
    b. 对 wave 内每个 task(并发,受 maxParallelWorkers 限):
       - WorktreeManager.createForTask(建 worktree+分支)
       - 在 worktree 里跑 Developer/验证/Auditor(复用现有 per-task 逻辑,
@@ -296,25 +442,35 @@ describe('wave scheduler boundaries', () => {
 
 ```text
 Implement Phase 8D P5 round 1 per docs/phase-8d-p5-wave-scheduler-brief.md §第一轮.
-Design source: docs/phase-8d-worktree-parallel-execution.md §7.1.
+Design source: docs/phase-8d-worktree-parallel-execution.md §4 (config) and §7.1 (waves).
 
-Round 1 ONLY: pure wave-compute functions + max_parallel_workers config. Do NOT
-touch task-graph-loop.ts, run-orchestrator.ts, or any executor — round 1 is
-leaf functions only.
+Round 1 ONLY: pure wave-compute functions + parallel config block + TaskStatus.BLOCKED.
+Do NOT touch task-graph-loop.ts core loop, run-orchestrator.ts executor dispatch, or
+any executor — round 1 is leaf functions + types only.
 
-1. Add max_parallel_workers (default 1, range 1..16) to ReviewLoopConfig in
-   src/types.ts and src/artifacts/config.ts. Default 1 = byte-identical serial.
-2. New file src/scheduler/wave-compute.ts: computeWaves(tasks) does topological
-   depth layering (depends_on in TaskNode, types.ts:1037); parallelizable=false
-   tasks occupy a wave alone; throws on cycle / missing dep. demoteConflicts
-   moves conflicting tasks to the next wave (cascading, with an iteration cap).
-   See §1.2/§1.3.
-3. New file tests/unit/wave-compute.test.ts: 9+ cases (the 3-task diamond,
-   chain, cycle throws, missing dep throws, np-alone, empty, demote basic,
-   demote cascade, no-conflict). See §1.4.
+1. Add a `parallel` config BLOCK (NOT top-level — top-level schema is
+   additionalProperties:false, see config.ts:50/60/80/91). Shape per design §4:
+   parallel: { enabled: boolean (default false, explicit opt-in via --parallel or
+   config), max_parallel_workers: number (default 1, range 1..16) }. Default
+   {enabled:false, max_parallel_workers:1} = byte-identical serial. Add $defs.parallelConfig
+   and ref it from the top-level schema. See §1.1/§1.1a.
+2. Add BLOCKED to the TaskStatus enum (src/types.ts:1004). Today it is
+   pending/running/passed/failed/skipped only. BLOCKED is used by the wave path's
+   escalation-ladder terminal state (design §7.2). Check every exhaustive switch over
+   TaskStatus and add a BLOCKED case; the 8B serial path never writes BLOCKED so
+   existing tests stay byte-identical. See §1.1b.
+3. New file src/scheduler/wave-compute.ts: computeWaves(tasks) does topological depth
+   layering (depends_on in TaskNode types.ts:1037); parallelizable=false tasks each
+   occupy a singleton wave, ordered by task_id, parallel tasks never mixed into an np
+   singleton (see §1.3 rules); throws on cycle / missing dep. demoteConflicts moves
+   conflicting tasks (lexically-larger id) to the next wave, cascading, with cap =
+   tasks.length × Σ|conflicts[t]| (NOT wave×2). See §1.2/§1.3.
+4. New file tests/unit/wave-compute.test.ts using a makeTask(id, opts) helper (§1.4):
+   8+ cases (3-task diamond, chain, cycle throws, missing dep throws, np-alone,
+   two-np-same-layer-by-id, empty, demote basic, demote cascade, no-conflict).
 
-Existing 892 tests must stay byte-identical (round 1 doesn't touch the loop).
-All gates green.
+Existing 892 tests must stay byte-identical (round 1 doesn't touch the loop, and
+BLOCKED is never written by the serial path). All gates green.
 ```
 
 第二、三轮的 start request 在第一轮合并后再写(根据实际抽函数结果调整)。
