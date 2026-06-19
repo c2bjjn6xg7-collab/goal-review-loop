@@ -134,7 +134,15 @@ export class WorktreeManager {
 
     for (const record of existingRecords) {
       if (await pathsEqual(record.worktreePath, worktreePath)) {
-        const existingBranch = record.branch ?? branch;
+        const existingBranch = record.branch ?? '';
+        if (existingBranch !== branch) {
+          throw new WorktreeManagerError(
+            `createForTask: worktree at ${worktreePath} already exists but is on branch ` +
+              `"${existingBranch}", expected "${branch}" for this task. ` +
+              `A leftover worktree from a different run/task is occupying the path. ` +
+              `Inspect and remove it manually before retrying.`,
+          );
+        }
         return { worktreePath: record.worktreePath, branch: existingBranch };
       }
     }
@@ -164,13 +172,29 @@ export class WorktreeManager {
 
   async cleanupTask(runId: string, taskId: string): Promise<void> {
     const worktreePath = buildWorktreePath(this.projectRoot, runId, taskId);
-    try {
-      const removeResult = await runGit(['worktree', 'remove', worktreePath], this.projectRoot);
-      if (removeResult.exit_code !== 0) {
-        return;
-      }
-    } catch {
+    // Idempotent: if the worktree no longer exists, cleanup is a no-op success
+    // (resume may call cleanupTask for an already-cleaned task).
+    const worktreeExists = await fs.pathExists(worktreePath);
+    if (!worktreeExists) {
       return;
+    }
+    // Worktree exists — removal MUST succeed. A dirty worktree or a locked
+    // path is a real error, not something to swallow: P5 would otherwise
+    // believe cleanup succeeded and proceed on stale state.
+    let removeResult;
+    try {
+      removeResult = await runGit(['worktree', 'remove', worktreePath], this.projectRoot);
+    } catch (err) {
+      throw new WorktreeManagerError(
+        `cleanupTask: git worktree remove threw for ${worktreePath}: ${(err as Error).message}`,
+      );
+    }
+    if (removeResult.exit_code !== 0) {
+      throw new WorktreeManagerError(
+        `cleanupTask: failed to remove worktree at ${worktreePath} ` +
+          `(likely dirty or locked): ${removeResult.stderr || 'git worktree remove failed'}. ` +
+          `Resolve manually (inspect/clean the worktree) before retrying.`,
+      );
     }
   }
 

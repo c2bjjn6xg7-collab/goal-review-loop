@@ -90,6 +90,32 @@ describe('WorktreeManager.createForTask', () => {
     expect(list.length).toBe(1);
     expect(list[0].taskId).toBe('t1');
   });
+
+  it('THROWS when reusing a leftover worktree on the wrong branch', async () => {
+    const { repoDir, baseSha } = createTestRepo('reuse-wrong-branch');
+    cleanupDirs.push(repoDir);
+    const mgr = new WorktreeManager(repoDir);
+
+    // Task A claims path .agent/worktrees/run-X/t1 on branch agent/run-X/t1-a.
+    await mgr.createForTask({
+      runId: 'run-X',
+      taskId: 't1',
+      slug: 'a',
+      baseCommit: baseSha,
+    });
+
+    // A leftover worktree now occupies t1's path. Task B targets the SAME path
+    // (same runId/taskId) but a DIFFERENT branch (slug differs). Reusing it
+    // silently would let P5 run B's work in A's worktree — must throw instead.
+    await expect(
+      mgr.createForTask({
+        runId: 'run-X',
+        taskId: 't1',
+        slug: 'b',
+        baseCommit: baseSha,
+      }),
+    ).rejects.toThrow(/already exists but is on branch/);
+  });
 });
 
 describe('WorktreeManager.cleanupTask', () => {
@@ -150,6 +176,35 @@ describe('WorktreeManager.cleanupTask', () => {
       repoDir,
     );
     expect(branchAfter.exit_code).toBe(0);
+  });
+
+  it('THROWS when the worktree is dirty (cleanup must not silently swallow)', async () => {
+    const { repoDir, baseSha } = createTestRepo('cleanup-dirty-throw');
+    cleanupDirs.push(repoDir);
+    const mgr = new WorktreeManager(repoDir);
+
+    const created = await mgr.createForTask({
+      runId: 'run-dirty',
+      taskId: 't1',
+      slug: 'demo',
+      baseCommit: baseSha,
+    });
+
+    // Make the worktree dirty: an untracked file blocks `git worktree remove`.
+    writeFileSync(join(created.worktreePath, 'untracked.txt'), 'stale');
+
+    // Hardened behavior: a dirty worktree MUST surface as an error, not be
+    // swallowed. P5 relies on cleanupTask either removing the worktree or
+    // loudly failing — never silently leaving stale state behind.
+    await expect(mgr.cleanupTask('run-dirty', 't1')).rejects.toThrow(
+      /cleanupTask: failed to remove worktree/,
+    );
+
+    // Worktree still exists (remove was refused) — caller must resolve manually.
+    expect(existsSync(created.worktreePath)).toBe(true);
+
+    // Force-clean so afterEach can rm the repo dir.
+    execSync(`git worktree remove --force "${created.worktreePath}"`, { cwd: repoDir, stdio: 'ignore' });
   });
 });
 
