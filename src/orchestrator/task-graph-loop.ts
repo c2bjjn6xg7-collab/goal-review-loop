@@ -42,6 +42,7 @@ import type {
   GoalFrontMatter,
   VerificationCommand,
   TaskGraph,
+  TaskNode,
   TaskResult,
   TaskResultsFile,
   TaskGraphState,
@@ -87,6 +88,305 @@ interface TaskGraphLoopParams {
   tag: boolean;
   /** When resuming, the 0-based task index to restart from. */
   resumeTaskIndex?: number;
+}
+
+/**
+ * Phase 8D P5 Round 2C: parameters for `runTaskGraphTaskSerial`, the helper
+ * that owns one task's serial Developer/verification attempt loop.
+ */
+export interface RunTaskGraphTaskSerialParams {
+  projectRoot: string;
+  agentDir: string;
+  runId: string;
+  stateStore: StateStore;
+  artifactStore: ArtifactStore;
+  orchestratorRegistry: OrchestratorFileRegistry;
+  config: ReviewLoopConfig;
+  currentBranch: string;
+  baseCommit: string;
+  taskGraph: TaskGraph;
+  task: TaskNode;
+  taskIndex: number;
+  taskTotal: number;
+  tgState: TaskGraphState;
+  maxIterations: number;
+  combinedSignal: AbortSignal;
+  goalPath: string;
+  handoffPath: string;
+  goalSuccessCriteria: string[];
+}
+
+/**
+ * Phase 8D P5 Round 2C: result of a single serial per-task execution.
+ *
+ * If `terminalResult` is set, the outer task graph loop must return it
+ * verbatim (cancellation paths). Otherwise `passed`/`error` describe the
+ * outcome of the per-task attempt loop.
+ */
+export interface RunTaskGraphTaskSerialResult {
+  passed: boolean;
+  error: string | null;
+  terminalResult?: OrchestratorResult;
+}
+
+/**
+ * Phase 8D P5 Round 2C: serial per-task Developer/verification attempt loop.
+ *
+ * This helper owns one task's rework loop, including:
+ *   - per-attempt task_attempts state writes,
+ *   - task-scoped Developer prompt build/cleanup,
+ *   - Developer agent invocation,
+ *   - system-protected path verification,
+ *   - Developer handoff validation,
+ *   - feedback block dispatch,
+ *   - per-task scope guard,
+ *   - per-task verification command execution,
+ *   - retry/break/continue control flow,
+ *   - cancellation handling.
+ *
+ * It does NOT own task ordering, `current_task_index`, task-result
+ * persistence, BLOCKED transitions, integration verification, audit, or
+ * finalization — those remain in `runTaskGraphLoop`.
+ */
+export async function runTaskGraphTaskSerial(
+  params: RunTaskGraphTaskSerialParams,
+): Promise<RunTaskGraphTaskSerialResult> {
+  const {
+    projectRoot,
+    agentDir,
+    runId,
+    stateStore,
+    artifactStore,
+    orchestratorRegistry,
+    config,
+    currentBranch,
+    baseCommit,
+    taskGraph,
+    task,
+    taskIndex,
+    taskTotal,
+    tgState,
+    maxIterations,
+    combinedSignal,
+    goalPath,
+    handoffPath,
+    goalSuccessCriteria,
+  } = params;
+  const taskIndexDisplay = taskIndex + 1;
+
+  // Normalize task verification commands
+  const taskVerificationCommands = normalizeGoalCommands(task.verification_commands);
+
+  // ── Per-task Developer attempts (rework loop) ──
+  let taskPassed = false;
+  let taskError: string | null = null;
+
+  for (let attempt = 1; attempt <= maxIterations; attempt++) {
+    tgState.task_attempts[task.id] = attempt;
+    await stateStore.update(() => ({ task_graph_state: { ...tgState } }));
+
+    await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex, taskStatus: attempt > 1 ? 'rework' : 'running', lastEvent: `Task ${taskIndexDisplay} attempt ${attempt}/${maxIterations}: ${task.title}` });
+
+    // Build task-scoped Developer prompt
+    // Phase 8B: Remove stale developer-handoff.md from prior tasks so the
+    // agent-adapter artifact freshness check sees a freshly written file.
+    const handoffFile = join(agentDir, 'developer-handoff.md');
+    if (existsSync(handoffFile)) {
+      try { unlinkSync(handoffFile); } catch { /* best effort */ }
+    }
+
+    // Snapshot protected paths + plan/GOAL digests BEFORE creating the prompt
+    // file, so the prompt file (written to .agent/debug/) is not in the
+    // snapshot and its later deletion is not flagged as tampering.
+    const preDevSystemPaths = snapshotSystemPaths(agentDir);
+    const preDevGoalDigest = computeDigest(readFileSync(goalPath, 'utf8'));
+    // Phase 8B: snapshot workspace files for a task-scoped diff after Developer.
+    const preTaskWorkspace = snapshotWorkspaceFiles(projectRoot);
+
+    let developerPrompt: string;
+    let developerPromptFile: string | undefined;
+    try {
+      developerPrompt = buildTaskDeveloperPrompt({
+        run_id: runId,
+        project_root: projectRoot,
+        task_index: taskIndexDisplay,
+        task_total: taskTotal,
+        task_id: task.id,
+        task_title: task.title,
+        task_description: task.description,
+        allowed_changes: task.allowed_changes,
+        disallowed_changes: task.disallowed_changes,
+        verification_commands: task.verification_commands,
+        goal_success_criteria: goalSuccessCriteria,
+        goal_path: goalPath,
+        handoff_path: handoffPath,
+      });
+      developerPromptFile = await writePromptFile(agentDir, developerPrompt, runId, `task-${task.id}-attempt-${attempt}`);
+    } catch (err) {
+      taskError = `Prompt build failed: ${err instanceof Error ? err.message : String(err)}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} prompt`, 'FAIL', taskError);
+      break;
+    }
+
+    let developerResult;
+    let developerCleanupResult: PromptCleanupResult | undefined;
+    try {
+      await emitProgress({ projectRoot, stateStore, lastEvent: `Running Developer for task ${taskIndexDisplay} (attempt ${attempt})`, registry: orchestratorRegistry });
+
+      const developerInput = buildDeveloperInput({
+        run_id: runId,
+        iteration: taskIndexDisplay,
+        // F-8D-T-001 fix: pass attempt so retry log files don't collide
+        // with the previous attempt's log files (which would otherwise
+        // trip verifySystemProtectedPaths' digest_mismatch check).
+        attempt,
+        project_root: projectRoot,
+        command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
+        timeout_seconds: config.agents.developer.timeout_seconds,
+        prompt: developerPrompt,
+        prompt_file: developerPromptFile,
+        signal: combinedSignal,
+      });
+
+      developerResult = await runAgent(developerInput, projectRoot);
+    } finally {
+      if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
+    }
+
+    if (developerResult) {
+      emitTranscript({ projectRoot, role: 'developer', iteration: taskIndexDisplay, runId, startedAt: new Date().toISOString(), result: developerResult, registry: orchestratorRegistry });
+    }
+    registerAgentLogs(developerResult, orchestratorRegistry);
+
+    if (developerCleanupResult && !developerCleanupResult.success) {
+      taskError = `Prompt cleanup failed: ${developerCleanupResult.error}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} cleanup`, 'FAIL', taskError);
+      break;
+    }
+
+    if (developerResult.status === 'cancelled') {
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} developer`, 'CANCELLED', developerResult.error?.message);
+      return {
+        passed: false,
+        error: 'Run cancelled by user request',
+        terminalResult: makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled by user request', `Developer cancelled on task ${task.id}`, developerResult.error),
+      };
+    }
+
+    if (developerResult.status !== 'success') {
+      taskError = `Developer failed: ${developerResult.error?.message ?? 'unknown'}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} developer attempt ${attempt}`, 'FAIL', taskError);
+      if (attempt < maxIterations) continue;
+      break;
+    }
+
+    // Verify system-protected paths unchanged
+    const registryVerification = await verifySystemProtectedPaths(projectRoot, orchestratorRegistry, preDevSystemPaths);
+    if (!registryVerification.valid) {
+      const violationMsgs = registryVerification.violations.map(v => v.message).join('; ');
+      taskError = `Developer tampered with system-protected paths: ${violationMsgs}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} system path integrity`, 'FAIL', violationMsgs);
+      if (attempt < maxIterations) continue;
+      break;
+    }
+
+    // Validate Developer handoff
+    const developerValidation = validateDeveloperOutput(projectRoot, runId, taskIndexDisplay, null, preDevGoalDigest);
+    if (!developerValidation.valid) {
+      taskError = `Developer output invalid: ${developerValidation.errors.join('; ')}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} handoff`, 'FAIL', developerValidation.errors.join('; '));
+      if (attempt < maxIterations) continue;
+      break;
+    }
+    if (developerValidation.isBlocked) {
+      taskError = 'Developer reported BLOCKED';
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} handoff`, 'BLOCKED', 'Developer reported BLOCKED');
+      break;
+    }
+
+    // Phase 10: dispatch ReviewLoopRequest feedback blocks from developer-handoff.md (best-effort).
+    await dispatchFeedbackBlocks({
+      projectRoot, runId, role: 'developer',
+      artifactPath: join(projectRoot, '.agent/developer-handoff.md'),
+      config: config.feedback_protocol,
+      registry: orchestratorRegistry,
+    }).catch(() => { /* failure-safe */ });
+
+    // ── Per-task scope guard (enforces task.allowed_changes) ──
+    // Collect full diff for evidence/metadata, but scope-check ONLY the files
+    // this Developer run changed (task-scoped), so prior tasks' files — which
+    // legitimately fall outside this task's allowed_changes — are not flagged.
+    const diffResult = await collectDiff({ projectRoot, baseCommit, iteration: taskIndexDisplay });
+    await writeDiffArtifacts(projectRoot, taskIndexDisplay, diffResult);
+    const taskChangedFiles = buildTaskChangedFiles(projectRoot, preTaskWorkspace);
+    registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`), orchestratorRegistry);
+
+    const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
+    const scopeResult = checkScope({
+      allowedChanges: task.allowed_changes,
+      disallowedChanges: task.disallowed_changes,
+      changedFiles: taskChangedFiles,
+      orchestratorOwnedFiles,
+    });
+    await writeScopeReport(projectRoot, taskIndexDisplay, scopeResult.report);
+    if (existsSync(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`, 'scope-report.json'))) {
+      orchestratorRegistry.register(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`, 'scope-report.json'), computeDigest(readFileSync(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`, 'scope-report.json'), 'utf8')));
+    }
+
+    if (!scopeResult.passed) {
+      const deniedPaths = scopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ');
+      taskError = `Scope violation: ${deniedPaths}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'VERIFYING', `task ${task.id} scope`, 'FAIL', deniedPaths);
+      if (attempt < maxIterations) continue;
+      break;
+    }
+    await appendLog(artifactStore, runId, taskIndexDisplay, 'VERIFYING', `task ${task.id} scope`, 'PASS');
+
+    // ── Per-task verification ──
+    if (combinedSignal.aborted) {
+      await stateStore.transition(PhaseEnum.CANCELLED);
+      return {
+        passed: false,
+        error: 'Verification cancelled by abort signal',
+        terminalResult: makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled', 'Verification cancelled by abort signal', null),
+      };
+    }
+
+    const verificationResult = await runVerification({
+      commands: taskVerificationCommands,
+      projectRoot,
+      runId,
+      iteration: taskIndexDisplay,
+      signal: combinedSignal,
+    });
+    registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`), orchestratorRegistry);
+    const taskManifestPath = join(agentDir, 'verification', 'manifest.json');
+    if (existsSync(taskManifestPath)) {
+      orchestratorRegistry.register(taskManifestPath, computeDigest(readFileSync(taskManifestPath, 'utf8')));
+    }
+
+    const requiredPassed = verificationResult.manifest.commands
+      .filter(c => c.required)
+      .every(c => c.status === 'success');
+
+    if (!requiredPassed || !verificationResult.passed) {
+      const failedCmds = verificationResult.manifest.commands
+        .filter(c => c.required && c.status !== 'success')
+        .map(c => c.id);
+      taskError = `Task verification failed: ${failedCmds.join(', ')}`;
+      await appendLog(artifactStore, runId, taskIndexDisplay, 'VERIFYING', `task ${task.id} verification`, 'FAIL', failedCmds.join(', '));
+      if (attempt < maxIterations) continue;
+      break;
+    }
+
+    await appendLog(artifactStore, runId, taskIndexDisplay, 'VERIFYING', `task ${task.id} verification`, 'PASS');
+    taskPassed = true;
+    taskError = null;
+    break;
+  } // end per-task attempt loop
+
+  return { passed: taskPassed, error: taskError };
 }
 
 /**
@@ -160,209 +460,38 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} start`, 'PASS', `Task ${taskIndexDisplay} of ${ordered.length}: ${task.title}`);
     await emitProgress({ projectRoot, stateStore, lastEvent: `Task ${taskIndexDisplay}/${ordered.length}: ${task.title}`, registry: orchestratorRegistry });
 
-    // Normalize task verification commands
-    const taskVerificationCommands = normalizeGoalCommands(task.verification_commands);
+    // ── Phase 8D P5 Round 2C: delegate the per-task attempt loop to the
+    // serial helper. The outer loop retains task ordering, current_task_index,
+    // task-result persistence, BLOCKED transitions, integration verification,
+    // audit, and finalization.
+    const taskExecution = await runTaskGraphTaskSerial({
+      projectRoot,
+      agentDir,
+      runId,
+      stateStore,
+      artifactStore,
+      orchestratorRegistry,
+      config,
+      currentBranch,
+      baseCommit,
+      taskGraph,
+      task,
+      taskIndex: i,
+      taskTotal: ordered.length,
+      tgState,
+      maxIterations,
+      combinedSignal,
+      goalPath,
+      handoffPath,
+      goalSuccessCriteria,
+    });
 
-    // ── Per-task Developer attempts (rework loop) ──
-    let taskPassed = false;
-    let taskError: string | null = null;
+    if (taskExecution.terminalResult) {
+      return taskExecution.terminalResult;
+    }
 
-    for (let attempt = 1; attempt <= maxIterations; attempt++) {
-      tgState.task_attempts[task.id] = attempt;
-      await stateStore.update(() => ({ task_graph_state: { ...tgState } }));
-
-      await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex: i, taskStatus: attempt > 1 ? 'rework' : 'running', lastEvent: `Task ${taskIndexDisplay} attempt ${attempt}/${maxIterations}: ${task.title}` });
-
-      // Build task-scoped Developer prompt
-      // Phase 8B: Remove stale developer-handoff.md from prior tasks so the
-      // agent-adapter artifact freshness check sees a freshly written file.
-      const handoffFile = join(agentDir, 'developer-handoff.md');
-      if (existsSync(handoffFile)) {
-        try { unlinkSync(handoffFile); } catch { /* best effort */ }
-      }
-
-      // Snapshot protected paths + plan/GOAL digests BEFORE creating the prompt
-      // file, so the prompt file (written to .agent/debug/) is not in the
-      // snapshot and its later deletion is not flagged as tampering.
-      const preDevSystemPaths = snapshotSystemPaths(agentDir);
-      const preDevGoalDigest = computeDigest(readFileSync(goalPath, 'utf8'));
-      // Phase 8B: snapshot workspace files for a task-scoped diff after Developer.
-      const preTaskWorkspace = snapshotWorkspaceFiles(projectRoot);
-
-      let developerPrompt: string;
-      let developerPromptFile: string | undefined;
-      try {
-        developerPrompt = buildTaskDeveloperPrompt({
-          run_id: runId,
-          project_root: projectRoot,
-          task_index: taskIndexDisplay,
-          task_total: ordered.length,
-          task_id: task.id,
-          task_title: task.title,
-          task_description: task.description,
-          allowed_changes: task.allowed_changes,
-          disallowed_changes: task.disallowed_changes,
-          verification_commands: task.verification_commands,
-          goal_success_criteria: goalSuccessCriteria,
-          goal_path: goalPath,
-          handoff_path: handoffPath,
-        });
-        developerPromptFile = await writePromptFile(agentDir, developerPrompt, runId, `task-${task.id}-attempt-${attempt}`);
-      } catch (err) {
-        taskError = `Prompt build failed: ${err instanceof Error ? err.message : String(err)}`;
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} prompt`, 'FAIL', taskError);
-        break;
-      }
-
-      let developerResult;
-      let developerCleanupResult: PromptCleanupResult | undefined;
-      try {
-        await emitProgress({ projectRoot, stateStore, lastEvent: `Running Developer for task ${taskIndexDisplay} (attempt ${attempt})`, registry: orchestratorRegistry });
-
-        const developerInput = buildDeveloperInput({
-          run_id: runId,
-          iteration: taskIndexDisplay,
-          // F-8D-T-001 fix: pass attempt so retry log files don't collide
-          // with the previous attempt's log files (which would otherwise
-          // trip verifySystemProtectedPaths' digest_mismatch check).
-          attempt,
-          project_root: projectRoot,
-          command_template: resolveCommandForAgent(config.agents.developer.command, config.agents.developer.provider, config),
-          timeout_seconds: config.agents.developer.timeout_seconds,
-          prompt: developerPrompt,
-          prompt_file: developerPromptFile,
-          signal: combinedSignal,
-        });
-
-        developerResult = await runAgent(developerInput, projectRoot);
-      } finally {
-        if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
-      }
-
-      if (developerResult) {
-        emitTranscript({ projectRoot, role: 'developer', iteration: taskIndexDisplay, runId, startedAt: new Date().toISOString(), result: developerResult, registry: orchestratorRegistry });
-      }
-      registerAgentLogs(developerResult, orchestratorRegistry);
-
-      if (developerCleanupResult && !developerCleanupResult.success) {
-        taskError = `Prompt cleanup failed: ${developerCleanupResult.error}`;
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} cleanup`, 'FAIL', taskError);
-        break;
-      }
-
-      if (developerResult.status === 'cancelled') {
-        await stateStore.transition(PhaseEnum.CANCELLED);
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} developer`, 'CANCELLED', developerResult.error?.message);
-        return makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled by user request', `Developer cancelled on task ${task.id}`, developerResult.error);
-      }
-
-      if (developerResult.status !== 'success') {
-        taskError = `Developer failed: ${developerResult.error?.message ?? 'unknown'}`;
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} developer attempt ${attempt}`, 'FAIL', taskError);
-        if (attempt < maxIterations) continue;
-        break;
-      }
-
-      // Verify system-protected paths unchanged
-      const registryVerification = await verifySystemProtectedPaths(projectRoot, orchestratorRegistry, preDevSystemPaths);
-      if (!registryVerification.valid) {
-        const violationMsgs = registryVerification.violations.map(v => v.message).join('; ');
-        taskError = `Developer tampered with system-protected paths: ${violationMsgs}`;
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} system path integrity`, 'FAIL', violationMsgs);
-        if (attempt < maxIterations) continue;
-        break;
-      }
-
-      // Validate Developer handoff
-      const developerValidation = validateDeveloperOutput(projectRoot, runId, taskIndexDisplay, null, preDevGoalDigest);
-      if (!developerValidation.valid) {
-        taskError = `Developer output invalid: ${developerValidation.errors.join('; ')}`;
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} handoff`, 'FAIL', developerValidation.errors.join('; '));
-        if (attempt < maxIterations) continue;
-        break;
-      }
-      if (developerValidation.isBlocked) {
-        taskError = 'Developer reported BLOCKED';
-        await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} handoff`, 'BLOCKED', 'Developer reported BLOCKED');
-        break;
-      }
-
-      // Phase 10: dispatch ReviewLoopRequest feedback blocks from developer-handoff.md (best-effort).
-      await dispatchFeedbackBlocks({
-        projectRoot, runId, role: 'developer',
-        artifactPath: join(projectRoot, '.agent/developer-handoff.md'),
-        config: config.feedback_protocol,
-        registry: orchestratorRegistry,
-      }).catch(() => { /* failure-safe */ });
-
-      // ── Per-task scope guard (enforces task.allowed_changes) ──
-      // Collect full diff for evidence/metadata, but scope-check ONLY the files
-      // this Developer run changed (task-scoped), so prior tasks' files — which
-      // legitimately fall outside this task's allowed_changes — are not flagged.
-      const diffResult = await collectDiff({ projectRoot, baseCommit, iteration: taskIndexDisplay });
-      await writeDiffArtifacts(projectRoot, taskIndexDisplay, diffResult);
-      const taskChangedFiles = buildTaskChangedFiles(projectRoot, preTaskWorkspace);
-      registerDirectoryFiles(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`), orchestratorRegistry);
-
-      const orchestratorOwnedFiles = orchestratorRegistry.getRelativePaths(projectRoot);
-      const scopeResult = checkScope({
-        allowedChanges: task.allowed_changes,
-        disallowedChanges: task.disallowed_changes,
-        changedFiles: taskChangedFiles,
-        orchestratorOwnedFiles,
-      });
-      await writeScopeReport(projectRoot, taskIndexDisplay, scopeResult.report);
-      if (existsSync(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`, 'scope-report.json'))) {
-        orchestratorRegistry.register(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`, 'scope-report.json'), computeDigest(readFileSync(join(agentDir, 'evidence', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`, 'scope-report.json'), 'utf8')));
-      }
-
-      if (!scopeResult.passed) {
-        const deniedPaths = scopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ');
-        taskError = `Scope violation: ${deniedPaths}`;
-        await appendLog(artifactStore, runId, i + 1, 'VERIFYING', `task ${task.id} scope`, 'FAIL', deniedPaths);
-        if (attempt < maxIterations) continue;
-        break;
-      }
-      await appendLog(artifactStore, runId, i + 1, 'VERIFYING', `task ${task.id} scope`, 'PASS');
-
-      // ── Per-task verification ──
-      if (combinedSignal.aborted) {
-        await stateStore.transition(PhaseEnum.CANCELLED);
-        return makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled', 'Verification cancelled by abort signal', null);
-      }
-
-      const verificationResult = await runVerification({
-        commands: taskVerificationCommands,
-        projectRoot,
-        runId,
-        iteration: taskIndexDisplay,
-        signal: combinedSignal,
-      });
-      registerDirectoryFiles(join(agentDir, 'verification', `iteration-${String(taskIndexDisplay).padStart(2, '0')}`), orchestratorRegistry);
-      const taskManifestPath = join(agentDir, 'verification', 'manifest.json');
-      if (existsSync(taskManifestPath)) {
-        orchestratorRegistry.register(taskManifestPath, computeDigest(readFileSync(taskManifestPath, 'utf8')));
-      }
-
-      const requiredPassed = verificationResult.manifest.commands
-        .filter(c => c.required)
-        .every(c => c.status === 'success');
-
-      if (!requiredPassed || !verificationResult.passed) {
-        const failedCmds = verificationResult.manifest.commands
-          .filter(c => c.required && c.status !== 'success')
-          .map(c => c.id);
-        taskError = `Task verification failed: ${failedCmds.join(', ')}`;
-        await appendLog(artifactStore, runId, i + 1, 'VERIFYING', `task ${task.id} verification`, 'FAIL', failedCmds.join(', '));
-        if (attempt < maxIterations) continue;
-        break;
-      }
-
-      await appendLog(artifactStore, runId, i + 1, 'VERIFYING', `task ${task.id} verification`, 'PASS');
-      taskPassed = true;
-      taskError = null;
-      break;
-    } // end per-task attempt loop
+    const taskPassed = taskExecution.passed;
+    const taskError = taskExecution.error;
 
     // Record task result
     const now = new Date().toISOString();

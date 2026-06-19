@@ -1,23 +1,21 @@
 ---
 schema_version: 1
-run_id: "20260619121841-cwn99t"
-goal_id: "phase-8d-p5-round2b-parallel-opt-in-guard"
-title: "Phase 8D P5 Round 2B Parallel Opt-In Guard"
+run_id: "20260619132548-t8fsjx"
+goal_id: "phase-8d-p5-round2c-task-runner-extraction"
+title: "Phase 8D P5 Round 2C Task Runner Extraction"
 allowed_changes:
-  - "src/scheduler/parallel-execution.ts"
-  - "src/cli/start.ts"
-  - "src/orchestrator/run-orchestrator.ts"
-  - "tests/unit/parallel-execution.test.ts"
-  - "tests/integration/no-commit-bypass.test.ts"
+  - "src/**"
+  - "tests/**"
 disallowed_changes:
   - ".git/**"
   - ".agent/state.json"
   - ".agent/GOAL.md"
   - ".agent/audit-report.md"
   - ".agent/final-audit.md"
-  - "src/orchestrator/task-graph-loop.ts"
-  - ".agent/task-runs/**"
+  - "src/orchestrator/run-orchestrator.ts"
+  - "src/cli/start.ts"
   - "prompts/**"
+  - ".agent/task-runs/**"
 verification_commands:
   - id: "unit-tests"
     command: ["npm", "test"]
@@ -46,46 +44,45 @@ verification_commands:
     timeout_seconds: 120
 ---
 
-# Phase 8D P5 Round 2B Parallel Opt-In Guard
+# Phase 8D P5 Round 2C Task Runner Extraction
 
 ## Objective
 
-Implement Phase 8D P5 Round 2B only: add an explicit parallel opt-in resolver, CLI plumbing for `--parallel` and `--max-parallel-workers`, and a fail-closed orchestrator guard for requested wave mode. Follow `docs/superpowers/plans/2026-06-19-phase-8d-p5-round2b-parallel-opt-in-seam.md` as the implementation guide.
+Implement Phase 8D P5 Round 2C only: extract the existing serial per-task Developer/verification attempt loop from `runTaskGraphLoop` into an exported helper named `runTaskGraphTaskSerial` in `src/orchestrator/task-graph-loop.ts`, while preserving all current task graph behavior. Follow `docs/superpowers/plans/2026-06-19-phase-8d-p5-round2c-task-runner-extraction.md` as the implementation guide.
 
 ## Success Criteria
 
-1. `src/scheduler/parallel-execution.ts` exists and exports a pure resolver API for deciding between `serial` and `wave` mode from `ReviewLoopConfig.parallel` plus CLI overrides.
-2. The resolver validates worker counts as integers from 1 to 16 and throws `ParallelExecutionConfigError` for invalid counts.
-3. Default config with no CLI flags resolves to disabled serial mode and preserves existing orchestrator behavior.
-4. `max_parallel_workers` alone does not enable parallelism when config `parallel.enabled` is false or absent.
-5. `--max-parallel-workers` alone does not enable parallelism when `--parallel` is not passed and config parallel is not enabled.
-6. `--parallel` or `config.parallel.enabled: true` is required for explicit parallel opt-in.
-7. Explicit opt-in with a resolved worker count of 1 resolves to serial mode, not wave mode.
-8. Explicit opt-in with a resolved worker count greater than 1 resolves to wave mode.
-9. `src/cli/start.ts` parses `--parallel` and `--max-parallel-workers <n>`, exposes them on `StartOptions`, validates invalid CLI worker counts before orchestrator work, and passes valid overrides to `runOrchestrator`.
-10. `tests/integration/no-commit-bypass.test.ts` extends existing Commander parsing coverage to assert the new flags parse as `parallel === true` and `maxParallelWorkers === 3`.
-11. `src/orchestrator/run-orchestrator.ts` accepts optional CLI overrides, resolves the parallel decision after `loadConfigWithDefaults(...)`, converts resolver config errors into clear `CONFIG_ERROR` blocked results, and blocks `decision.mode === 'wave'` with a clear message stating that worktree-backed wave execution is not wired until Phase 8D P5 Round 2C.
-12. `runOrchestrator` does not call `runWaveExecutorCore` and does not silently fall back to serial when real wave mode is requested.
-13. No changes are made to `src/orchestrator/task-graph-loop.ts`, prompts, worktree creation, resume behavior, `.agent/task-runs`, or parallel Developer/Auditor execution.
-14. Required gates pass: `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, and `git diff --check`.
+1. `src/orchestrator/task-graph-loop.ts` exports `RunTaskGraphTaskSerialParams`, `RunTaskGraphTaskSerialResult`, and `runTaskGraphTaskSerial`.
+2. `runTaskGraphTaskSerial` contains the serial per-task Developer/verification attempt loop that was previously inline in `runTaskGraphLoop`.
+3. `runTaskGraphLoop` calls `runTaskGraphTaskSerial` and no longer contains the `for (let attempt = 1; attempt <= maxIterations; attempt++)` loop.
+4. `runTaskGraphLoop` remains responsible for task ordering, `current_task_index`, task status writes, task-result persistence, BLOCKED transition, final integration verification, audit, and finalization.
+5. Existing serial behavior is preserved, including Developer retries, prompt cleanup handling, system protected path verification, Developer handoff validation, feedback block dispatch, task-scoped scope guard, per-task verification, cancellation handling, and artifact registration.
+6. `tests/unit/task-graph-loop-structure.test.ts` exists and verifies that `runTaskGraphTaskSerial` is exported and owns the per-task attempt loop.
+7. `tests/integration/task-graph.test.ts` is modified only to strengthen the existing passing fake-agent task graph assertions.
+8. In the passing fake-agent task graph integration test, task result order remains `task-1`, `task-2`, `task-3`, attempts remain `[1, 1, 1]`, and every result has `verification_passed === true`.
+9. `src/orchestrator/run-orchestrator.ts` is not modified and does not call `runWaveExecutorCore`.
+10. `src/cli/start.ts` is not modified.
+11. No worktrees, parallel Developer/Auditor execution, resume behavior, `.agent/task-runs`, prompt changes, or `current_task_index` semantic changes are introduced.
+12. Targeted regression tests pass: `npm test -- tests/unit/task-graph-loop-structure.test.ts`, `npm test -- tests/integration/task-graph.test.ts`, and `npm test -- tests/unit/wave-executor.test.ts tests/unit/parallel-execution.test.ts`.
+13. Required gates pass: `npm run typecheck`, `npm run lint`, `npm run build`, `npm test`, and `git diff --check`.
 
 ## Non-Goals
 
-- Do not implement real worktree-backed wave execution.
-- Do not call `runWaveExecutorCore` from `run-orchestrator.ts`.
+- Do not wire `runWaveExecutorCore` into the orchestrator.
+- Do not modify `src/orchestrator/run-orchestrator.ts`.
+- Do not modify `src/cli/start.ts`.
 - Do not create worktrees.
 - Do not run Developer or Auditor agents in parallel.
 - Do not add resume behavior.
-- Do not create or use `.agent/task-runs`.
+- Do not add or use `.agent/task-runs`.
 - Do not change prompts.
-- Do not modify `src/orchestrator/task-graph-loop.ts`.
-- Do not modify files outside the allowed implementation and test files listed in front matter.
+- Do not change `current_task_index` semantics.
+- Do not perform unrelated refactors outside the extraction needed for this round.
 
 ## Constraints
 
-- Keep changes tightly scoped to the five allowed files.
-- Preserve default serial behavior when no explicit parallel opt-in is provided.
-- Treat worker-count-only settings as sizing data, not an opt-in signal.
-- Fail closed for requested `wave` mode until Phase 8D P5 Round 2C wires actual worktree-backed execution.
-- Use existing project style, TypeScript ESM imports, Commander conventions, and Vitest test patterns.
-- Do not perform git commits, tags, pushes, destructive git operations, or broad refactors.
+- Keep implementation changes tightly scoped to `src/orchestrator/task-graph-loop.ts`.
+- Keep test changes scoped to `tests/unit/task-graph-loop-structure.test.ts` and the existing passing serial assertions in `tests/integration/task-graph.test.ts`.
+- Preserve the Round 2B fail-closed wave guard and confirm `run-orchestrator.ts` has no `runWaveExecutorCore` usage.
+- Preserve existing TypeScript ESM style, Vitest patterns, and local orchestrator helper APIs.
+- Do not perform git commits, tags, pushes, destructive git commands, worktree creation, or broad formatting churn.

@@ -1,101 +1,53 @@
 ---
 schema_version: 1
-run_id: "20260619121841-cwn99t"
-iteration: 4
+run_id: "20260619132548-t8fsjx"
+iteration: 3
 author_role: "developer"
 status: "COMPLETED"
 ---
 
-# Developer Handoff — Task 4 of 4: Verify scope and gates
+# Developer Handoff — Task 3 of 3 (Round 2C regression gates)
 
 ## Summary
 
-Ran the final scope review and all required engineering gates against the
-Phase 8D P5 Round 2B working tree. All gates pass on the existing
-implementation; no code fixes were required.
+Task `task-3` (Run regression gates) verified the complete Round 2C
+change set without modifying source code beyond what was already in
+place from tasks 1 and 2. All 9 required verification commands ran and
+passed.
 
-## Scope review
+## Files touched
 
-Tracked changes (relative to `main`) are confined to the allowed paths:
+None modified by this task. The Round 2C changeset under verification
+was already present on the branch:
 
-- `src/cli/start.ts` — adds `--parallel` / `--max-parallel-workers <n>` CLI
-  parsing, validates worker counts, and forwards overrides to
-  `runOrchestrator`.
-- `src/orchestrator/run-orchestrator.ts` — accepts the new optional CLI
-  overrides, resolves the parallel decision after `loadConfigWithDefaults(...)`,
-  converts `ParallelExecutionConfigError` into a clear `CONFIG_ERROR` blocked
-  result, and blocks `decision.mode === 'wave'` with a message stating
-  worktree-backed wave execution is not wired until Phase 8D P5 Round 2C.
-- `tests/integration/no-commit-bypass.test.ts` — extends Commander parsing
-  coverage for the new flags (`parallel === true`, `maxParallelWorkers === 3`).
-
-Untracked additions are also in scope:
-
-- `src/scheduler/parallel-execution.ts` — pure resolver API
-  (`resolveParallelExecution`) that decides between `serial` and `wave` mode
-  from `ReviewLoopConfig.parallel` plus CLI overrides, validating worker counts
-  as integers in `[1, 16]` and throwing `ParallelExecutionConfigError` for
-  invalid counts.
-- `tests/unit/parallel-execution.test.ts` — unit tests covering the resolver
-  matrix from the GOAL (defaults, CLI-only flags, opt-in with worker count 1
-  vs >1, validation errors).
-
-No changes were made to disallowed paths (`src/orchestrator/task-graph-loop.ts`,
-`prompts/**`, `.agent/state.json`, `.agent/GOAL.md`, `.agent/audit-report.md`,
-`.agent/final-audit.md`, `.agent/task-runs/**`, or `.git/**`). Pre-existing
-orchestrator-owned modifications on the branch (`.agent/GOAL.md`,
-`.agent/plan.md`, `.agent/task-graph.json`, `.agent/task-results.json`,
-`.agent/developer-handoff.md`) come from earlier tasks/orchestrator activity in
-this run and were not touched by this task.
-
-## GOAL criteria verification
-
-Cross-checked against the 14 GOAL success criteria:
-
-1. ✅ `src/scheduler/parallel-execution.ts` exists and exports the resolver API.
-2. ✅ Resolver validates worker counts as integers in `[1, 16]` and throws
-   `ParallelExecutionConfigError` for invalid values.
-3. ✅ Default config + no CLI flags → `enabled: false`, `mode: 'serial'`.
-4. ✅ `max_parallel_workers` alone (config) does not enable parallelism when
-   `parallel.enabled` is false/absent.
-5. ✅ `--max-parallel-workers` alone (CLI) does not enable parallelism without
-   `--parallel` or config opt-in.
-6. ✅ `--parallel` or `config.parallel.enabled: true` is required for explicit
-   opt-in.
-7. ✅ Explicit opt-in with worker count of 1 → `mode: 'serial'`.
-8. ✅ Explicit opt-in with worker count > 1 → `mode: 'wave'`.
-9. ✅ `src/cli/start.ts` parses the new flags, exposes them on
-   `StartOptions`, validates invalid worker counts before orchestrator work, and
-   passes valid overrides to `runOrchestrator`.
-10. ✅ `tests/integration/no-commit-bypass.test.ts` covers the new Commander
-    flags (`parallel === true`, `maxParallelWorkers === 3`).
-11. ✅ `runOrchestrator` accepts CLI overrides, resolves the parallel decision
-    after `loadConfigWithDefaults(...)`, converts resolver errors into
-    `CONFIG_ERROR` blocked results, and blocks `decision.mode === 'wave'` with
-    a Round 2C message.
-12. ✅ `runOrchestrator` does not call `runWaveExecutorCore` and does not
-    silently fall back to serial when wave mode is requested.
-13. ✅ No changes to `src/orchestrator/task-graph-loop.ts`, prompts, worktree
-    creation, resume behavior, `.agent/task-runs`, or parallel
-    Developer/Auditor execution.
-14. ✅ Required gates pass (see below).
+- `src/orchestrator/task-graph-loop.ts` — `runTaskGraphTaskSerial`
+  extraction (from task 1)
+- `tests/unit/task-graph-loop-structure.test.ts` — structure assertions
+  for the new export (from task 1)
+- `tests/integration/task-graph.test.ts` — strengthened fake-agent
+  task-graph assertions (from task 2)
 
 ## Verification results
 
-All required gates pass:
+All required commands passed:
 
-| Gate | Command | Result |
+| id | command | result |
 | --- | --- | --- |
-| `typecheck` | `npm run typecheck` | ✅ pass (no output, exit 0) |
-| `lint` | `npm run lint` | ✅ pass (no warnings) |
-| `build` | `npm run build` | ✅ pass |
-| `unit-tests` | `npm test` | ✅ pass — 63 files, 962 tests |
-| `diff-check` | `git diff --check` | ✅ pass (exit 0, no whitespace issues) |
+| `task-3-structure-test` | `npm test -- tests/unit/task-graph-loop-structure.test.ts` | ✅ 1 file, 2 tests passed (294ms) |
+| `task-3-task-graph-integration` | `npm test -- tests/integration/task-graph.test.ts` | ✅ 1 file, 4 tests passed (4.74s) |
+| `task-3-related-p5-tests` | `npm test -- tests/unit/wave-executor.test.ts tests/unit/parallel-execution.test.ts` | ✅ 2 files, 39 tests passed (342ms) |
+| `task-3-typecheck` | `npm run typecheck` | ✅ tsc --noEmit clean |
+| `task-3-lint` | `npm run lint` | ✅ eslint src/ --max-warnings=0 clean |
+| `task-3-build` | `npm run build` | ✅ tsc clean |
+| `task-3-full-tests` | `npm test` | ✅ 64 files, 964 tests passed (75.02s) |
+| `task-3-diff-check` | `git diff --check` | ✅ no whitespace errors |
+| `task-3-no-wave-call` | `sh -c '! rg -n "runWaveExecutorCore" src/orchestrator/run-orchestrator.ts'` | ✅ no matches (guard holds) |
 
-No narrowly scoped fixes were needed; the prior tasks' implementation already
-satisfies every GOAL criterion and every gate.
+## Notes
 
-## Status
-
-COMPLETED — Phase 8D P5 Round 2B parallel opt-in seam is fully implemented,
-scoped, and verified. Ready for the auditor.
+- `src/orchestrator/run-orchestrator.ts` and `src/cli/start.ts` were
+  not modified during this run (confirmed via `git status`).
+- No worktree, parallel Developer/Auditor, resume, `.agent/task-runs`,
+  or prompt changes were introduced.
+- The full vitest run reported 964/964 tests green across 64 files,
+  confirming the Round 2C extraction preserves serial behavior.

@@ -130,6 +130,12 @@ describe('Phase 8B: Task Graph sequential execution', () => {
     const tr = JSON.parse(readFileSync(trPath, 'utf8'));
     expect(tr.results).toHaveLength(3);
     expect(tr.results.every((r: { status: string }) => r.status === 'passed')).toBe(true);
+    // Task results must be in topological order: task-1, task-2, task-3.
+    expect(tr.results.map((r: { task_id: string }) => r.task_id)).toEqual(['task-1', 'task-2', 'task-3']);
+    // Each task should pass on the first attempt with the success behavior.
+    expect(tr.results.map((r: { attempts: number }) => r.attempts)).toEqual([1, 1, 1]);
+    // Per-task verification must pass for every task.
+    expect(tr.results.every((r: { verification_passed: boolean }) => r.verification_passed === true)).toBe(true);
 
     // Per-task source files created within each task's allowed scope
     expect(existsSync(join(repoDir, 'src', 'part-a', 'impl.ts'))).toBe(true);
