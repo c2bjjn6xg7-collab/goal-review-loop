@@ -194,6 +194,59 @@ describe('Lock Manager', () => {
     });
   });
 
+  describe('lockName option', () => {
+    it('should default to run.lock when lockName is not provided', async () => {
+      const lm = new LockManager(agentDir);
+      await lm.acquire('run-001');
+      expect(await fs.pathExists(path.join(agentDir, 'run.lock'))).toBe(true);
+    });
+
+    it('should default to run.lock when an empty options object is provided', async () => {
+      const lm = new LockManager(agentDir, {});
+      await lm.acquire('run-001');
+      expect(await fs.pathExists(path.join(agentDir, 'run.lock'))).toBe(true);
+    });
+
+    it('should use the provided lockName instead of run.lock', async () => {
+      const lm = new LockManager(agentDir, { lockName: 'scheduler.lock' });
+      await lm.acquire('run-001');
+      expect(await fs.pathExists(path.join(agentDir, 'scheduler.lock'))).toBe(true);
+      expect(await fs.pathExists(path.join(agentDir, 'run.lock'))).toBe(false);
+    });
+
+    it('should allow two different lock names in the same agentDir to be acquired independently', async () => {
+      const a = new LockManager(agentDir, { lockName: 'a.lock' });
+      const b = new LockManager(agentDir, { lockName: 'b.lock' });
+
+      await a.acquire('run-a');
+      await b.acquire('run-b');
+
+      expect(await a.isLocked()).toBe(true);
+      expect(await b.isLocked()).toBe(true);
+
+      await a.release('run-a');
+      await b.release('run-b');
+    });
+
+    it('should still contend when two managers use the same lockName', async () => {
+      const first = new LockManager(agentDir, { lockName: 'shared.lock' });
+      const second = new LockManager(agentDir, { lockName: 'shared.lock' });
+
+      await first.acquire('run-001');
+      await expect(second.acquire('run-002')).rejects.toThrow(LockManagerError);
+      await expect(second.acquire('run-002')).rejects.toThrow('Another run is active');
+    });
+
+    it('should not contend with the default run.lock when using a custom lockName', async () => {
+      const defaultLm = new LockManager(agentDir);
+      const customLm = new LockManager(agentDir, { lockName: 'scheduler.lock' });
+
+      await defaultLm.acquire('run-default');
+      // Custom-named manager must not see the default lock as contention.
+      await expect(customLm.acquire('run-custom')).resolves.toBeUndefined();
+    });
+  });
+
   describe('isLocked', () => {
     it('should return false when no lock exists', async () => {
       expect(await lockManager.isLocked()).toBe(false);

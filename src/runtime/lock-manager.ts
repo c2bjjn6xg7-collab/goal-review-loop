@@ -20,11 +20,20 @@ export class LockManagerError extends Error {
   }
 }
 
+export interface LockManagerOptions {
+  /**
+   * Optional alternate lock file name (e.g. "scheduler.lock").
+   * When omitted, defaults to "run.lock" — byte-identical to the legacy behavior.
+   */
+  lockName?: string;
+}
+
 export class LockManager {
   private readonly lockPath: string;
 
-  constructor(agentDir: string) {
-    this.lockPath = path.join(agentDir, 'run.lock');
+  constructor(agentDir: string, options: LockManagerOptions = {}) {
+    const lockName = options.lockName ?? 'run.lock';
+    this.lockPath = path.join(agentDir, lockName);
   }
 
   /**

@@ -109,7 +109,10 @@ export async function executeStart(options: StartOptions): Promise<OrchestratorR
       task_slug: options.taskSlug,
       max_iterations: options.maxIterations,
       config_path: options.config,
-      no_commit: options.noCommit,
+      // Commander maps `--no-commit` to `options.commit = false` (default `true`).
+      // Reading `options.noCommit` would always be `undefined` and silently fall
+      // back to the config default, so the flag would never take effect.
+      no_commit: options.commit === false,
       tag: options.tag ?? false,
     });
 
@@ -154,7 +157,8 @@ export interface StartOptions {
   taskSlug?: string;
   maxIterations?: number;
   config?: string;
-  noCommit?: boolean;
+  /** Commander `--no-commit` populates this as `false`; default is `true`. */
+  commit?: boolean;
   tag?: boolean;
   watch?: boolean;
   watchInterval?: number;

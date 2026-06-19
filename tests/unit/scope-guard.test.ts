@@ -494,4 +494,60 @@ describe('Phase 8B: per-task scope guard', () => {
     expect(result.passed).toBe(false);
     expect(result.report.denied.some((d) => d.path === 'src/module-a/foo.ts')).toBe(true);
   });
+
+  // Phase 8D pre-flight: agent worktree paths are system-protected so a worker
+  // in worktree A cannot reach into worktree B even with a permissive
+  // allowed_changes glob.
+  describe('agent worktree path protection', () => {
+    it('denies changes under another task worktree as system_protected even when allowed_changes lists that path', () => {
+      const changedFiles = createChangedFiles([
+        { path: '.agent/worktrees/other-task/src/foo.ts', status: 'modified' },
+      ]);
+      const result = checkScope({
+        allowedChanges: ['.agent/worktrees/other-task/**'],
+        disallowedChanges: [],
+        changedFiles,
+        orchestratorOwnedFiles: [],
+      });
+
+      expect(result.passed).toBe(false);
+      expect(result.report.denied).toHaveLength(1);
+      expect(result.report.denied[0].path).toBe('.agent/worktrees/other-task/src/foo.ts');
+      expect(result.report.denied[0].reason).toBe('system_protected');
+      expect(result.report.allowed).not.toContain('.agent/worktrees/other-task/src/foo.ts');
+    });
+
+    it('denies changes under another task worktree even with broad ** allowed_changes', () => {
+      const changedFiles = createChangedFiles([
+        { path: '.agent/worktrees/task-b/src/bar.ts', status: 'modified' },
+      ]);
+      const result = checkScope({
+        allowedChanges: ['**'],
+        disallowedChanges: [],
+        changedFiles,
+        orchestratorOwnedFiles: [],
+      });
+
+      expect(result.passed).toBe(false);
+      expect(result.report.denied).toHaveLength(1);
+      expect(result.report.denied[0].reason).toBe('system_protected');
+    });
+
+    it('allows orchestrator-owned worktree files when listed in orchestratorOwnedFiles', () => {
+      const changedFiles = createChangedFiles([
+        { path: '.agent/worktrees/task-a/notes.md', status: 'modified' },
+      ]);
+      const result = checkScope({
+        allowedChanges: ['**'],
+        disallowedChanges: [],
+        changedFiles,
+        orchestratorOwnedFiles: ['.agent/worktrees/task-a/notes.md'],
+      });
+
+      expect(result.passed).toBe(true);
+      expect(result.report.excluded_orchestrator_owned).toContain(
+        '.agent/worktrees/task-a/notes.md',
+      );
+    });
+  });
 });
