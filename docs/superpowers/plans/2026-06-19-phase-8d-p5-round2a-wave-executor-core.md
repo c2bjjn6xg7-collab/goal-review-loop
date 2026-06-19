@@ -444,7 +444,7 @@ for (let waveIndex = 0; waveIndex < plan.waves.length; waveIndex++) {
     const batch = wave.slice(batchStart, batchStart + params.maxParallelWorkers);
     emit({ type: 'batch-start', waveIndex, batchIndex, taskIds: [...batch] });
 
-    const batchResults = await Promise.all(batch.map(async (taskId, taskIndexInBatch) => {
+    await Promise.all(batch.map(async (taskId, taskIndexInBatch) => {
       const task = byId.get(taskId);
       if (!task) {
         throw new WaveExecutorError(`Wave plan referenced unknown task "${taskId}"`, 'invalid-runner-result');
@@ -457,10 +457,10 @@ for (let waveIndex = 0; waveIndex < plan.waves.length; waveIndex++) {
         maxParallelWorkers: params.maxParallelWorkers,
       });
       emit({ type: 'task-finish', waveIndex, batchIndex, taskId, status: result.status, error: result.error });
+      results.push(result);
       return result;
     }));
 
-    results.push(...batchResults);
     emit({ type: 'batch-finish', waveIndex, batchIndex, taskIds: [...batch] });
   }
 
