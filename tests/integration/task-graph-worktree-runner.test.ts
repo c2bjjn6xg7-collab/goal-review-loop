@@ -77,7 +77,7 @@ ${goalDigestSeed}
 `;
 }
 
-function makeConfig(): ReviewLoopConfig {
+function makeConfig(developerBehavior: string = 'task-success'): ReviewLoopConfig {
   const fakeAgentPath = path.resolve(process.cwd(), 'tests', 'fixtures', 'fake-agent.mjs');
   return {
     ...DEFAULT_CONFIG,
@@ -98,7 +98,7 @@ function makeConfig(): ReviewLoopConfig {
           '--prompt-file',
           '{prompt_file}',
           '--behavior',
-          'task-success',
+          developerBehavior,
         ],
         timeout_seconds: 60,
       },
@@ -231,6 +231,52 @@ describe('runTaskInWorktree', () => {
     const committedPaths = git(fixture.repoDir, ['show', '--name-only', '--format=', result.finalCommitSha ?? '']);
     expect(committedPaths.split(/\r?\n/).filter(Boolean)).toEqual(['src/part-a/impl.ts']);
 
+    expect(git(fixture.repoDir, ['status', '--short', '--untracked-files=all'])).toBe('');
+  }, 120000);
+
+  it('records a failed result without committing when the developer violates scope', async () => {
+    const fixture = createTestRepo();
+    repoDir = fixture.repoDir;
+
+    const result = await runTaskInWorktree({
+      projectRoot: fixture.repoDir,
+      runId: RUN_ID,
+      taskGraph: fixture.taskGraph,
+      task: fixture.task,
+      config: makeConfig('scope-violation'),
+      baseCommit: fixture.baseCommit,
+      maxIterations: 1,
+      taskIndex: 0,
+      taskTotal: 1,
+      slug: 'part-a',
+    });
+
+    // Criterion 2: failed status with a non-empty error.
+    expect(result.taskId).toBe(TASK_ID);
+    expect(result.status).toBe('failed');
+    expect(typeof result.error).toBe('string');
+    expect(result.error?.length ?? 0).toBeGreaterThan(0);
+    expect(result.finalCommitSha).toBeNull();
+
+    // Criterion 3: main task-run result exists with the expected fields.
+    const stored = await readTaskRunResult(fixture.repoDir, RUN_ID, TASK_ID);
+    expect(stored.found).toBe(true);
+    if (stored.found) {
+      expect(stored.result.run_id).toBe(RUN_ID);
+      expect(stored.result.task_id).toBe(TASK_ID);
+      expect(stored.result.status).toBe('failed');
+      expect(stored.result.error).toBe(result.error);
+      expect(stored.result.final_commit_sha).toBeNull();
+    }
+
+    // Criterion 4: no new task commit represents the unverified changes.
+    // The task branch was created at the base commit and must not have advanced.
+    expect(git(fixture.repoDir, ['rev-parse', '--verify', result.branch])).toBe(fixture.baseCommit);
+    expect(
+      git(fixture.repoDir, ['rev-list', '--count', `${fixture.baseCommit}..${result.branch}`]),
+    ).toBe('0');
+
+    // Criterion 5: the main worktree stays clean after the failed run.
     expect(git(fixture.repoDir, ['status', '--short', '--untracked-files=all'])).toBe('');
   }, 120000);
 });

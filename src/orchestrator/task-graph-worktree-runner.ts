@@ -298,18 +298,28 @@ async function updateWorkerTaskStatus(
     : status === 'blocked'
       ? TaskStatus.BLOCKED
       : TaskStatus.FAILED;
-  await stateStore.update((state) => {
-    if (!state.task_graph_state) return {};
-    return {
-      task_graph_state: {
-        ...state.task_graph_state,
-        task_statuses: {
-          ...state.task_graph_state.task_statuses,
-          [taskId]: taskStatus,
+  // The worker state.json is worker-local and disposable. A failed or blocked
+  // Developer may have tampered with it (e.g. `scope-violation` overwrites
+  // state.json), which makes the state unreadable. Updating the worker task
+  // status is best-effort: it must never prevent the cross-worktree task-run
+  // result from being written. Swallow read/update failures here so the main
+  // result write always proceeds and the main worktree stays clean.
+  try {
+    await stateStore.update((state) => {
+      if (!state.task_graph_state) return {};
+      return {
+        task_graph_state: {
+          ...state.task_graph_state,
+          task_statuses: {
+            ...state.task_graph_state.task_statuses,
+            [taskId]: taskStatus,
+          },
         },
-      },
-    };
-  });
+      };
+    });
+  } catch {
+    /* worker state unreadable/tampered — best-effort, do not block result write */
+  }
 }
 
 async function commitTaskChanges(
