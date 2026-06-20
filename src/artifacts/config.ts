@@ -221,7 +221,7 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     archive_history: true,
     stop_on_infrastructure_error: true,
     max_consecutive_failures: 3,
-    max_agent_retries: 1,
+    max_agent_retries: 3,
   },
   git: {
     require_repository: true,

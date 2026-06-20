@@ -126,7 +126,7 @@ developer-fail-three-then-success
 
 Behavior:
 
-- Use a sentinel file under `.agent/debug/`, for example `.agent/debug/developer-fail-three-then-success-count`.
+- Use a sentinel file under `/tmp/review-loop-fake-agent-counters/<run_id>/`, for example `/tmp/review-loop-fake-agent-counters/<run_id>/developer-fail-three-then-success-count`. This avoids touching orchestrator-protected `.agent` paths during Developer execution.
 - Increment the count every time this fake Developer behavior is invoked.
 - For counts `1`, `2`, and `3`, exit nonzero to produce `AGENT_ERROR`.
 - On count `4` and later, write a normal completed handoff and a small allowed implementation file, same as the `success` behavior.
@@ -248,4 +248,3 @@ Acceptance:
 - typecheck, lint --max-warnings 0, build, and full test suite pass.
 - Final report explicitly states that no provider/model escalation was implemented.
 ```
-

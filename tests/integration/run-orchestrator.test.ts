@@ -12,6 +12,11 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
 
+function readDeveloperRetryCounter(repoDir: string): string {
+  const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+  return readFileSync(join(tmpdir(), 'review-loop-fake-agent-counters', state.run_id, 'developer-fail-three-then-success-count'), 'utf8');
+}
+
 /** Write review-loop.yaml config that uses the fake agent. */
 function writeFakeAgentConfig(
   repoDir: string,
@@ -309,6 +314,49 @@ describe('Run Orchestrator integration', () => {
     // Breaker did NOT trip: same-iteration maxIterations exhaustion returned first.
     expect(result.error?.code).not.toBe('CONSECUTIVE_FAILURE_LIMIT');
   });
+
+  // ─── Phase 8D P6 Round 3: same-provider Developer retry ───────
+
+  it('R1: retries Developer 3x on AGENT_ERROR then passes with default config', async () => {
+    repoDir = createTestRepo('retry-success', { developer: 'developer-fail-three-then-success' });
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a feature',
+      task_slug: 'retry-success',
+    });
+
+    expect(result.phase).toBe('PASSED');
+    expect(result.exit_code).toBe(0);
+
+    // Default max_agent_retries=3 → 1 initial + 3 retries = 4 invocations,
+    // logging retries 1, 2, and 3.
+    expect(readDeveloperRetryCounter(repoDir)).toBe('4');
+    const logContent = readFileSync(join(repoDir, '.agent', 'iteration-log.md'), 'utf8');
+    expect(logContent).toContain('developer retry 1');
+    expect(logContent).toContain('developer retry 2');
+    expect(logContent).toContain('developer retry 3');
+  }, 180000);
+
+  it('R2: respects max_agent_retries override of 2 and blocks before fourth invocation', async () => {
+    repoDir = createTestRepo('retry-blocked', { developer: 'developer-fail-three-then-success' }, { max_agent_retries: 2 });
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a feature',
+      task_slug: 'retry-blocked',
+    });
+
+    expect(result.phase).toBe('BLOCKED');
+    expect(result.exit_code).toBe(3);
+    expect(result.error?.code).toBe('AGENT_ERROR');
+
+    expect(readDeveloperRetryCounter(repoDir)).toBe('3');
+    const logContent = readFileSync(join(repoDir, '.agent', 'iteration-log.md'), 'utf8');
+    expect(logContent).toContain('developer retry 1');
+    expect(logContent).toContain('developer retry 2');
+    expect(logContent).not.toContain('developer retry 3');
+  }, 180000);
 
   // ─── Scenario 15: Agent exit error → BLOCKED ───────────────
   it('blocks on agent non-zero exit', async () => {

@@ -981,8 +981,11 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       let developerResult;
       let developerCleanupResult: PromptCleanupResult | undefined;
-      const MAX_DEVELOPER_RETRIES = 1;
-      for (let developerAttempt = 0; developerAttempt <= MAX_DEVELOPER_RETRIES; developerAttempt++) {
+      // Phase 8D P6: retry budget comes from config.loop.max_agent_retries.
+      // max_agent_retries = N yields N + 1 total Developer invocations (1 initial + N retries),
+      // all using the same resolved Developer command/provider configuration.
+      const maxDeveloperRetries = config.loop.max_agent_retries;
+      for (let developerAttempt = 0; developerAttempt <= maxDeveloperRetries; developerAttempt++) {
         developerCleanupResult = undefined;
         try {
           // Phase 6 F-604: Emit progress at phase start
@@ -1016,9 +1019,11 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
           if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
         }
 
-        // If Developer failed due to AGENT_ERROR (e.g. API empty response), retry once
-        if (developerResult.status === 'failed' && developerResult.error?.code === 'AGENT_ERROR' && developerAttempt < MAX_DEVELOPER_RETRIES) {
+        // If Developer failed due to AGENT_ERROR (e.g. API empty response), retry up to maxDeveloperRetries times
+        if (developerResult.status === 'failed' && developerResult.error?.code === 'AGENT_ERROR' && developerAttempt < maxDeveloperRetries) {
+          registerAgentLogs(developerResult, orchestratorRegistry);
           await appendLog(artifactStore, runId, iteration, 'DEVELOPING', `developer retry ${developerAttempt + 1}`, 'FAIL', `Developer failed with AGENT_ERROR, retrying: ${developerResult.error?.message ?? 'unknown'}`);
+          refreshSystemPathSnapshot(preDevSystemPaths, join(agentDir, ARTIFACT_FILES.ITERATION_LOG));
           continue;
         }
         break;
@@ -1027,12 +1032,6 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       if (!developerResult) {
         await transitionToBlocked(stateStore, 'Developer produced no result');
         return makeBlockedResult(runId, projectRoot, 'Developer produced no result', 'AGENT_ERROR', currentBranch);
-      }
-
-      // developerResult is always assigned after the retry loop
-      if (!developerResult) {
-        await transitionToBlocked(stateStore, "Developer produced no result");
-        return makeBlockedResult(runId, projectRoot, "Developer produced no result", "AGENT_ERROR", currentBranch);
       }
 
       // Phase 6: Emit developer transcript and progress
@@ -2727,6 +2726,22 @@ export function snapshotSystemPaths(
   }
 
   return paths;
+}
+
+function refreshSystemPathSnapshot(
+  paths: Map<string, { digest: string; mode: number; isSymlink: boolean }>,
+  filePath: string,
+): void {
+  if (!existsSync(filePath)) return;
+  try {
+    const stat = lstatSync(filePath);
+    if (stat.isDirectory()) return;
+    paths.set(filePath, {
+      digest: computeDigest(readFileSync(filePath, 'utf8')),
+      mode: stat.mode,
+      isSymlink: stat.isSymbolicLink(),
+    });
+  } catch { /* best effort: verification will report if the file is invalid */ }
 }
 
 /**

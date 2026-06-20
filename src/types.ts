@@ -427,7 +427,7 @@ export interface ReviewLoopConfig {
     stop_on_infrastructure_error: boolean;
     /** Phase 8D P6: run-level circuit breaker threshold. Default: 3. */
     max_consecutive_failures: number;
-    /** Phase 8D P6: same-provider retry budget before escalation. Default: 1. */
+    /** Phase 8D P6: same-provider retry budget. Default: 3. */
     max_agent_retries: number;
   };
   git: GitConfig;

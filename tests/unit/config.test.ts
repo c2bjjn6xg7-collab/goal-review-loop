@@ -183,7 +183,7 @@ runtime:
       expect(DEFAULT_CONFIG.version).toBe(1);
       expect(DEFAULT_CONFIG.loop.max_iterations).toBe(3);
       expect(DEFAULT_CONFIG.loop.max_consecutive_failures).toBe(3);
-      expect(DEFAULT_CONFIG.loop.max_agent_retries).toBe(1);
+      expect(DEFAULT_CONFIG.loop.max_agent_retries).toBe(3);
       expect(DEFAULT_CONFIG.git.push).toBe(false);
       expect(DEFAULT_CONFIG.git.require_clean_worktree).toBe(true);
       expect(DEFAULT_CONFIG.git.commit_on_pass).toBe(true);
@@ -787,7 +787,7 @@ describe('Phase 8D P6 Round 1: failure policy config', () => {
 
     const config = await loadConfig(configPath);
     expect(config.loop.max_consecutive_failures).toBe(3);
-    expect(config.loop.max_agent_retries).toBe(1);
+    expect(config.loop.max_agent_retries).toBe(3);
   });
 
   it('accepts explicit boundary values', async () => {

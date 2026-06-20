@@ -25,6 +25,7 @@
  *   rework-success   - Developer: write valid handoff for rework (iteration > 1)
  *   rework-fail      - Developer: still fails after rework
  *   slow-developer   - Developer: sleep 30s (for mid-run cancel testing)
+ *   developer-fail-three-then-success - Developer: fail 3x with AGENT_ERROR (exit 1), then succeed
  *   no-artifact      - Don't write any artifact
  *   timeout          - Sleep until timeout
  *   exit-error       - Exit with non-zero code
@@ -39,6 +40,7 @@
 import { writeFileSync, mkdirSync, existsSync, readFileSync, appendFileSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -641,6 +643,33 @@ try {
         case 'rework-fail':
           // Phase 4: Developer in rework mode — still can't fix the issue
           writeBlockedHandoff();
+          break;
+        case 'developer-fail-three-then-success':
+          // Phase 8D P6: fail the first three Developer invocations with
+          // AGENT_ERROR (exit non-zero, no handoff artifact), then succeed on
+          // the fourth. Exercises the orchestrator's same-provider retry loop.
+          // A counter file in /tmp tracks invocations without touching
+          // orchestrator-protected .agent paths during Developer execution.
+          {
+            const counterDir = join(tmpdir(), 'review-loop-fake-agent-counters', runId);
+            if (!existsSync(counterDir)) mkdirSync(counterDir, { recursive: true });
+            const counterPath = join(counterDir, 'developer-fail-three-then-success-count');
+            let count = 0;
+            if (existsSync(counterPath)) {
+              count = parseInt(readFileSync(counterPath, 'utf8').trim() || '0', 10) || 0;
+            }
+            count += 1;
+            writeFileSync(counterPath, String(count), 'utf8');
+            if (count <= 3) {
+              // Fail with AGENT_ERROR: exit non-zero without writing a handoff.
+              process.exit(1);
+            }
+            writeCompletedHandoff();
+            if (!existsSync(join(projectRoot, 'src'))) {
+              mkdirSync(join(projectRoot, 'src'), { recursive: true });
+            }
+            writeFileSync(join(projectRoot, 'src', 'test-impl.ts'), '// Test implementation\nexport const testFn = () => true;\n', 'utf8');
+          }
           break;
         case 'slow-developer':
           // Phase 4: Sleep for 30 seconds to allow mid-run cancel testing.
