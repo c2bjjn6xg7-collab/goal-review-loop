@@ -19,6 +19,7 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { runTaskGraphLoop } from './task-graph-loop.js';
+import { runTaskGraphWaveLoop } from './task-graph-wave-loop.js';
 import { resolveTaskGraphResumeDecision } from './task-graph-resume.js';
 import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
@@ -191,12 +192,12 @@ export async function runOrchestrator(params: {
       return makeBlockedResult('', projectRoot, `Configuration error: ${err instanceof Error ? err.message : String(err)}`, 'CONFIG_ERROR');
     }
 
-    // Phase 8D P5 Round 2B: resolve the parallel-execution decision from config
-    // + CLI overrides. Invalid worker counts surface here as a clear CONFIG_ERROR
-    // before any agent or git work begins. Wave-mode requests fail closed until
-    // Round 2E wires worktree-backed execution; serial decisions (the default
-    // and one-worker explicit opt-in) flow through to the existing path
-    // unchanged.
+    // Phase 8D P5: resolve the parallel-execution decision from config + CLI
+    // overrides. Invalid worker counts surface here as a clear CONFIG_ERROR
+    // before any agent or git work begins. Wave-mode task-graph requests are
+    // dispatched after planning once we know whether task-graph.json exists;
+    // serial decisions (the default and one-worker explicit opt-in) flow
+    // through to the existing path unchanged.
     let parallelDecision;
     try {
       parallelDecision = resolveParallelExecution(config, {
@@ -214,15 +215,6 @@ export async function runOrchestrator(params: {
       }
       throw err;
     }
-    if (parallelDecision.mode === 'wave') {
-      return makeBlockedResult(
-        '',
-        projectRoot,
-        `Parallel wave mode requested (${parallelDecision.maxParallelWorkers} workers, source=${parallelDecision.source}) but worktree-backed wave execution is not wired until Phase 8D P5 Round 2E. Re-run without --parallel or set config.parallel.enabled=false to use the existing serial path.`,
-        'CONFIG_ERROR',
-      );
-    }
-
     // Phase 6: Emit permission mode warnings
     emitPermissionWarnings(config);
 
@@ -689,6 +681,24 @@ export async function runOrchestrator(params: {
     // monolithic iteration loop (backwards compatibility).
     // ═══════════════════════════════════════════════════════════
     if (plannerValidation.taskGraph) {
+      if (parallelDecision.mode === 'wave') {
+        return await runTaskGraphWaveLoop({
+          projectRoot,
+          agentDir,
+          runId,
+          stateStore,
+          artifactStore,
+          orchestratorRegistry,
+          config,
+          currentBranch,
+          baseCommit,
+          goalDigest,
+          taskGraph: plannerValidation.taskGraph,
+          maxIterations: params.max_iterations ?? config.loop.max_iterations,
+          maxParallelWorkers: parallelDecision.maxParallelWorkers,
+          combinedSignal,
+        });
+      }
       return await runTaskGraphLoop({
         projectRoot,
         agentDir,
@@ -709,6 +719,16 @@ export async function runOrchestrator(params: {
         tag: params.tag ?? config.git.create_tag,
         resumeTaskIndex: undefined,
       });
+    }
+
+    if (parallelDecision.mode === 'wave') {
+      return makeBlockedResult(
+        runId,
+        projectRoot,
+        'Parallel wave mode requires task-graph planning; no task-graph.json was produced. Re-run without --parallel or use a task-graph-capable planner.',
+        'CONFIG_ERROR',
+        currentBranch,
+      );
     }
 
     return await runIterationLoop({

@@ -119,14 +119,13 @@ describe('resolveParallelExecution', () => {
 });
 
 /**
- * Phase 8D P5 Round 2B: orchestrator fail-closed guard.
+ * Phase 8D P5 Round 2B/2E: orchestrator parallel opt-in behavior.
  *
  * `runOrchestrator` resolves the parallel decision immediately after
- * `loadConfigWithDefaults`. Wave-mode requests (resolver returns `mode: 'wave'`)
- * must be rejected with a clear `CONFIG_ERROR` blocked result before any
- * preflight, lock, or agent work runs — Round 2B does not wire worktree-backed
- * wave execution. Invalid worker counts must surface as the same
- * `CONFIG_ERROR` rather than crashing the orchestrator.
+ * `loadConfigWithDefaults`. Invalid worker counts must surface as a clear
+ * `CONFIG_ERROR` before any preflight, lock, or agent work runs. Valid
+ * wave-mode requests now continue past the old fail-closed guard; a task graph
+ * is required later before worktree-backed wave execution can run.
  */
 describe('runOrchestrator parallel opt-in guard', () => {
   let projectRoot: string;
@@ -143,7 +142,7 @@ describe('runOrchestrator parallel opt-in guard', () => {
     try { rmSync(projectRoot, { recursive: true, force: true }); } catch { /* ok */ }
   });
 
-  it('blocks wave-mode CLI requests with CONFIG_ERROR before preflight', async () => {
+  it('does not fail closed with the old Round 2E guard before preflight', async () => {
     const result = await runOrchestrator({
       project_root: projectRoot,
       request: 'noop',
@@ -153,10 +152,10 @@ describe('runOrchestrator parallel opt-in guard', () => {
 
     expect(result.phase).toBe('BLOCKED');
     expect(result.exit_code).toBe(3);
-    expect(result.error?.code).toBe('CONFIG_ERROR');
-    expect(result.message).toMatch(/wave/i);
-    expect(result.message).toMatch(/Round 2E/);
-    // No git work: branch must be empty (preflight never ran).
+    expect(result.error?.code).toBe('PREFLIGHT_ERROR');
+    expect(result.message).not.toMatch(/Round 2E/);
+    expect(result.message).not.toMatch(/worktree-backed wave execution is not wired/i);
+    // No branch: the bare directory still fails before branch creation.
     expect(result.branch).toBe('');
     expect(result.commit_sha).toBeNull();
   });
