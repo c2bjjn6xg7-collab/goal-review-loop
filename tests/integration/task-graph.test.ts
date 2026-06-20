@@ -15,6 +15,7 @@ import { writeFileSync, mkdirSync, rmSync, readFileSync, existsSync, copyFileSyn
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
+import { executeResume } from '../../src/cli/resume.js';
 
 function writeFakeAgentConfig(
   repoDir: string,
@@ -271,6 +272,106 @@ describe('Phase 8B: Task Graph resume', () => {
     const stateAfter = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
     const statuses = stateAfter.task_graph_state.task_statuses;
     expect(Object.values(statuses).every((v: string) => v === 'passed')).toBe(true);
+  }, 180000);
+
+  it('CLI resume resumes a BLOCKED task-graph run through the CLI path to PASSED', async () => {
+    // First run: developer blocks once on task-1 (task-block-once), then
+    // succeeds on resume. The run BLOCKED at task index 0.
+    repoDir = createTestRepo('cli-resume', {
+      planner: 'task-graph',
+      developer: 'task-block-once',
+    });
+    const first = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a multi-part feature',
+      task_slug: 'cli-resume',
+      max_iterations: 1,
+    });
+    expect(first.phase).toBe('BLOCKED');
+
+    // The run must have blocked on task-1 with task_graph_state recorded.
+    const stateBefore = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    expect(stateBefore.task_graph_state).toBeTruthy();
+    expect(stateBefore.task_graph_state.task_statuses['task-1']).toBe('failed');
+    expect(stateBefore.phase).toBe('BLOCKED');
+
+    // Resume through the CLI path: executeResume reads state, runs consistency
+    // checks (branch, base_commit, GOAL digest), resolves the recovery action,
+    // and re-enters the orchestrator. The developer now succeeds (sentinel
+    // exists), so the run should complete all tasks and reach PASSED.
+    await executeResume({ project_root: repoDir });
+
+    // After CLI resume, the run reaches PASSED with a commit.
+    const stateAfter = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    expect(stateAfter.phase).toBe('PASSED');
+    expect(stateAfter.final_commit_sha).toBeTruthy();
+    // All tasks passed after resume.
+    const statuses = stateAfter.task_graph_state.task_statuses;
+    expect(Object.values(statuses).every((v: string) => v === 'passed')).toBe(true);
+  }, 180000);
+
+  it('resumes task-graph FINALIZING without re-entering integration verification', async () => {
+    repoDir = createTestRepo('finalizing-resume', {
+      planner: 'task-graph',
+      developer: 'task-success',
+    });
+
+    const first = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a multi-part feature',
+      task_slug: 'finalizing-resume',
+      max_iterations: 3,
+      no_commit: true,
+    });
+    expect(first.phase).toBe('PASSED');
+
+    const statePath = join(repoDir, '.agent', 'state.json');
+    const stateBefore = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(Object.values(stateBefore.task_graph_state.task_statuses).every((v: string) => v === 'passed')).toBe(true);
+
+    const interruptedState = {
+      ...stateBefore,
+      phase: 'FINALIZING',
+      last_error: null,
+      final_commit_sha: null,
+      final_commit_message: null,
+      finalized_at: null,
+      commit_skipped: false,
+      skip_reason: null,
+      tag_name: null,
+      tag_created: false,
+      stages: {
+        ...stateBefore.stages,
+        finalizing: {
+          status: 'running',
+          attempts: 1,
+          at: new Date().toISOString(),
+        },
+      },
+    };
+    writeFileSync(statePath, JSON.stringify(interruptedState, null, 2), 'utf8');
+
+    const resumeResult = await runOrchestrator({
+      project_root: repoDir,
+      task_slug: 'finalizing-resume',
+      max_iterations: 3,
+      no_commit: true,
+      resume_from: {
+        run_id: interruptedState.run_id,
+        iteration: interruptedState.iteration,
+        phase: interruptedState.phase,
+        branch: interruptedState.branch,
+        base_commit: interruptedState.base_commit,
+        task_slug: interruptedState.task_slug,
+        goal_digest: interruptedState.goal_digest,
+      },
+    });
+
+    expect(resumeResult.phase).toBe('PASSED');
+    expect(resumeResult.commit_skipped).toBe(true);
+    const log = readFileSync(join(repoDir, '.agent', 'iteration-log.md'), 'utf8');
+    expect(log).toMatch(/task graph resume from FINALIZING/);
+    expect(log).not.toMatch(/Illegal state transition: FINALIZING → VERIFYING/);
   }, 180000);
 });
 

@@ -19,6 +19,7 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { runTaskGraphLoop } from './task-graph-loop.js';
+import { resolveTaskGraphResumeDecision } from './task-graph-resume.js';
 import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { ArtifactStore, ARTIFACT_FILES } from '../artifacts/artifact-store.js';
@@ -340,7 +341,54 @@ export async function runOrchestrator(params: {
       // saved task index instead of the monolithic iteration loop.
       if (goalValidation.taskGraph) {
         const tgState = await stateStore.read();
-        const resumeTaskIndex = tgState.task_graph_state?.current_task_index ?? 0;
+        // Phase 8D P7: derive the resume index from per-task statuses instead
+        // of trusting raw `current_task_index`. A failed/running/blocked task
+        // restarts, otherwise the earliest pending task continues, otherwise
+        // the task loop is skipped so integration verification/finalization runs.
+        const resumeDecision = resolveTaskGraphResumeDecision(
+          goalValidation.taskGraph,
+          tgState.task_graph_state,
+        );
+        await appendLog(
+          artifactStore,
+          runId,
+          startIteration,
+          'RESUMING',
+          'task-graph resume decision',
+          'PASS',
+          `${resumeDecision.kind} at index ${resumeDecision.taskIndex}${resumeDecision.taskId ? ` (${resumeDecision.taskId})` : ''}: ${resumeDecision.reason}`,
+        );
+        const resumeTaskIndex = resumeDecision.taskIndex;
+        if (resume.phase === PhaseEnum.FINALIZING && resumeDecision.kind === 'all_tasks_complete') {
+          const finalizationIteration = resumeDecision.taskIndex + 1;
+          await appendLog(
+            artifactStore,
+            runId,
+            finalizationIteration,
+            'FINALIZING',
+            'task graph resume from FINALIZING',
+            'PASS',
+            'all task-graph tasks are complete — resuming finalization without re-running integration verification',
+          );
+          return await runFinalization({
+            projectRoot,
+            agentDir,
+            runId,
+            stateStore,
+            artifactStore,
+            config,
+            currentBranch,
+            baseCommit,
+            goalFm,
+            goalDigest,
+            diffDigest: tgState.audited_diff_digest ?? goalDigest,
+            iteration: finalizationIteration,
+            noCommit: params.no_commit ?? !config.git.commit_on_pass,
+            tag: params.tag ?? config.git.create_tag,
+            combinedSignal,
+            orchestratorRegistry,
+          });
+        }
         // Phase 8B: a task-graph run may have BLOCKED on a failed task. BLOCKED has
         // no outgoing legal transitions, so force the phase back to DEVELOPING to
         // restart from the failed task. Successfully completed tasks are skipped.

@@ -14,6 +14,9 @@ import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { computeDigest } from '../runtime/digest.js';
 import { runOrchestrator, type ResumeContext } from '../orchestrator/run-orchestrator.js';
+import { WorktreeManager, WorktreeManagerError } from '../scheduler/worktree-manager.js';
+import { loadTaskGraph } from '../scheduler/task-graph.js';
+import { runWorktreeRecoveryDiagnostics } from './resume-worktree-recovery.js';
 import type { RunState } from '../types.js';
 import { Phase as PhaseEnum } from '../types.js';
 import { isTerminal } from '../orchestrator/state-machine.js';
@@ -130,7 +133,40 @@ export async function executeResume(params: {
     }
   }
 
-  // 6. Phase-specific recovery
+  // 6. Worktree recovery diagnostics (Phase 8D P7)
+  //
+  // When recovering a lock on a task-graph run, prune stale git worktree
+  // metadata and print a non-destructive classification of the run's
+  // worktrees. This is diagnostic only: no worktrees or branches are deleted
+  // and no task cleanup runs automatically. Worktree-manager failures stop
+  // resume with a manual-action suggestion so the user never resumes with
+  // misleading recovery evidence.
+  if (params.recover_lock && state.task_graph_state) {
+    try {
+      const worktreeManager = new WorktreeManager(projectRoot);
+      const taskGraph = loadTaskGraph(projectRoot).graph;
+      await runWorktreeRecoveryDiagnostics({
+        runId: state.run_id,
+        taskGraph,
+        taskGraphState: state.task_graph_state,
+        deps: {
+          prune: () => worktreeManager.prune(),
+          listForRun: (runId) => worktreeManager.listForRun(runId),
+        },
+      });
+    } catch (err) {
+      if (err instanceof WorktreeManagerError) {
+        throw new ResumeConsistencyError(
+          `Failed to gather worktree recovery diagnostics: ${err.message}`,
+          'worktree-diagnostics-failed',
+          'Inspect .agent/worktrees and run `git worktree list` manually, then retry resume.',
+        );
+      }
+      throw err;
+    }
+  }
+
+  // 7. Phase-specific recovery
   const recoveryAction = determineRecoveryAction(state);
 
   if (recoveryAction.action === 'blocked') {
@@ -141,7 +177,7 @@ export async function executeResume(params: {
     throw new ResumeConsistencyError(`Run ${state.run_id} needs to be restarted from scratch: ${recoveryAction.reason}. Use \`review-loop start\` with the same request to restart the run.`);
   }
 
-  // 7. Re-enter the orchestrator loop
+  // 8. Re-enter the orchestrator loop
   console.log(`Resuming run ${state.run_id} from ${state.phase} (iteration ${state.iteration})...`);
   console.log(`Recovery: ${recoveryAction.reason}`);
 
@@ -287,12 +323,12 @@ async function validateResumeConsistency(
 
 // ─── Recovery Action ─────────────────────────────────────────
 
-interface RecoveryAction {
+export interface RecoveryAction {
   action: 'continue' | 'restart' | 'blocked';
   reason?: string;
 }
 
-function determineRecoveryAction(state: RunState): RecoveryAction {
+export function determineRecoveryAction(state: RunState): RecoveryAction {
   switch (state.phase) {
     case PhaseEnum.INITIALIZING:
       return { action: 'restart', reason: 'Run was interrupted during initialization.' };
@@ -327,9 +363,20 @@ function determineRecoveryAction(state: RunState): RecoveryAction {
       return { action: 'continue', reason: 'Will resume finalization (Final Audit, commit, tag).' };
 
     case PhaseEnum.BLOCKED: {
+      // Tag-only finalization recovery is the most specific case: a commit
+      // exists but tag creation failed. Keep this check first so a run with
+      // both a final commit and (stale) task-graph state still retries the
+      // tag rather than re-entering task-graph execution.
       if (state.final_commit_sha && !state.tag_created && state.tag_name) {
         return { action: 'continue', reason: 'Commit exists but tag failed — can retry tag creation.' };
       }
+      // Phase 8B: a task-graph run that BLOCKED on a task can be resumed —
+      // the orchestrator restarts from the failed task index.
+      if (state.task_graph_state) {
+        return { action: 'continue', reason: 'Task-graph run blocked on a task — can resume from the failed task.' };
+      }
+      // Monolithic BLOCKED runs (no task graph, no tag to retry) cannot be
+      // resumed automatically; they require manual intervention.
       return { action: 'blocked', reason: 'Run is blocked. Resolve the blocking issue manually.' };
     }
 
