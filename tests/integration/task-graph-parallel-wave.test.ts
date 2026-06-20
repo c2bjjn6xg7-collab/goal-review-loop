@@ -107,11 +107,12 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
     }
   });
 
-  it('runs a task graph through worktree-backed waves without merging task branches', async () => {
+  it('runs a task graph through worktree-backed waves and assembles an integration branch', async () => {
     repoDir = createTestRepo('all-pass', {
       planner: 'task-graph',
       developer: 'task-success',
     });
+    const originalBranch = git(repoDir, ['branch', '--show-current']);
 
     const result = await runOrchestrator({
       project_root: repoDir,
@@ -127,8 +128,18 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
     expect(result.error).toBeNull();
     expect(result.commit_sha).toBeNull();
     expect(result.commit_skipped).toBe(true);
-    expect(result.skip_reason).toMatch(/Phase 8D wave mode/i);
-    expect(result.message).toMatch(/Phase 8E/i);
+    expect(result.skip_reason).toMatch(/Phase 8E R1 assembled the integration branch/i);
+    expect(result.message).toMatch(/assembled integration branch/i);
+    expect(result.message).toMatch(/Final Aggregate Audit and final project commit\/tag are deferred/i);
+    expect(result.branch).toBe(`integration/${result.run_id}`);
+    expect(git(repoDir, ['branch', '--show-current'])).toBe(`integration/${result.run_id}`);
+    expect(git(repoDir, ['rev-parse', '--verify', `integration/${result.run_id}`])).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(repoDir, ['rev-parse', '--verify', originalBranch])).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.artifact_paths).toEqual(expect.arrayContaining([
+      join(repoDir, '.agent', 'integration'),
+      join(repoDir, '.agent', 'integration', 'integration-plan.json'),
+      join(repoDir, '.agent', 'integration', 'cherry-pick-log.jsonl'),
+    ]));
 
     for (const taskId of ['task-1', 'task-2', 'task-3']) {
       const stored = await readTaskRunResult(repoDir, result.run_id, taskId);
@@ -147,8 +158,20 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
       'src/integration/impl.ts',
     ];
     for (const filePath of expectedTaskFiles) {
-      expect(existsSync(join(repoDir, filePath))).toBe(false);
+      expect(existsSync(join(repoDir, filePath))).toBe(true);
+      expect(git(repoDir, ['show', `${result.branch}:${filePath}`])).toContain('export const taskFn');
     }
+
+    const integrationPlan = JSON.parse(readFileSync(join(repoDir, '.agent', 'integration', 'integration-plan.json'), 'utf8'));
+    expect(integrationPlan.tasks.map((entry: { task_id: string }) => entry.task_id)).toEqual(['task-1', 'task-2', 'task-3']);
+    expect(integrationPlan.excluded_tasks).toEqual([]);
+    expect(JSON.stringify(integrationPlan)).not.toContain('diff_digest');
+
+    const cherryPickLog = readFileSync(join(repoDir, '.agent', 'integration', 'cherry-pick-log.jsonl'), 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    expect(cherryPickLog.map((entry: { outcome: string }) => entry.outcome)).toEqual(['applied', 'applied', 'applied']);
 
     const taskResults = JSON.parse(readFileSync(join(repoDir, '.agent', 'task-results.json'), 'utf8'));
     expect(taskResults.results.map((entry: { task_id: string }) => entry.task_id)).toEqual(['task-1', 'task-2', 'task-3']);
@@ -156,6 +179,9 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
 
     const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
     expect(state.phase).toBe('PASSED');
+    expect(state.branch).toBe(`integration/${result.run_id}`);
+    expect(state.commit_skipped).toBe(true);
+    expect(state.skip_reason).toMatch(/Phase 8E R1 assembled the integration branch/i);
     expect(Object.values(state.task_graph_state.task_statuses).every((status) => status === 'passed')).toBe(true);
   }, 120000);
 

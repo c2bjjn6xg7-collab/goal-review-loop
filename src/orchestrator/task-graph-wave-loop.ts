@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import {
@@ -21,9 +21,17 @@ import {
   appendLog,
   emitProgress,
   makeBlockedResult,
+  makeResult,
   computeDigest,
   registerDirectoryFiles,
 } from './run-orchestrator.js';
+import { buildIntegrationPlan } from './integration-plan.js';
+import {
+  integrationArtifactDir,
+  integrationArtifactPaths,
+  runIntegrationMerge,
+  writeIntegrationPlanEvidence,
+} from './integration-runner.js';
 import {
   Phase as PhaseEnum,
   TaskStatus,
@@ -200,8 +208,123 @@ export async function runTaskGraphWaveLoop(
     'DEVELOPING',
     'parallel wave execution completed',
     'PASS',
-    'all task branches passed; Phase 8D does not merge or finalize',
+    'all task branches passed; assembling Phase 8E R1 integration branch',
   );
+
+  const integrationPlan = await buildIntegrationPlan({
+    projectRoot,
+    runId,
+    baseCommit,
+    taskGraph,
+  });
+  if (integrationPlan.excluded_tasks.length > 0) {
+    const integrationArtifacts = await writeIntegrationPlanEvidence({
+      projectRoot,
+      plan: integrationPlan,
+    });
+    const integrationPaths = integrationArtifactPaths(projectRoot);
+    writeFileSync(integrationPaths.cherryPickLog, '', 'utf8');
+    rmSync(integrationPaths.conflictReport, { force: true });
+    integrationArtifacts.push(integrationPaths.cherryPickLog);
+    registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
+
+    const summary = integrationPlan.excluded_tasks
+      .map((task) => `${task.task_id}: ${task.status} (${task.reason})`)
+      .join('; ');
+    await stateStore.transition(PhaseEnum.BLOCKED);
+    await appendLog(
+      artifactStore,
+      runId,
+      tasks.length + 2,
+      'DEVELOPING',
+      'integration planning',
+      'BLOCKED',
+      summary,
+    );
+    await emitProgress({
+      projectRoot,
+      stateStore,
+      lastEvent: 'Integration planning BLOCKED by excluded task-run result(s)',
+      registry: orchestratorRegistry,
+    });
+    return makeResult(
+      runId,
+      PhaseEnum.BLOCKED,
+      3,
+      currentBranch,
+      null,
+      uniquePaths([taskResultsPath, join(agentDir, 'task-runs'), integrationArtifactDir(projectRoot), ...integrationArtifacts]),
+      'Resolve excluded task-run result(s), then rerun integration',
+      `Phase 8E R1 integration BLOCKED because not every task can be safely integrated: ${summary}`,
+      {
+        code: 'VERIFICATION_FAILED',
+        message: `Phase 8E R1 integration BLOCKED because not every task can be safely integrated: ${summary}`,
+        resumable: false,
+        suggested_action: 'Review .agent/integration/excluded-tasks.md and rerun missing, failed, or blocked tasks before integration.',
+      },
+      null,
+      true,
+      null,
+      false,
+      'Phase 8E R1 integration was blocked before cherry-pick because task-run results were incomplete.',
+    );
+  }
+
+  const integrationResult = await runIntegrationMerge({
+    projectRoot,
+    runId,
+    baseCommit,
+    plan: integrationPlan,
+  });
+  registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
+
+  if (integrationResult.status === 'blocked') {
+    await stateStore.update(() => ({ branch: integrationResult.integration_branch }));
+    await stateStore.transition(PhaseEnum.BLOCKED);
+    await appendLog(
+      artifactStore,
+      runId,
+      tasks.length + 2,
+      'DEVELOPING',
+      'integration merge',
+      'BLOCKED',
+      integrationResult.error_message ?? 'integration merge blocked',
+    );
+    await emitProgress({
+      projectRoot,
+      stateStore,
+      lastEvent: 'Integration merge BLOCKED',
+      registry: orchestratorRegistry,
+    });
+    const message = integrationResult.error_message ?? 'Phase 8E R1 integration merge BLOCKED';
+    return makeResult(
+      runId,
+      PhaseEnum.BLOCKED,
+      3,
+      integrationResult.integration_branch,
+      null,
+      uniquePaths([taskResultsPath, join(agentDir, 'task-runs'), integrationArtifactDir(projectRoot), ...integrationResult.artifact_paths]),
+      'Resolve integration conflict/precondition, then retry',
+      message,
+      {
+        code: integrationResult.error_code ?? 'VERIFICATION_FAILED',
+        message,
+        resumable: false,
+        suggested_action: 'Review .agent/integration evidence before retrying integration.',
+      },
+      null,
+      true,
+      null,
+      false,
+      'Phase 8E R1 integration was blocked before Final Aggregate Audit or final commit.',
+    );
+  }
+
+  await stateStore.update(() => ({
+    branch: integrationResult.integration_branch,
+    commit_skipped: true,
+    skip_reason: 'Phase 8E R1 assembled the integration branch; Final Aggregate Audit and final project commit/tag are deferred.',
+  }));
   await stateStore.transition(PhaseEnum.VERIFYING);
   await stateStore.transition(PhaseEnum.AUDITING);
   await stateStore.transition(PhaseEnum.FINALIZING);
@@ -209,27 +332,27 @@ export async function runTaskGraphWaveLoop(
   await emitProgress({
     projectRoot,
     stateStore,
-    lastEvent: 'Parallel wave execution PASSED (Phase 8D: no merge/finalization)',
+    lastEvent: `Phase 8E R1 integration branch assembled: ${integrationResult.integration_branch}`,
     registry: orchestratorRegistry,
   });
 
-  const message = 'Parallel wave task execution PASSED. Phase 8D recorded task branches and task-run artifacts only; merge, integration verification, and Final Aggregate Audit are owned by Phase 8E.';
-  return {
-    run_id: runId,
-    phase: PhaseEnum.PASSED,
-    exit_code: 0,
-    branch: currentBranch,
-    audit_decision: null,
-    artifact_paths: [taskResultsPath, join(agentDir, 'task-runs')],
-    next_action: 'Proceed to Phase 8E integration merge when ready',
+  const message = `Parallel wave task execution PASSED. Phase 8E R1 assembled integration branch ${integrationResult.integration_branch}; Final Aggregate Audit and final project commit/tag are deferred to a later Phase 8E slice.`;
+  return makeResult(
+    runId,
+    PhaseEnum.PASSED,
+    0,
+    integrationResult.integration_branch,
+    null,
+    uniquePaths([taskResultsPath, join(agentDir, 'task-runs'), integrationArtifactDir(projectRoot), ...integrationResult.artifact_paths]),
+    'Run the later Phase 8E Final Aggregate Audit/final commit slice when ready',
     message,
-    error: null,
-    commit_sha: null,
-    commit_skipped: true,
-    tag_name: null,
-    tag_created: false,
-    skip_reason: 'Phase 8D wave mode does not merge task branches, run Final Aggregate Audit, or create a final commit.',
-  };
+    null,
+    null,
+    true,
+    null,
+    false,
+    'Phase 8E R1 assembled the integration branch; Final Aggregate Audit and final project commit/tag are deferred.',
+  );
 }
 
 async function ensureWaveTaskGraphState(
@@ -293,4 +416,8 @@ function listGitTrackedFiles(projectRoot: string): string[] {
   } catch {
     return [];
   }
+}
+
+function uniquePaths(paths: string[]): string[] {
+  return Array.from(new Set(paths));
 }
