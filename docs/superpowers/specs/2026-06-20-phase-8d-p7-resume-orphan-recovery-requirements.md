@@ -19,6 +19,12 @@ P7 should make resume decisions explicit, testable, and safe without enabling tr
 4. Integrate safe recovery diagnostics into `resume --recover-lock` without deleting unknown or dirty worktrees.
 5. Keep the implementation narrow: reliability/recovery only, no scheduling redesign.
 
+## Planning Guidance
+
+Future Planner/Developer runs for P7 and later Phase 8D work must follow `docs/superpowers/agent-task-planning-guidelines.md`.
+
+Do not over-split recovery work into tiny file-level tasks. Use the smallest complete module that can independently typecheck and pass its targeted tests. If a recovery feature requires coordinated changes across CLI, orchestrator helpers, scheduler helpers, and integration tests, keep that scope together instead of creating narrow `allowed_changes` scopes that force a Developer to BLOCKED.
+
 ## Definitions
 
 ### Task-Graph Resumable BLOCKED

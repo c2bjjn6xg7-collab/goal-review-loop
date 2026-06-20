@@ -99,6 +99,8 @@ Body must include:
 
 In addition to plan.md and GOAL.md, you MUST produce `.agent/task-graph.json` that decomposes the requirement into smaller, independently-verifiable tasks. This keeps each Developer run's context short enough for the model to handle reliably.
 
+If the repository contains `docs/superpowers/agent-task-planning-guidelines.md`, treat it as standing policy for task sizing and `allowed_changes` scope. In particular, do not over-split atomic cross-file work merely to create more tasks.
+
 ### task-graph.json
 
 Must be valid JSON with this shape:
@@ -137,16 +139,18 @@ Must be valid JSON with this shape:
 
 ### Decomposition rules
 
-1. Decompose into **2–6 tasks** for a non-trivial requirement. Fewer is acceptable only for trivial requirements (minimum 1).
-2. Each task must have a **narrow `allowed_changes`** scope — do not list the entire `src/**` for every task. Split by module or concern.
-3. Each task must have at least one **`verification_commands`** entry that can independently verify that task's work.
-4. `depends_on` must form a **DAG** (no cycles). The first task must have no dependencies. The last task must be a verification/integration task that depends on all prior tasks.
-5. Each task must be small enough for a single Developer run to complete **without exceeding model context limits** — prefer many small tasks over one large task.
-6. `allowed_changes` and `disallowed_changes` paths must be relative to project root (no `..` or absolute paths).
-7. `goal_digest` must be the SHA-256 digest of the GOAL.md file content you produced, in the form `sha256:<64 hex characters>`.
-8. Task IDs must be unique and match `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
-9. The union of all tasks' `allowed_changes` should cover the GOAL's `allowed_changes`.
-10. `status` for every task must be `"pending"`.
+1. Decompose by **atomic, independently buildable modules**, not by the smallest possible file or concern. A task is well-sized when it can be implemented, typechecked, and tested without requiring an immediate scope expansion.
+2. Use **1 task** for cross-file changes that must land together to compile or pass tests. This is especially important for orchestrator flows, task-graph/wave execution, schema + adapter + integration-test changes, and any request marked `atomic`, `do not split`, `single task`, or `follow the existing plan exactly`.
+3. Use **2–6 tasks** only when the requirement naturally separates into independently-verifiable modules. Do not split a feature merely to keep tasks small when the split would create half-implemented code, blocked Developers, or failing typecheck between tasks.
+4. Each task must have an `allowed_changes` scope that is **complete for that task's module**. Keep scope focused, but include every source, test, config, prompt, or doc file that the task plausibly needs. Do not make `allowed_changes` so narrow that the Developer is forced to block on obvious companion files.
+5. Each task must have at least one **`verification_commands`** entry that can independently verify that task's completed module.
+6. `depends_on` must form a **DAG** (no cycles). If multiple implementation tasks exist, the last task should be a verification/integration task that depends on all prior tasks.
+7. Each task must fit in the selected Developer model's context window. When the model has a large context window, prefer a larger atomic module with full context over fragile over-decomposition.
+8. `allowed_changes` and `disallowed_changes` paths must be relative to project root (no `..` or absolute paths).
+9. `goal_digest` must be the SHA-256 digest of the GOAL.md file content you produced, in the form `sha256:<64 hex characters>`.
+10. Task IDs must be unique and match `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
+11. The union of all tasks' `allowed_changes` should cover the GOAL's `allowed_changes`.
+12. `status` for every task must be `"pending"`.
 
 ---
 

@@ -8,6 +8,8 @@
 
 **Tech Stack:** TypeScript, Node.js, Vitest, existing review-loop orchestrator/CLI/scheduler modules.
 
+**Task Sizing Policy:** Follow `docs/superpowers/agent-task-planning-guidelines.md`. Do not split this plan below independently-buildable modules. If a future Planner/Developer run cannot complete one of the listed tasks without touching obvious companion files, widen that task's `allowed_changes` in the task graph instead of forcing a scope-blocked partial implementation.
+
 ---
 
 ## Files
