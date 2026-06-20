@@ -19,6 +19,7 @@ import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { runTaskGraphLoop } from './task-graph-loop.js';
+import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { ArtifactStore, ARTIFACT_FILES } from '../artifacts/artifact-store.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
@@ -768,6 +769,31 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       );
     }
 
+    // Phase 8D P6: run-level circuit breaker. Cancel takes priority; this gate
+    // runs before any iteration work begins.
+    const breakerState = await stateStore.read();
+    if (breakerState.consecutive_failure_count >= config.loop.max_consecutive_failures) {
+      const count = breakerState.consecutive_failure_count;
+      const max = config.loop.max_consecutive_failures;
+      await stateStore.transition(PhaseEnum.FAILED);
+      await appendLog(
+        artifactStore, runId, iteration,
+        breakerState.phase, 'circuit breaker tripped', 'FAIL',
+        `consecutive_failure_count=${count}/${max}`,
+      );
+      return makeResult(
+        runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
+        'Consecutive failure limit reached',
+        `Consecutive soft failures reached ${count}/${max}. Review .agent/iteration-log.md for failure details.`,
+        {
+          code: 'CONSECUTIVE_FAILURE_LIMIT',
+          message: `Consecutive soft failures reached ${count}/${max}. Review .agent/iteration-log.md for failure details.`,
+          resumable: false,
+          suggested_action: 'Review .agent/iteration-log.md, adjust GOAL/prompts/config, then start a new run',
+        },
+      );
+    }
+
     // ── DEVELOPING (or REWORKING for iteration > 1) ──
 
     if (iteration > 1) {
@@ -1134,6 +1160,9 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       const deniedPaths = scopeResult.report.denied.map(d => d.path).join(', ');
       await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'FAIL', `Denied: ${deniedPaths}`);
 
+      // Phase 8D P6: track soft failure before rework/terminal handling.
+      await recordSoftFailure(stateStore, config, 'verification_failed');
+
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
         return makeResult(
@@ -1181,6 +1210,9 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         .filter(c => c.required && c.status !== 'success')
         .map(c => c.id);
       await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'verification result', 'FAIL', `Failed: ${failedCmds.join(', ')}`);
+
+      // Phase 8D P6: track soft failure before rework/terminal handling.
+      await recordSoftFailure(stateStore, config, 'verification_failed');
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
@@ -1430,6 +1462,9 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         await stateStore.transition(PhaseEnum.REWORKING);
         await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', `Mechanical check failure overrides PASS: ${auditValidation.errors.join('; ')}`);
 
+        // Phase 8D P6: track soft failure before rework/terminal handling.
+        await recordSoftFailure(stateStore, config, 'verification_failed');
+
         if (iteration >= maxIterations) {
           await stateStore.transition(PhaseEnum.FAILED);
           return makeResult(
@@ -1452,6 +1487,9 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     if (decision === 'PASS') {
       await stateStore.transition(PhaseEnum.FINALIZING);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'PASS');
+
+      // Phase 8D P6: passing iteration resets the run-level failure counter.
+      await recordSoftFailurePass(stateStore, config);
       // Phase 10: dispatch ReviewLoopRequest feedback blocks from audit-report.md (best-effort).
       await dispatchFeedbackBlocks({
         projectRoot, runId, role: 'auditor',
@@ -1484,6 +1522,9 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     if (decision === 'FAIL') {
       await stateStore.transition(PhaseEnum.REWORKING);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL');
+
+      // Phase 8D P6: track soft failure before rework/terminal handling.
+      await recordSoftFailure(stateStore, config, 'auditor_block');
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);

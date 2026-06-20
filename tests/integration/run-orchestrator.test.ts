@@ -13,7 +13,11 @@ import { tmpdir } from 'node:os';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
 
 /** Write review-loop.yaml config that uses the fake agent. */
-function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, string>): void {
+function writeFakeAgentConfig(
+  repoDir: string,
+  roleBehaviors: Record<string, string>,
+  loopOverrides: Record<string, unknown> = {},
+): void {
   const fakeAgentPath = resolve(join(process.cwd(), 'tests', 'fixtures', 'fake-agent.mjs'));
 
   const config = {
@@ -36,7 +40,7 @@ function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, str
         timeout_seconds: 60,
       },
     },
-    loop: { max_iterations: 3 },
+    loop: { max_iterations: 3, ...loopOverrides },
     git: {
       require_repository: true,
       require_head: true,
@@ -72,7 +76,11 @@ function copyPrompts(repoDir: string): void {
 }
 
 /** Create a temporary git repo for testing. Config and prompts are committed so worktree is clean. */
-function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = {}): string {
+function createTestRepo(
+  suffix: string,
+  roleBehaviors: Record<string, string> = {},
+  loopOverrides: Record<string, unknown> = {},
+): string {
   const repoDir = join(tmpdir(), `review-loop-test-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
 
@@ -94,7 +102,7 @@ function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = 
   writeFileSync(join(repoDir, 'tests', 'index.test.ts'), 'test("hello", () => {});\n');
 
   // Write config and prompts BEFORE initial commit so worktree is clean
-  writeFakeAgentConfig(repoDir, roleBehaviors);
+  writeFakeAgentConfig(repoDir, roleBehaviors, loopOverrides);
   copyPrompts(repoDir);
 
   execSync('git add -A', { cwd: repoDir });
@@ -240,6 +248,67 @@ describe('Run Orchestrator integration', () => {
     // Verify the error indicates timeout
     expect(result.error?.message).toMatch(/timed out|timeout/i);
   }, 120000); // 120s Vitest timeout for real timeout test
+
+  // ─── Phase 8D P6 Round 2: circuit breaker ────────────────────
+
+  it('I1: trips CONSECUTIVE_FAILURE_LIMIT before iteration exhaustion', async () => {
+    repoDir = createTestRepo(
+      'breaker-trip',
+      { auditor: 'audit-fail' },
+      { max_consecutive_failures: 2, max_iterations: 5 },
+    );
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a feature',
+      task_slug: 'breaker-trip',
+    });
+
+    expect(result.phase).toBe('FAILED');
+    expect(result.exit_code).toBe(2);
+    expect(result.error?.code).toBe('CONSECUTIVE_FAILURE_LIMIT');
+
+    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    expect(state.consecutive_failure_count).toBe(2);
+  });
+
+  it('I2: PASS resets the counter, no breaker trip', async () => {
+    repoDir = createTestRepo(
+      'breaker-reset',
+      { auditor: 'audit-fail-then-pass' },
+      { max_consecutive_failures: 3, max_iterations: 3 },
+    );
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a feature',
+      task_slug: 'breaker-reset',
+    });
+
+    expect(result.phase).toBe('PASSED');
+    expect(result.error?.code).not.toBe('CONSECUTIVE_FAILURE_LIMIT');
+
+    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    expect(state.consecutive_failure_count).toBe(0);
+  });
+
+  it('I3: same-iteration exhaustion preempts the loop-top gate', async () => {
+    repoDir = createTestRepo(
+      'breaker-inert',
+      { auditor: 'audit-fail' },
+      { max_consecutive_failures: 3, max_iterations: 3 },
+    );
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a feature',
+      task_slug: 'breaker-inert',
+    });
+
+    expect(result.phase).toBe('FAILED');
+    // Breaker did NOT trip: same-iteration maxIterations exhaustion returned first.
+    expect(result.error?.code).not.toBe('CONSECUTIVE_FAILURE_LIMIT');
+  });
 
   // ─── Scenario 15: Agent exit error → BLOCKED ───────────────
   it('blocks on agent non-zero exit', async () => {

@@ -203,6 +203,7 @@ export const ErrorCategory = {
   UNSUPPORTED_PUSH: 'UNSUPPORTED_PUSH',
   USER_CANCELLED: 'USER_CANCELLED',
   INFRASTRUCTURE_ERROR: 'INFRASTRUCTURE_ERROR',
+  CONSECUTIVE_FAILURE_LIMIT: 'CONSECUTIVE_FAILURE_LIMIT',
 } as const;
 
 export type ErrorCategory = (typeof ErrorCategory)[keyof typeof ErrorCategory];
@@ -232,6 +233,7 @@ export const ERROR_CATEGORY_DEFAULT_RESULT: ReadonlyMap<ErrorCategory, Phase> = 
   [ErrorCategory.UNSUPPORTED_PUSH, Phase.BLOCKED],
   [ErrorCategory.USER_CANCELLED, Phase.CANCELLED],
   [ErrorCategory.INFRASTRUCTURE_ERROR, Phase.BLOCKED],
+  [ErrorCategory.CONSECUTIVE_FAILURE_LIMIT, Phase.FAILED],
 ]);
 
 /**

@@ -10,8 +10,8 @@ import type { ReviewLoopError } from '../../src/types.js';
 describe('Error normalization', () => {
   const allCategories = Object.values(ErrorCategory);
 
-  it('has exactly 21 error categories', () => {
-    expect(allCategories).toHaveLength(21);
+  it('has exactly 22 error categories', () => {
+    expect(allCategories).toHaveLength(22);
   });
 
   it('every error category has a default result phase', () => {
@@ -68,5 +68,9 @@ describe('Error normalization', () => {
 
   it('USER_CANCELLED maps to CANCELLED phase', () => {
     expect(ERROR_CATEGORY_DEFAULT_RESULT.get('USER_CANCELLED')).toBe('CANCELLED');
+  });
+
+  it('CONSECUTIVE_FAILURE_LIMIT maps to FAILED phase', () => {
+    expect(ERROR_CATEGORY_DEFAULT_RESULT.get('CONSECUTIVE_FAILURE_LIMIT')).toBe('FAILED');
   });
 });
