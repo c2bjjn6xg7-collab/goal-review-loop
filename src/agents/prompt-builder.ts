@@ -518,5 +518,27 @@ status: "COMPLETED"
 
 Set \`status: "BLOCKED"\` only if you genuinely cannot proceed.
 6. Keep your work focused and minimal — this is one narrow task, not the whole goal.
+
+## Scope expansion protocol (BLOCKED)
+
+If completing this task correctly requires modifying, creating, or deleting files that are **outside** the \`allowed_changes\` list above, you MUST NOT touch those files. Instead, stop and report it as a blocked task:
+
+1. Do NOT modify, create, or delete any path outside \`allowed_changes\`. Do NOT guess or widen the scope yourself — there is no automatic scope widening.
+2. Write your handoff to \`${context.handoff_path}\` with \`status: "BLOCKED"\`.
+3. In the handoff **body** (plain markdown prose — NOT a new front-matter field), include a section titled \`scope_expansion_request\` that lists:
+   - each path you needed but could not modify, and
+   - a short reason why that path is required to complete the task.
+4. Make no other changes. Do not introduce a new handoff schema field; the \`scope_expansion_request\` content lives in the handoff body only.
+
+Example:
+
+\`\`\`
+## scope_expansion_request
+
+- \`src/types.ts\` — required because the new config field must be added to the runtime type for this task to compile.
+- \`docs/configuration.md\` — required to document the new option alongside existing config keys.
+\`\`\`
+
+Use this protocol only when scope genuinely blocks you. If the task can be completed within \`allowed_changes\`, proceed normally and set \`status: "COMPLETED"\`.
 `;
 }

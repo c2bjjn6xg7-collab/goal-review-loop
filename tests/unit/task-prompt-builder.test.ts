@@ -63,6 +63,30 @@ describe('buildTaskDeveloperPrompt', () => {
     expect(p).toMatch(/MUST NOT modify any file outside/i);
   });
 
+  it('instructs developer to write a BLOCKED handoff when scope is insufficient', () => {
+    const p = buildTaskDeveloperPrompt(baseCtx);
+    expect(p).toMatch(/status: "BLOCKED"/);
+    expect(p).toMatch(/scope_expansion_request/i);
+  });
+
+  it('tells the developer not to widen scope themselves', () => {
+    const p = buildTaskDeveloperPrompt(baseCtx);
+    expect(p).toMatch(/do not.*widen.*scope|no automatic scope widening/i);
+  });
+
+  it('keeps scope_expansion_request as body prose, not a new schema field', () => {
+    const p = buildTaskDeveloperPrompt(baseCtx);
+    // The front matter schema fields are fixed; the request lives in the handoff body.
+    expect(p).toMatch(/in the handoff body/i);
+    expect(p).toMatch(/NOT a new front-matter field|not.*new handoff schema field/i);
+  });
+
+  it('asks the developer to name needed paths and reasons', () => {
+    const p = buildTaskDeveloperPrompt(baseCtx);
+    expect(p).toMatch(/path.*required|needed.*path|each path you needed/i);
+    expect(p).toMatch(/reason/i);
+  });
+
   it('does not reference other tasks or the full plan', () => {
     const p = buildTaskDeveloperPrompt(baseCtx);
     // Should not leak other tasks' scope

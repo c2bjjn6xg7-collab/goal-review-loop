@@ -580,6 +580,14 @@ export interface RuntimeConfig {
   lock_stale_seconds: number;
   /** Grace period in seconds for cancel to take effect before force-killing. Default: 10. */
   cancel_grace_seconds: number;
+  /**
+   * Phase 8D P6.5: idle timeout in seconds for a Developer attempt. If the
+   * Developer produces no stdout, stderr, or handoff-file activity within this
+   * window, the attempt is considered stalled and aborted via the per-attempt
+   * AbortController. Default: 480. Explicit small overrides (e.g. 1 or 2) are
+   * accepted so tests can exercise the watchdog quickly.
+   */
+  agent_idle_timeout_seconds: number;
 }
 
 // ─── Phase 10: ReviewLoopRequest Feedback Block Protocol ──────

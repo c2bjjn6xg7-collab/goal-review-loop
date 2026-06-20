@@ -825,3 +825,71 @@ describe('Phase 8D P6 Round 1: failure policy config', () => {
     await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
   });
 });
+
+// Phase 8D P6.5: agent idle timeout runtime config
+describe('Phase 8D P6.5: agent idle timeout runtime config', () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rl-idle-timeout-'));
+  });
+
+  afterEach(async () => {
+    await fs.remove(tmpDir);
+  });
+
+  it('DEFAULT_CONFIG.runtime.agent_idle_timeout_seconds is 480', () => {
+    expect(DEFAULT_CONFIG.runtime.agent_idle_timeout_seconds).toBe(480);
+  });
+
+  it('fills agent_idle_timeout_seconds default (480) when absent from yaml', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    await fs.writeFile(configPath, [
+      'version: 1',
+      'agents:',
+      '  planner: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+      '  developer: { command: ["sh","-lc","x"], timeout_seconds: 600 }',
+      '  auditor: { command: ["codex","exec","{prompt_file}"], timeout_seconds: 600 }',
+      'loop: { max_iterations: 3 }',
+      'git: { require_repository: true, require_head: true, require_clean_worktree: true, branch_template: "b", commit_on_pass: true, commit_template: "c", create_tag: false, tag_template: "t", push: false }',
+      'runtime: { kill_grace_seconds: 10, max_log_bytes: 1048576, lock_stale_seconds: 86400 }',
+    ].join('\n'), 'utf8');
+
+    const config = await loadConfig(configPath);
+    expect(config.runtime.agent_idle_timeout_seconds).toBe(480);
+  });
+
+  it.each([1, 2, 5, 480])('accepts explicit agent_idle_timeout_seconds override %s', async (value) => {
+    const configPath = path.join(tmpDir, `review-loop-${value}.yaml`);
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      runtime: { ...DEFAULT_CONFIG.runtime, agent_idle_timeout_seconds: value },
+    };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+
+    const loaded = await loadConfig(configPath);
+    expect(loaded.runtime.agent_idle_timeout_seconds).toBe(value);
+  });
+
+  it.each([0, 0.5, -1])('rejects invalid agent_idle_timeout_seconds value %s', async (value) => {
+    const configPath = path.join(tmpDir, `review-loop-bad-${value}.yaml`);
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      runtime: { ...DEFAULT_CONFIG.runtime, agent_idle_timeout_seconds: value },
+    };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+
+  it('rejects unknown extra fields under runtime', async () => {
+    const configPath = path.join(tmpDir, 'review-loop.yaml');
+    const cfg: Record<string, unknown> = {
+      ...DEFAULT_CONFIG,
+      runtime: { ...DEFAULT_CONFIG.runtime, future_runtime_field: 'nope' },
+    };
+    await fs.writeFile(configPath, yaml.dump(cfg), 'utf8');
+
+    await expect(loadConfig(configPath)).rejects.toThrow(ConfigError);
+  });
+});

@@ -127,6 +127,28 @@ providers:
       proxy_url: "http://corporate-proxy.example.com:8080"
 ```
 
+## Runtime Configuration
+
+The `runtime` block controls process-execution safeguards shared across all
+agent roles.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kill_grace_seconds` | `number` (≥1) | `10` | Grace period before force-killing a timed-out process. |
+| `max_log_bytes` | `number` (≥1024) | `10485760` | Hard cap on captured stdout/stderr log size per process. |
+| `lock_stale_seconds` | `number` (≥60) | `86400` | Age at which a run lock is considered stale. |
+| `cancel_grace_seconds` | `number` (≥1) | `10` | Grace period for cancel to take effect before force-killing. |
+| `agent_idle_timeout_seconds` | `number` (≥1) | `480` | Idle timeout in seconds for a Developer attempt. If the Developer produces no stdout, stderr, or handoff-file activity within this window, the attempt is considered stalled and aborted via the per-attempt `AbortController`. Explicit small overrides (e.g. `1` or `2`) are accepted so tests can exercise the watchdog quickly. |
+
+```yaml
+runtime:
+  kill_grace_seconds: 10
+  max_log_bytes: 10485760
+  lock_stale_seconds: 86400
+  cancel_grace_seconds: 10
+  agent_idle_timeout_seconds: 480
+```
+
 ## Full Configuration Example
 
 ```yaml
@@ -187,6 +209,8 @@ runtime:
   kill_grace_seconds: 10
   max_log_bytes: 10485760
   lock_stale_seconds: 86400
+  cancel_grace_seconds: 10
+  agent_idle_timeout_seconds: 480
 ```
 
 ---

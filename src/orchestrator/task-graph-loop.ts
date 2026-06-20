@@ -30,11 +30,13 @@ import {
 import { buildDeveloperInput, validateDeveloperOutput } from '../agents/developer-adapter.js';
 import { buildAuditorInput } from '../agents/auditor-adapter.js';
 import { orderedTasks, initialTaskStatuses, initialTaskAttempts } from '../scheduler/task-graph.js';
-import { runAgent } from '../agents/agent-adapter.js';
+import { runAgent, buildAgentLogPaths } from '../agents/agent-adapter.js';
 import { resolveCommandForAgent } from '../providers/provider-registry.js';
 import { normalizeGoalCommands } from '../artifacts/artifact-schemas.js';
 import { dispatchFeedbackBlocks } from './feedback-dispatcher.js';
 import { readFeedbackNotesForAudit } from './feedback-dispatcher.js';
+import { runTaskGraphPreflight } from './task-graph-preflight.js';
+import { DeveloperIdleWatchdog, type DeveloperIdleWatchdogResult } from './developer-idle-watchdog.js';
 import { buildProgressData, writeProgress, writeProgressMarkdown } from '../runtime/progress-writer.js';
 import type { Digest } from '../runtime/digest.js';
 import type {
@@ -177,6 +179,28 @@ export async function runTaskGraphTaskSerial(
   // Normalize task verification commands
   const taskVerificationCommands = normalizeGoalCommands(task.verification_commands);
 
+  // ── Phase 8D P6.5: task graph scope preflight (warn-only) ──
+  // Surface risky scopes before any Developer attempt runs: a required
+  // integration-test verification with a test-only allowed_changes (no
+  // source/docs/config path) usually cannot be satisfied. Warnings are logged
+  // to iteration-log.md here and never block execution.
+  const preflight = runTaskGraphPreflight({
+    task_id: task.id,
+    allowed_changes: task.allowed_changes,
+    verification_commands: taskVerificationCommands,
+  });
+  for (const warning of preflight.warnings) {
+    await appendLog(
+      artifactStore,
+      runId,
+      taskIndexDisplay,
+      'DEVELOPING',
+      `task ${task.id} preflight`,
+      'PASS',
+      `PREFLIGHT WARNING (${warning.code}): ${warning.message}`,
+    );
+  }
+
   // ── Per-task Developer attempts (rework loop) ──
   let taskPassed = false;
   let taskError: string | null = null;
@@ -228,8 +252,32 @@ export async function runTaskGraphTaskSerial(
       break;
     }
 
+    // ── Phase 8D P6.5: per-attempt idle watchdog ──
+    // Compose a per-attempt AbortController with the run-wide combinedSignal so
+    // that either a user cancel OR an idle-watchdog trip aborts this attempt.
+    // The watchdog watches the attempt's stdout/stderr logs and the handoff
+    // file; if none grow within the configured idle window it aborts the
+    // controller, which the Process Runner turns into a 'cancelled' result.
+    const attemptAbortController = createAttemptAbortController(combinedSignal);
+    const idleTimeoutSeconds = config.runtime.agent_idle_timeout_seconds;
+    const attemptLogPaths = buildAgentLogPaths(
+      join(agentDir, 'debug'),
+      runId,
+      'developer',
+      taskIndexDisplay,
+      attempt,
+    );
+    const idleWatchdog = new DeveloperIdleWatchdog({
+      idleTimeoutMs: idleTimeoutSeconds * 1000,
+      stdoutPath: attemptLogPaths.stdoutPath,
+      stderrPath: attemptLogPaths.stderrPath,
+      handoffPath,
+      controller: attemptAbortController,
+    });
+
     let developerResult;
     let developerCleanupResult: PromptCleanupResult | undefined;
+    let watchdogResult: DeveloperIdleWatchdogResult | undefined;
     try {
       await emitProgress({ projectRoot, stateStore, lastEvent: `Running Developer for task ${taskIndexDisplay} (attempt ${attempt})`, registry: orchestratorRegistry });
 
@@ -245,11 +293,15 @@ export async function runTaskGraphTaskSerial(
         timeout_seconds: config.agents.developer.timeout_seconds,
         prompt: developerPrompt,
         prompt_file: developerPromptFile,
-        signal: combinedSignal,
+        // Per-attempt signal: aborted by user cancel OR idle-watchdog trip.
+        signal: attemptAbortController.signal,
       });
 
+      idleWatchdog.start();
       developerResult = await runAgent(developerInput, projectRoot);
     } finally {
+      idleWatchdog.stop();
+      watchdogResult = idleWatchdog.getResult();
       if (developerPromptFile) developerCleanupResult = await deletePromptFile(developerPromptFile);
     }
 
@@ -261,6 +313,30 @@ export async function runTaskGraphTaskSerial(
     if (developerCleanupResult && !developerCleanupResult.success) {
       taskError = `Prompt cleanup failed: ${developerCleanupResult.error}`;
       await appendLog(artifactStore, runId, taskIndexDisplay, 'DEVELOPING', `task ${task.id} cleanup`, 'FAIL', taskError);
+      break;
+    }
+
+    // ── Phase 8D P6.5: idle-watchdog trip ──
+    // A watchdog trip aborts the attempt, which surfaces as a 'cancelled'
+    // result. Treat that as a task failure (stall) — NOT a user cancel — so
+    // the rework loop retries or exhausts into BLOCKED with actionable
+    // idle-timeout detail (task id, attempt, idle seconds, log paths, and a
+    // suggested action from the watchdog reason).
+    if (watchdogResult?.tripped) {
+      taskError =
+        `Developer stalled on task ${task.id} attempt ${attempt}: idle watchdog tripped after ` +
+        `${idleTimeoutSeconds}s with no stdout, stderr, or handoff-file activity. ` +
+        `${watchdogResult.reason ?? ''}`;
+      await appendLog(
+        artifactStore,
+        runId,
+        taskIndexDisplay,
+        'DEVELOPING',
+        `task ${task.id} developer idle watchdog`,
+        'FAIL',
+        taskError,
+      );
+      if (attempt < maxIterations) continue;
       break;
     }
 
@@ -511,7 +587,10 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     tgState.task_statuses[task.id] = taskPassed ? 'passed' : 'failed';
     await stateStore.update(() => ({ task_graph_state: { ...tgState } }));
 
-    await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex: i, taskStatus: taskPassed ? 'passed' : 'failed', lastEvent: `Task ${taskIndexDisplay}/${ordered.length} ${taskPassed ? 'passed' : 'failed'}: ${task.title}` });
+    const taskProgressEvent = taskPassed
+      ? `Task ${taskIndexDisplay}/${ordered.length} passed: ${task.title}`
+      : `Task ${taskIndexDisplay}/${ordered.length} failed: ${task.title}${taskError ? ` — ${taskError}` : ''}`;
+    await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex: i, taskStatus: taskPassed ? 'passed' : 'failed', lastEvent: taskProgressEvent });
 
     if (!taskPassed) {
       // Task failed after max rework — BLOCKED the entire run.
@@ -695,6 +774,31 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
 }
 
 // ─── Phase 8B: Task Graph helpers ─────────────────────────────
+
+/**
+ * Phase 8D P6.5: Create a per-attempt AbortController composed with a parent
+ * signal. The returned controller aborts when the parent aborts (user cancel)
+ * OR when an idle watchdog aborts it directly. If the parent is already
+ * aborted, the controller is returned pre-aborted so the attempt never starts.
+ *
+ * This keeps the existing cancellation path (combinedSignal) working while
+ * giving the idle watchdog its own controller to trip independently per attempt.
+ */
+function createAttemptAbortController(parentSignal: AbortSignal): AbortController {
+  const controller = new AbortController();
+  if (parentSignal.aborted) {
+    controller.abort(parentSignal.reason);
+    return controller;
+  }
+  parentSignal.addEventListener(
+    'abort',
+    () => {
+      if (!controller.signal.aborted) controller.abort(parentSignal.reason);
+    },
+    { once: true },
+  );
+  return controller;
+}
 
 /**
  * Parse "Success Criteria" numbered lines from GOAL.md body.

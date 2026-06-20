@@ -89,6 +89,7 @@ const CONFIG_SCHEMA = {
         max_log_bytes: { type: 'number', minimum: 1024 },
         lock_stale_seconds: { type: 'number', minimum: 60 },
         cancel_grace_seconds: { type: 'number', minimum: 1 },
+        agent_idle_timeout_seconds: { type: 'number', minimum: 1 },
       },
       additionalProperties: false,
     },
@@ -239,6 +240,7 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     max_log_bytes: 10485760, // 10MB
     lock_stale_seconds: 86400, // 24h
     cancel_grace_seconds: 10,
+    agent_idle_timeout_seconds: 480,
   },
   feedback_protocol: {
     enabled: true,
@@ -292,6 +294,10 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     }
     if (config.runtime.cancel_grace_seconds === undefined) {
       config.runtime.cancel_grace_seconds = DEFAULT_CONFIG.runtime.cancel_grace_seconds;
+    }
+    // Phase 8D P6.5: fill in agent_idle_timeout_seconds default if missing.
+    if (config.runtime.agent_idle_timeout_seconds === undefined) {
+      config.runtime.agent_idle_timeout_seconds = DEFAULT_CONFIG.runtime.agent_idle_timeout_seconds;
     }
 
     // Phase 5 backward compat: fill in final_auditor with auditor config if missing

@@ -16,7 +16,11 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
 
-function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, string>): void {
+function writeFakeAgentConfig(
+  repoDir: string,
+  roleBehaviors: Record<string, string>,
+  runtimeOverrides?: Record<string, number>,
+): void {
   const fakeAgentPath = resolve(join(process.cwd(), 'tests', 'fixtures', 'fake-agent.mjs'));
   const config = {
     version: 1,
@@ -54,6 +58,7 @@ function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, str
       kill_grace_seconds: 5,
       max_log_bytes: 10485760,
       lock_stale_seconds: 86400,
+      ...runtimeOverrides,
     },
   };
   writeFileSync(join(repoDir, 'review-loop.yaml'), JSON.stringify(config, null, 2));
@@ -71,7 +76,11 @@ function copyPrompts(repoDir: string): void {
   }
 }
 
-function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = {}): string {
+function createTestRepo(
+  suffix: string,
+  roleBehaviors: Record<string, string> = {},
+  runtimeOverrides?: Record<string, number>,
+): string {
   const repoDir = join(tmpdir(), `task-graph-test-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init', { cwd: repoDir });
@@ -86,7 +95,7 @@ function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = 
   // Seed src/ so the repo has tracked source files.
   mkdirSync(join(repoDir, 'src'), { recursive: true });
   writeFileSync(join(repoDir, 'src', 'index.ts'), 'export {};\n', 'utf8');
-  writeFakeAgentConfig(repoDir, roleBehaviors);
+  writeFakeAgentConfig(repoDir, roleBehaviors, runtimeOverrides);
   copyPrompts(repoDir);
   execSync('git add -A', { cwd: repoDir });
   execSync('git commit -m "initial"', { cwd: repoDir });
@@ -263,4 +272,64 @@ describe('Phase 8B: Task Graph resume', () => {
     const statuses = stateAfter.task_graph_state.task_statuses;
     expect(Object.values(statuses).every((v: string) => v === 'passed')).toBe(true);
   }, 180000);
+});
+
+// ─── Phase 8D P6.5: idle watchdog cancels a silently hanging Developer ──
+describe('Phase 8D P6.5: idle watchdog', () => {
+  let repoDir: string;
+
+  afterEach(() => {
+    if (repoDir) {
+      try { rmSync(repoDir, { recursive: true }); } catch { /* ok */ }
+    }
+  });
+
+  it('cancels a silently hanging task Developer via the idle watchdog and reports BLOCKED', async () => {
+    // Tiny idle window so the watchdog trips in ~1s; agent timeout stays high
+    // so the idle watchdog (not the agent timeout) is what aborts the attempt.
+    repoDir = createTestRepo('idle-watchdog', {
+      planner: 'task-graph',
+      developer: 'hang-silent',
+    }, {
+      kill_grace_seconds: 1,
+      max_log_bytes: 10485760,
+      lock_stale_seconds: 86400,
+      cancel_grace_seconds: 1,
+      agent_idle_timeout_seconds: 1,
+    });
+
+    const startedAt = Date.now();
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Run task graph',
+      task_slug: 'idle-watchdog',
+      max_iterations: 1,
+    });
+    const durationMs = Date.now() - startedAt;
+
+    // The run reaches BLOCKED (not stuck in DEVELOPING).
+    expect(result.phase).toBe('BLOCKED');
+    expect(result.exit_code).toBe(3);
+    expect(result.error?.code).toBe('VERIFICATION_FAILED');
+    // Actionable idle-timeout detail reaches the result message.
+    expect(result.message).toMatch(/idle watchdog|stalled|idle timeout/i);
+    // Cancelled quickly — well under the 5min hang or the 60s agent timeout.
+    expect(durationMs).toBeLessThan(15000);
+
+    // iteration-log.md records the stall/timeout event with actionable detail.
+    const log = readFileSync(join(repoDir, '.agent', 'iteration-log.md'), 'utf8');
+    expect(log).toMatch(/idle watchdog|stalled|idle timeout/i);
+
+    // task-results.json contains a failed result for the stalled task.
+    const tr = JSON.parse(readFileSync(join(repoDir, '.agent', 'task-results.json'), 'utf8'));
+    expect(tr.results.some((r: { task_id: string; status: string }) => r.task_id === 'task-1' && r.status === 'failed')).toBe(true);
+
+    // progress.json also surfaces the stall/timeout event for monitors.
+    const progress = JSON.parse(readFileSync(join(repoDir, '.agent', 'progress.json'), 'utf8'));
+    expect(progress.last_event).toMatch(/idle watchdog|stalled|idle timeout/i);
+
+    // state.json shows the task reached 'failed' (BLOCKED), not stuck running.
+    const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
+    expect(state.task_graph_state.task_statuses['task-1']).toBe('failed');
+  }, 30000);
 });

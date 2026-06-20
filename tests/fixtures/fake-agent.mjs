@@ -25,6 +25,8 @@
  *   rework-success   - Developer: write valid handoff for rework (iteration > 1)
  *   rework-fail      - Developer: still fails after rework
  *   slow-developer   - Developer: sleep 30s (for mid-run cancel testing)
+ *   hang-silent      - Developer: write nothing and sleep 5min; for idle-watchdog tests
+ *                       (the idle watchdog must abort this before the agent timeout)
  *   developer-fail-three-then-success - Developer: fail 3x with AGENT_ERROR (exit 1), then succeed
  *   no-artifact      - Don't write any artifact
  *   timeout          - Sleep until timeout
@@ -682,6 +684,17 @@ try {
           writeFileSync(join(projectRoot, 'src', 'test-impl.ts'), '// Test implementation\nexport const testFn = () => true;\n', 'utf8');
           await new Promise((resolve) => {
             setTimeout(resolve, 30000);
+          });
+          break;
+        case 'hang-silent':
+          // Phase 8D P6.5: Simulate a silently hanging Developer — write no
+          // handoff and no stdout/stderr output, then sleep well past the agent
+          // timeout. The idle watchdog should abort this attempt within the
+          // configured idle window (well before this sleep resolves) via the
+          // per-attempt AbortController. Uses an active timer to keep the event
+          // loop alive so the process actually hangs instead of exiting.
+          await new Promise((resolve) => {
+            setTimeout(resolve, 300000); // 5 minutes — watchdog must abort first
           });
           break;
         case 'no-artifact':
