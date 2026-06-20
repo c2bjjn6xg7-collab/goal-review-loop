@@ -129,7 +129,7 @@ export async function runOrchestrator(params: {
    * Phase 8D P5 Round 2B: explicit `--parallel` opt-in. On its own, this
    * requests parallel mode; combined with a worker count > 1 (from config or
    * `max_parallel_workers`) it resolves to `wave` mode, which the orchestrator
-   * blocks here until Round 2C wires real worktree-backed execution.
+   * blocks here until Round 2E wires real worktree-backed execution.
    */
   parallel?: boolean;
   /**
@@ -194,7 +194,7 @@ export async function runOrchestrator(params: {
     // Phase 8D P5 Round 2B: resolve the parallel-execution decision from config
     // + CLI overrides. Invalid worker counts surface here as a clear CONFIG_ERROR
     // before any agent or git work begins. Wave-mode requests fail closed until
-    // Round 2C wires worktree-backed execution; serial decisions (the default
+    // Round 2E wires worktree-backed execution; serial decisions (the default
     // and one-worker explicit opt-in) flow through to the existing path
     // unchanged.
     let parallelDecision;
@@ -218,7 +218,7 @@ export async function runOrchestrator(params: {
       return makeBlockedResult(
         '',
         projectRoot,
-        `Parallel wave mode requested (${parallelDecision.maxParallelWorkers} workers, source=${parallelDecision.source}) but worktree-backed wave execution is not wired until Phase 8D P5 Round 2C. Re-run without --parallel or set config.parallel.enabled=false to use the existing serial path.`,
+        `Parallel wave mode requested (${parallelDecision.maxParallelWorkers} workers, source=${parallelDecision.source}) but worktree-backed wave execution is not wired until Phase 8D P5 Round 2E. Re-run without --parallel or set config.parallel.enabled=false to use the existing serial path.`,
         'CONFIG_ERROR',
       );
     }

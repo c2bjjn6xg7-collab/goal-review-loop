@@ -155,7 +155,7 @@ describe('runOrchestrator parallel opt-in guard', () => {
     expect(result.exit_code).toBe(3);
     expect(result.error?.code).toBe('CONFIG_ERROR');
     expect(result.message).toMatch(/wave/i);
-    expect(result.message).toMatch(/Round 2C/);
+    expect(result.message).toMatch(/Round 2E/);
     // No git work: branch must be empty (preflight never ran).
     expect(result.branch).toBe('');
     expect(result.commit_sha).toBeNull();
