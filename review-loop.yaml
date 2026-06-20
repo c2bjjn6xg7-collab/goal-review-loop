@@ -2,7 +2,28 @@ version: 1
 
 agents:
   planner:
-    command: ["codex", "exec", "-s", "workspace-write", "{prompt_file}"]
+    command:
+      - "sh"
+      - "-c"
+      - |
+        P=$(cat "$1")
+        heartbeat_interval="${REVIEW_LOOP_PLANNER_HEARTBEAT_SECONDS:-30}"
+        (
+          while :; do
+            sleep "$heartbeat_interval"
+            printf '[review-loop heartbeat] claude planner still running (%ss idle heartbeat)\n' "$heartbeat_interval" >&2
+          done
+        ) &
+        heartbeat_pid=$!
+        trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM
+        env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+          claude -p --permission-mode bypassPermissions --max-turns 160 -- "$P"
+        status=$?
+        kill "$heartbeat_pid" 2>/dev/null || true
+        wait "$heartbeat_pid" 2>/dev/null || true
+        exit "$status"
+      - "claude-planner"
+      - "{prompt_file}"
     timeout_seconds: 1800
   developer:
     command:
