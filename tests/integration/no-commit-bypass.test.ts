@@ -22,6 +22,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
 import { createStartCommand, executeStart } from '../../src/cli/start.js';
+import { createStatusCommand } from '../../src/cli/status.js';
 
 function writeFakeAgentConfig(repoDir: string, roleBehaviors: Record<string, string>): void {
   const fakeAgentPath = resolve(join(process.cwd(), 'tests', 'fixtures', 'fake-agent.mjs'));
@@ -148,6 +149,18 @@ describe('--no-commit bypass regression', () => {
     cmd3.parse(['--request', 'noop', '--parallel', '--max-parallel-workers', '3'], { from: 'user' });
     expect(cmd3.opts().parallel).toBe(true);
     expect(cmd3.opts().maxParallelWorkers).toBe(3);
+
+    const cmd4 = createStartCommand();
+    cmd4.exitOverride();
+    cmd4.action(() => { /* no-op */ });
+    cmd4.parse(['--request', 'noop', '--watch', '--watch-interval', '5000'], { from: 'user' });
+    expect(cmd4.opts().watchInterval).toBe(5000);
+
+    const statusCmd = createStatusCommand();
+    statusCmd.exitOverride();
+    statusCmd.action(() => { /* no-op */ });
+    statusCmd.parse(['--watch', '--watch-interval', '5000'], { from: 'user' });
+    expect(statusCmd.opts().watchInterval).toBe(5000);
   });
 
   it('executeStart({ commit: false }) reaches PASSED with no commit (HEAD unchanged)', async () => {

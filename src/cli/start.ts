@@ -26,20 +26,30 @@ import { existsSync, readFileSync } from 'node:fs';
 import { runOrchestrator, type OrchestratorResult } from '../orchestrator/run-orchestrator.js';
 
 /**
- * Strict integer parser for `--max-parallel-workers`.
+ * Strict positive integer parser for CLI numeric options.
  *
- * `parseInt` would silently truncate "1.5" → 1, hide "abc" as NaN, and accept
- * leading-sign / trailing-garbage values. The resolver enforces the [1, 16]
- * range; here we only guarantee the parsed value is a non-negative integer
- * literal so range validation in `executeStart` operates on a clean number.
+ * `parseInt` would silently truncate "1.5" to 1, hide "abc" as NaN, and in
+ * Commander custom parsers can misread the previous/default value as a radix.
  */
-function parseWorkerCount(value: string): number {
-  if (!/^[0-9]+$/.test(value)) {
+function parsePositiveInteger(value: string, optionName: string): number {
+  if (!/^[0-9]+$/.test(value) || Number(value) < 1) {
     throw new InvalidArgumentError(
-      `--max-parallel-workers must be a positive integer, got "${value}"`,
+      `${optionName} must be a positive integer, got "${value}"`,
     );
   }
   return Number(value);
+}
+
+function parseMaxIterations(value: string): number {
+  return parsePositiveInteger(value, '--max-iterations');
+}
+
+function parseWatchInterval(value: string): number {
+  return parsePositiveInteger(value, '--watch-interval');
+}
+
+function parseWorkerCount(value: string): number {
+  return parsePositiveInteger(value, '--max-parallel-workers');
 }
 
 export function createStartCommand(): Command {
@@ -50,7 +60,7 @@ export function createStartCommand(): Command {
     .option('--request <text>', 'User request text')
     .option('--request-file <path>', 'Path to user request file')
     .option('--task-slug <slug>', 'Optional task short name')
-    .option('--max-iterations <n>', 'Max rework iterations', parseInt)
+    .option('--max-iterations <n>', 'Max rework iterations', parseMaxIterations)
     .option('--config <path>', 'Config file path')
     .option('--no-commit', 'Do not commit on pass')
     .option('--tag', 'Create local tag on pass')
@@ -61,7 +71,7 @@ export function createStartCommand(): Command {
       parseWorkerCount,
     )
     .option('--watch', 'Display progress updates during execution')
-    .option('--watch-interval <ms>', 'Watch polling interval in ms', parseInt, 2000)
+    .option('--watch-interval <ms>', 'Watch polling interval in ms', parseWatchInterval, 2000)
     .action(async (options) => {
       try {
         const result = await executeStart(options);

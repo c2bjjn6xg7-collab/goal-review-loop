@@ -16,13 +16,20 @@ import {
   feedbackSummaryHasContent,
 } from './status-feedback-summary.js';
 
+function parseWatchInterval(value: string): number {
+  if (!/^[0-9]+$/.test(value) || Number(value) < 1) {
+    throw new Error(`--watch-interval must be a positive integer, got "${value}"`);
+  }
+  return Number(value);
+}
+
 export function createStatusCommand(): Command {
   const cmd = new Command('status');
   cmd
     .description('Show current run status')
     .option('--json', 'Output status as JSON')
     .option('--watch', 'Continuously poll status until terminal phase')
-    .option('--watch-interval <ms>', 'Watch polling interval in ms', parseInt, 2000)
+    .option('--watch-interval <ms>', 'Watch polling interval in ms', parseWatchInterval, 2000)
     .option('--project-root <path>', 'Project root directory', process.cwd())
     .action(async (options) => {
       try {
