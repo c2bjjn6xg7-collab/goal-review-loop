@@ -42,6 +42,7 @@ export async function createIntegrationAuditFixture(options: {
   verificationCommand?: string[];
   finalAuditorBehavior?: 'audit-pass' | 'audit-fail' | 'audit-blocked' | 'audit-tamper-final';
   perTaskDiffDigest?: string;
+  integrationChange?: 'add-feature' | 'delete-base';
 }): Promise<IntegrationAuditFixture> {
   const repoDir = mkdtempSync(path.join(tmpdir(), `integration-audit-${options.suffix}-`));
   const runId = INTEGRATION_AUDIT_RUN_ID;
@@ -63,9 +64,15 @@ export async function createIntegrationAuditFixture(options: {
   const mainBranch = git(repoDir, ['branch', '--show-current']);
 
   git(repoDir, ['switch', '-c', integrationBranch, baseCommit]);
-  writeFile(repoDir, 'src/feature.ts', 'export const feature = true;\n');
-  git(repoDir, ['add', 'src/feature.ts']);
-  git(repoDir, ['commit', '-q', '-m', 'integrated feature']);
+  if (options.integrationChange === 'delete-base') {
+    rmSync(path.join(repoDir, 'src', 'base.ts'));
+    git(repoDir, ['add', '--', 'src/base.ts']);
+    git(repoDir, ['commit', '-q', '-m', 'delete base feature']);
+  } else {
+    writeFile(repoDir, 'src/feature.ts', 'export const feature = true;\n');
+    git(repoDir, ['add', 'src/feature.ts']);
+    git(repoDir, ['commit', '-q', '-m', 'integrated feature']);
+  }
   const integrationHead = git(repoDir, ['rev-parse', '--verify', 'HEAD']);
 
   const agentDir = path.join(repoDir, '.agent');
@@ -92,6 +99,47 @@ export async function createIntegrationAuditFixture(options: {
   writeFile(repoDir, '.agent/GOAL.md', goalContent);
   writeFile(repoDir, '.agent/plan.md', renderPlan(runId));
   writeFile(repoDir, '.agent/developer-handoff.md', renderHandoff(runId));
+  writeFile(repoDir, '.agent/task-graph.json', JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    goal_digest: goalDigest,
+    created_at: new Date().toISOString(),
+    tasks: [
+      {
+        id: 'task-1',
+        title: 'Integrated fixture task',
+        description: 'Fixture task used by integration audit tests.',
+        difficulty: 'low',
+        risk: 'low',
+        parallelizable: false,
+        depends_on: [],
+        allowed_changes: options.allowedChanges ?? ['src/**'],
+        disallowed_changes: ['.git/**', '.agent/state.json'],
+        verification_commands: [
+          {
+            id: 'task-1-verify',
+            command: options.verificationCommand ?? ['node', '-e', 'process.exit(0)'],
+            cwd: '.',
+            required: true,
+            timeout_seconds: 30,
+          },
+        ],
+        status: 'passed',
+      },
+    ],
+  }, null, 2));
+  writeFile(repoDir, '.agent/task-results.json', JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    results: [
+      {
+        task_id: 'task-1',
+        status: 'passed',
+        branch: `agent/${runId}/task-1`,
+        commit_sha: integrationHead,
+      },
+    ],
+  }, null, 2));
   await stateStore.update(() => ({ goal_digest: goalDigest }));
   await stateStore.transition(Phase.DEVELOPING);
 
@@ -113,6 +161,14 @@ export async function createIntegrationAuditFixture(options: {
     created_at: new Date().toISOString(),
   };
   await writeIntegrationPlanEvidence({ projectRoot: repoDir, plan });
+  writeFile(repoDir, '.agent/integration/cherry-pick-log.jsonl', JSON.stringify({
+    task_id: 'task-1',
+    branch: `agent/${runId}/task-1`,
+    commit_sha: integrationHead,
+    outcome: 'already_applied',
+    head_sha: integrationHead,
+    at: new Date().toISOString(),
+  }) + '\n');
   if (options.perTaskDiffDigest) {
     writeFile(repoDir, '.agent/task-runs/task-1/result.json', JSON.stringify({
       schema_version: 1,

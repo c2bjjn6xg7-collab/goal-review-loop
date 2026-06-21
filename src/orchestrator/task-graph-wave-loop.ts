@@ -32,7 +32,8 @@ import {
   runIntegrationMerge,
   writeIntegrationPlanEvidence,
 } from './integration-runner.js';
-import { integrationAuditSkipReason, runIntegrationAudit } from './integration-audit.js';
+import { runIntegrationAudit } from './integration-audit.js';
+import { runIntegrationFinalization } from './integration-finalizer.js';
 import {
   Phase as PhaseEnum,
   TaskStatus,
@@ -61,6 +62,8 @@ export interface TaskGraphWaveLoopParams {
   maxIterations: number;
   maxParallelWorkers: number;
   combinedSignal: AbortSignal;
+  noCommit: boolean;
+  tag: boolean;
 }
 
 export async function runTaskGraphWaveLoop(
@@ -83,6 +86,8 @@ export async function runTaskGraphWaveLoop(
     maxIterations,
     maxParallelWorkers,
     combinedSignal,
+    noCommit,
+    tag,
   } = params;
 
   const tasks = orderedTasks(taskGraph);
@@ -348,12 +353,17 @@ export async function runTaskGraphWaveLoop(
       projectRoot,
       agentDir,
       runId,
+      baseCommit,
+      goalDigest,
       stateStore,
       artifactStore,
       orchestratorRegistry,
       taskResultsPath,
       integrationResult,
       integrationAuditResult,
+      config,
+      noCommit,
+      tag,
       iteration: tasks.length + 2,
     })),
   );
@@ -363,24 +373,34 @@ async function mapIntegrationAuditResult(params: {
   projectRoot: string;
   agentDir: string;
   runId: string;
+  baseCommit: string;
+  goalDigest: string;
   stateStore: StateStore;
   artifactStore: ArtifactStore;
   orchestratorRegistry: OrchestratorFileRegistry;
   taskResultsPath: string;
   integrationResult: Awaited<ReturnType<typeof runIntegrationMerge>>;
   integrationAuditResult: Awaited<ReturnType<typeof runIntegrationAudit>>;
+  config: ReviewLoopConfig;
+  noCommit: boolean;
+  tag: boolean;
   iteration: number;
 }): Promise<Parameters<typeof makeResult>> {
   const {
     projectRoot,
     agentDir,
     runId,
+    baseCommit,
+    goalDigest,
     stateStore,
     artifactStore,
     orchestratorRegistry,
     taskResultsPath,
     integrationResult,
     integrationAuditResult,
+    config,
+    noCommit,
+    tag,
     iteration,
   } = params;
   registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
@@ -441,31 +461,91 @@ async function mapIntegrationAuditResult(params: {
     ];
   }
 
-  await stateStore.transition(PhaseEnum.PASSED);
+  // R2 PASS → run Phase 8E R3 finalization (commit/tag). R3 owns the
+  // FINALIZING → PASSED/BLOCKED transition; the wave loop only maps the result.
+  const finalization = await runIntegrationFinalization({
+    projectRoot,
+    agentDir,
+    runId,
+    baseCommit,
+    goalDigest,
+    integrationBranch: integrationAuditResult.integration_branch,
+    iteration,
+    stateStore,
+    artifactStore,
+    orchestratorRegistry,
+    config,
+    tag,
+    noCommit,
+  });
+
+  registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
+
+  if (finalization.status === 'blocked') {
+    const message = finalization.error_message ?? 'Phase 8E R3 finalization BLOCKED';
+    await appendLog(
+      artifactStore,
+      runId,
+      iteration,
+      'FINALIZING',
+      'integration finalization',
+      'BLOCKED',
+      message,
+    );
+    await emitProgress({
+      projectRoot,
+      stateStore,
+      lastEvent: 'Phase 8E R3 finalization BLOCKED',
+      registry: orchestratorRegistry,
+      finalAuditDecision: 'PASS',
+    });
+    return [
+      runId,
+      PhaseEnum.BLOCKED,
+      3,
+      integrationAuditResult.integration_branch,
+      'PASS',
+      uniquePaths([...artifactPaths, ...finalization.artifact_paths]),
+      'Resolve Phase 8E R3 finalization blocker, then resume',
+      message,
+      {
+        code: finalization.error_code ?? 'GIT_COMMIT_ERROR',
+        message,
+        resumable: finalization.final_commit_sha !== null,
+        suggested_action: 'Review .agent/integration evidence and retry Phase 8E R3 finalization.',
+      },
+      finalization.final_commit_sha,
+      false,
+      finalization.tag_name,
+      finalization.tag_created,
+      null,
+    ];
+  }
+
   await emitProgress({
     projectRoot,
     stateStore,
-    lastEvent: `Phase 8E R2 integrated audit PASSED: ${integrationAuditResult.integration_branch}`,
+    lastEvent: `Phase 8E R3 finalization PASSED: ${integrationAuditResult.integration_branch}`,
     registry: orchestratorRegistry,
+    commitSha: finalization.final_commit_sha,
     finalAuditDecision: 'PASS',
   });
 
-  const skipReason = integrationAuditSkipReason();
   return [
     runId,
     PhaseEnum.PASSED,
     0,
     integrationAuditResult.integration_branch,
     'PASS',
-    artifactPaths,
-    'Run Phase 8E R3 final commit/tag slice when ready',
-    `Parallel wave task execution PASSED. Phase 8E R2 verified and Final Aggregate Audited integration branch ${integrationAuditResult.integration_branch}; final project commit/tag are deferred to R3.`,
+    uniquePaths([...artifactPaths, ...finalization.artifact_paths]),
+    `Phase 8E R3 finalized integration branch ${integrationAuditResult.integration_branch}`,
+    `Parallel wave task execution PASSED. Phase 8E R2 verified and Final Aggregate Audited; Phase 8E R3 created the final project commit ${finalization.final_commit_sha?.slice(0, 8) ?? ''} on ${integrationAuditResult.integration_branch}.`,
     null,
-    null,
-    true,
-    null,
-    false,
-    skipReason,
+    finalization.final_commit_sha,
+    finalization.commit_skipped,
+    finalization.tag_name,
+    finalization.tag_created,
+    finalization.skip_reason,
   ];
 }
 

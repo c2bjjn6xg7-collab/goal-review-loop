@@ -6,11 +6,17 @@ import {
   findStagedSetViolations,
   buildAllowedCommitSet,
   VERSIONED_ARTIFACT_PATHS,
+  INTEGRATION_VERSIONED_ARTIFACT_PATHS,
+  OPTIONAL_INTEGRATION_VERSIONED_ARTIFACT_PATHS,
+  isIntegrationVersionedArtifact,
+  stageFiles,
+  stageFilesControlled,
   createCommit,
   createTag,
   commitExists,
   verifyCommitTree,
   getHeadSha,
+  getStagedFiles,
 } from '../../src/git/commit-manager.js';
 import { execSync } from 'node:child_process';
 import { writeFileSync, mkdirSync, rmSync, chmodSync, existsSync } from 'node:fs';
@@ -311,5 +317,254 @@ describe('verifyCommitTree', () => {
     expect(result.missing).toContain('.agent/plan.md');
     expect(result.missing).toContain('.agent/GOAL.md');
     expect(result.missing).toContain('.agent/final-audit.md');
+  });
+});
+
+describe('INTEGRATION_VERSIONED_ARTIFACT_PATHS allowlist', () => {
+  it('includes core R3 versioned artifacts and excludes task-runs', () => {
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/GOAL.md');
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/plan.md');
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/final-audit.md');
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/integration/integration-plan.json');
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/integration/integrated-diff-metadata.json');
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/integration/final-audit-context.json');
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS).not.toContain('.agent/state.json');
+    // .agent/task-runs/** must never be allowlisted
+    expect(INTEGRATION_VERSIONED_ARTIFACT_PATHS.some((p) => p.startsWith('.agent/task-runs/'))).toBe(false);
+  });
+
+  it('optional artifacts include conflict-report and excluded-tasks', () => {
+    expect(OPTIONAL_INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/integration/conflict-report.md');
+    expect(OPTIONAL_INTEGRATION_VERSIONED_ARTIFACT_PATHS).toContain('.agent/integration/excluded-tasks.md');
+  });
+});
+
+describe('isIntegrationVersionedArtifact', () => {
+  it('recognizes allowlisted artifacts', () => {
+    expect(isIntegrationVersionedArtifact('.agent/final-audit.md')).toBe(true);
+    expect(isIntegrationVersionedArtifact('.agent/integration/integration-plan.json')).toBe(true);
+    expect(isIntegrationVersionedArtifact('.agent/integration/conflict-report.md')).toBe(true);
+  });
+
+  it('rejects non-allowlisted paths', () => {
+    expect(isIntegrationVersionedArtifact('.agent/state.json')).toBe(false);
+    expect(isIntegrationVersionedArtifact('.agent/task-runs/task-1/result.json')).toBe(false);
+    expect(isIntegrationVersionedArtifact('.agent/audit-report.md')).toBe(false);
+    expect(isIntegrationVersionedArtifact('src/index.ts')).toBe(false);
+  });
+});
+
+function createTestRepoWithAgentIgnore(suffix: string): string {
+  const repoDir = join(tmpdir(), `commit-mgr-force-${suffix}-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, '.gitignore'), '.agent/**\nnode_modules/**\ndist/**\n', 'utf8');
+  writeFileSync(join(repoDir, 'README.md'), '# Test\n');
+  execSync('git add -A && git commit -m "initial"', { cwd: repoDir });
+  return repoDir;
+}
+
+describe('stageFilesControlled (Phase 8E R3 force-add)', () => {
+  it('stages ordinary business files with precise pathspecs (no force)', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('biz');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    writeFileSync(join(repoDir, 'src', 'feature.ts'), 'export const x = 1;\n');
+
+    const result = await stageFilesControlled(repoDir, [
+      { path: 'src/feature.ts', force: false },
+    ]);
+    expect(result.success).toBe(true);
+
+    const staged = await getStagedFiles(repoDir);
+    expect(staged).toContain('src/feature.ts');
+  });
+
+  it('stages allowlisted ignored .agent artifacts with force mode', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('force-ok');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, '.agent', 'integration'), { recursive: true });
+    writeFileSync(join(repoDir, '.agent', 'final-audit.md'), '# final\n');
+    writeFileSync(join(repoDir, '.agent', 'integration', 'integration-plan.json'), '{}\n');
+
+    // Sanity: plain git add would refuse the ignored file
+    expect(execSync('git check-ignore .agent/final-audit.md', { cwd: repoDir }).toString().trim()).toBe('.agent/final-audit.md');
+
+    const result = await stageFilesControlled(repoDir, [
+      { path: '.agent/final-audit.md', force: true },
+      { path: '.agent/integration/integration-plan.json', force: true },
+    ]);
+    expect(result.success).toBe(true);
+
+    const staged = await getStagedFiles(repoDir);
+    expect(staged).toContain('.agent/final-audit.md');
+    expect(staged).toContain('.agent/integration/integration-plan.json');
+  });
+
+  it('stages allowlisted .agent artifacts even with force:false (ignored files require -f)', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('force-implicit');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, '.agent'), { recursive: true });
+    writeFileSync(join(repoDir, '.agent', 'plan.md'), '# plan\n');
+
+    const result = await stageFilesControlled(repoDir, [
+      { path: '.agent/plan.md', force: false },
+    ]);
+    expect(result.success).toBe(true);
+    expect(await getStagedFiles(repoDir)).toContain('.agent/plan.md');
+  });
+
+  it('rejects non-allowlisted .agent paths before invoking git', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('reject-agent');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, '.agent', 'task-runs', 'task-1'), { recursive: true });
+    writeFileSync(join(repoDir, '.agent', 'task-runs', 'task-1', 'result.json'), '{}\n');
+    writeFileSync(join(repoDir, '.agent', 'audit-report.md'), '# audit\n');
+
+    const taskRuns = await stageFilesControlled(repoDir, [
+      { path: '.agent/task-runs/task-1/result.json', force: true },
+    ]);
+    expect(taskRuns.success).toBe(false);
+    expect(taskRuns.error).toMatch(/non-allowlisted .agent path/);
+
+    const auditReport = await stageFilesControlled(repoDir, [
+      { path: '.agent/audit-report.md', force: true },
+    ]);
+    expect(auditReport.success).toBe(false);
+    expect(auditReport.error).toMatch(/non-allowlisted .agent path/);
+
+    // Nothing was staged
+    expect(await getStagedFiles(repoDir)).toEqual([]);
+  });
+
+  it('prevalidates the full batch so a later invalid entry leaves no partial staged files', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('prevalidate-batch');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    mkdirSync(join(repoDir, '.agent'), { recursive: true });
+    writeFileSync(join(repoDir, 'src', 'feature.ts'), 'export const x = 1;\n');
+    writeFileSync(join(repoDir, '.agent', 'state.json'), '{}\n');
+
+    const result = await stageFilesControlled(repoDir, [
+      { path: 'src/feature.ts', force: false },
+      { path: '.agent/state.json', force: false },
+    ]);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/local-only/);
+    expect(await getStagedFiles(repoDir)).toEqual([]);
+  });
+
+  it('rejects local-only runtime artifacts before invoking git', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('reject-local');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, '.agent'), { recursive: true });
+    writeFileSync(join(repoDir, '.agent', 'state.json'), '{}\n');
+    mkdirSync(join(repoDir, 'dist'), { recursive: true });
+    writeFileSync(join(repoDir, 'dist', 'index.js'), '/* built */\n');
+
+    const stateResult = await stageFilesControlled(repoDir, [
+      { path: '.agent/state.json', force: false },
+    ]);
+    expect(stateResult.success).toBe(false);
+    expect(stateResult.error).toMatch(/local-only|non-allowlisted/);
+
+    const distResult = await stageFilesControlled(repoDir, [
+      { path: 'dist/index.js', force: false },
+    ]);
+    expect(distResult.success).toBe(false);
+    expect(distResult.error).toMatch(/local-only/);
+
+    expect(await getStagedFiles(repoDir)).toEqual([]);
+  });
+
+  it('rejects force:true for business paths (force only for allowlisted .agent)', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('reject-force-biz');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    writeFileSync(join(repoDir, 'src', 'feature.ts'), 'export const x = 1;\n');
+
+    const result = await stageFilesControlled(repoDir, [
+      { path: 'src/feature.ts', force: true },
+    ]);
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Force-add is only permitted for allowlisted/);
+    expect(await getStagedFiles(repoDir)).toEqual([]);
+  });
+
+  it('never uses git add -A / git add . (precise pathspecs only)', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('precise');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    writeFileSync(join(repoDir, 'src', 'a.ts'), 'a;\n');
+    writeFileSync(join(repoDir, 'src', 'b.ts'), 'b;\n');
+
+    const result = await stageFilesControlled(repoDir, [
+      { path: 'src/a.ts', force: false },
+    ]);
+    expect(result.success).toBe(true);
+    // Only the requested file is staged, not src/b.ts
+    const staged = await getStagedFiles(repoDir);
+    expect(staged).toEqual(['src/a.ts']);
+  });
+});
+
+describe('stageFiles (compatibility)', () => {
+  it('remains compatible with existing callers (plain path array)', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('compat');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, 'src'), { recursive: true });
+    writeFileSync(join(repoDir, 'src', 'feature.ts'), 'export const x = 1;\n');
+
+    const result = await stageFiles(repoDir, ['src/feature.ts']);
+    expect(result.success).toBe(true);
+    expect(await getStagedFiles(repoDir)).toContain('src/feature.ts');
+  });
+
+  it('force-adds ignored versioned .agent artifacts for existing finalization callers', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('compat-agent-artifacts');
+    cleanupDirs.push(repoDir);
+
+    mkdirSync(join(repoDir, '.agent'), { recursive: true });
+    writeFileSync(join(repoDir, '.agent', 'plan.md'), '# plan\n');
+    writeFileSync(join(repoDir, '.agent', 'GOAL.md'), '# goal\n');
+    writeFileSync(join(repoDir, '.agent', 'developer-handoff.md'), '# handoff\n');
+    writeFileSync(join(repoDir, '.agent', 'audit-report.md'), '# audit\n');
+    writeFileSync(join(repoDir, '.agent', 'final-audit.md'), '# final\n');
+
+    const result = await stageFiles(repoDir, [
+      '.agent/plan.md',
+      '.agent/GOAL.md',
+      '.agent/developer-handoff.md',
+      '.agent/audit-report.md',
+      '.agent/final-audit.md',
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(await getStagedFiles(repoDir)).toEqual([
+      '.agent/GOAL.md',
+      '.agent/audit-report.md',
+      '.agent/developer-handoff.md',
+      '.agent/final-audit.md',
+      '.agent/plan.md',
+    ]);
+  });
+
+  it('returns success for an empty path list without invoking git', async () => {
+    const repoDir = createTestRepoWithAgentIgnore('empty');
+    cleanupDirs.push(repoDir);
+    const result = await stageFiles(repoDir, []);
+    expect(result.success).toBe(true);
   });
 });

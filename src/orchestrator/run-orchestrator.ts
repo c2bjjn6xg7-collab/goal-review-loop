@@ -20,6 +20,7 @@ import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { runTaskGraphLoop } from './task-graph-loop.js';
 import { runTaskGraphWaveLoop } from './task-graph-wave-loop.js';
+import { runIntegrationFinalization } from './integration-finalizer.js';
 import { resolveTaskGraphResumeDecision } from './task-graph-resume.js';
 import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
@@ -353,6 +354,96 @@ export async function runOrchestrator(params: {
         const resumeTaskIndex = resumeDecision.taskIndex;
         if (resume.phase === PhaseEnum.FINALIZING && resumeDecision.kind === 'all_tasks_complete') {
           const finalizationIteration = resumeDecision.taskIndex + 1;
+          const integrationBranch = readR2IntegrationBranch(projectRoot, runId);
+          if (integrationBranch) {
+            await appendLog(
+              artifactStore,
+              runId,
+              finalizationIteration,
+              'FINALIZING',
+              'task graph resume from FINALIZING',
+              'PASS',
+              `R2 integration evidence found — resuming Phase 8E R3 finalization on ${integrationBranch}`,
+            );
+            const finalization = await runIntegrationFinalization({
+              projectRoot,
+              agentDir,
+              runId,
+              baseCommit,
+              goalDigest,
+              integrationBranch,
+              iteration: finalizationIteration,
+              stateStore,
+              artifactStore,
+              orchestratorRegistry,
+              config,
+              tag: params.tag ?? config.git.create_tag,
+              noCommit: params.no_commit ?? !config.git.commit_on_pass,
+            });
+            registerDirectoryFiles(join(agentDir, 'integration'), orchestratorRegistry);
+            if (finalization.status === 'blocked') {
+              const message = finalization.error_message ?? 'Phase 8E R3 finalization BLOCKED';
+              return makeResult(
+                runId,
+                PhaseEnum.BLOCKED,
+                3,
+                integrationBranch,
+                'PASS',
+                finalization.artifact_paths,
+                'Resolve Phase 8E R3 finalization blocker, then resume',
+                message,
+                {
+                  code: finalization.error_code ?? 'GIT_COMMIT_ERROR',
+                  message,
+                  resumable: finalization.final_commit_sha !== null,
+                  suggested_action: 'Review .agent/integration evidence and retry Phase 8E R3 finalization.',
+                },
+                finalization.final_commit_sha,
+                false,
+                finalization.tag_name,
+                finalization.tag_created,
+                null,
+              );
+            }
+            return makeResult(
+              runId,
+              PhaseEnum.PASSED,
+              0,
+              integrationBranch,
+              'PASS',
+              finalization.artifact_paths,
+              `Phase 8E R3 finalized integration branch ${integrationBranch}`,
+              finalization.final_commit_sha
+                ? `Phase 8E R3 finalization PASSED. Committed as ${finalization.final_commit_sha.slice(0, 8)}.`
+                : 'Phase 8E R3 finalization PASSED. Commit skipped.',
+              null,
+              finalization.final_commit_sha,
+              finalization.commit_skipped,
+              finalization.tag_name,
+              finalization.tag_created,
+              finalization.skip_reason,
+            );
+          }
+          if (parallelDecision.mode === 'wave') {
+            const message = 'R2 integration evidence missing or unreadable on Phase 8E R3 FINALIZING resume; refusing to rerun Final Aggregate Audit.';
+            await appendLog(
+              artifactStore,
+              runId,
+              finalizationIteration,
+              'FINALIZING',
+              'task graph resume from FINALIZING',
+              'FAIL',
+              message,
+            );
+            await transitionToBlocked(stateStore, message);
+            return makeBlockedResult(
+              runId,
+              projectRoot,
+              message,
+              'STATE_CONFLICT',
+              currentBranch,
+            );
+          }
           await appendLog(
             artifactStore,
             runId,
@@ -699,6 +790,8 @@ export async function runOrchestrator(params: {
           maxIterations: params.max_iterations ?? config.loop.max_iterations,
           maxParallelWorkers: parallelDecision.maxParallelWorkers,
           combinedSignal,
+          noCommit: params.no_commit ?? !config.git.commit_on_pass,
+          tag: params.tag ?? config.git.create_tag,
         });
       }
       return await runTaskGraphLoop({
@@ -2709,6 +2802,23 @@ export function makeBlockedResult(
       suggested_action: 'Check configuration and try again',
     },
   );
+}
+
+function readR2IntegrationBranch(projectRoot: string, runId: string): string | null {
+  const metadataPath = join(projectRoot, '.agent', 'integration', 'integrated-diff-metadata.json');
+  if (!existsSync(metadataPath)) return null;
+
+  try {
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as {
+      run_id?: unknown;
+      integration_branch?: unknown;
+    };
+    if (metadata.run_id !== runId) return null;
+    if (typeof metadata.integration_branch !== 'string') return null;
+    return metadata.integration_branch;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Phase 4 Helper Functions ────────────────────────────────

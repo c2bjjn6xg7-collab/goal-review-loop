@@ -113,6 +113,7 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
       developer: 'task-success',
     });
     const originalBranch = git(repoDir, ['branch', '--show-current']);
+    const originalBranchSha = git(repoDir, ['rev-parse', originalBranch]);
 
     const result = await runOrchestrator({
       project_root: repoDir,
@@ -120,22 +121,22 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
       task_slug: 'parallel-wave',
       parallel: true,
       max_parallel_workers: 2,
-      no_commit: true,
     });
 
     expect(result.phase).toBe('PASSED');
     expect(result.exit_code).toBe(0);
     expect(result.error).toBeNull();
     expect(result.audit_decision).toBe('PASS');
-    expect(result.commit_sha).toBeNull();
-    expect(result.commit_skipped).toBe(true);
-    expect(result.skip_reason).toMatch(/Phase 8E R2 ran integrated verification and Final Aggregate Audit/i);
-    expect(result.message).toMatch(/Phase 8E R2 verified and Final Aggregate Audited/i);
-    expect(result.message).toMatch(/final project commit\/tag are deferred to R3/i);
+    // Phase 8E R3 creates the final project commit on integration/{run_id}.
+    expect(result.commit_sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.commit_skipped).toBe(false);
+    expect(result.skip_reason).toBeNull();
+    expect(result.message).toMatch(/Phase 8E R3 created the final project commit/i);
     expect(result.branch).toBe(`integration/${result.run_id}`);
     expect(git(repoDir, ['branch', '--show-current'])).toBe(`integration/${result.run_id}`);
-    expect(git(repoDir, ['rev-parse', '--verify', `integration/${result.run_id}`])).toMatch(/^[0-9a-f]{40}$/);
-    expect(git(repoDir, ['rev-parse', '--verify', originalBranch])).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(repoDir, ['rev-parse', '--verify', `integration/${result.run_id}`])).toBe(result.commit_sha);
+    // Original branch is not moved by R3 finalization.
+    expect(git(repoDir, ['rev-parse', '--verify', originalBranch])).toBe(originalBranchSha);
     expect(result.artifact_paths).toEqual(expect.arrayContaining([
       join(repoDir, '.agent', 'integration'),
       join(repoDir, '.agent', 'integration', 'integration-plan.json'),
@@ -192,10 +193,15 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
     const state = JSON.parse(readFileSync(join(repoDir, '.agent', 'state.json'), 'utf8'));
     expect(state.phase).toBe('PASSED');
     expect(state.branch).toBe(`integration/${result.run_id}`);
-    expect(state.commit_skipped).toBe(true);
-    expect(state.skip_reason).toMatch(/Phase 8E R2 ran integrated verification and Final Aggregate Audit/i);
+    expect(state.commit_skipped).toBe(false);
+    expect(state.skip_reason).toBeNull();
+    expect(state.final_commit_sha).toBe(result.commit_sha);
     expect(state.audited_diff_digest).toBe(integratedMetadata.integrated_diff_digest);
     expect(Object.values(state.task_graph_state.task_statuses).every((status) => status === 'passed')).toBe(true);
+
+    // R3 never commits .agent/task-runs/**.
+    const finalTree = git(repoDir, ['ls-tree', '-r', '--name-only', result.branch]);
+    expect(finalTree.split('\n').some((p) => p.startsWith('.agent/task-runs/'))).toBe(false);
   }, 120000);
 
   it('reports CONFIG_ERROR when wave mode is requested but the planner emits no task graph', async () => {
