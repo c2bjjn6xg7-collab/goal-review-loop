@@ -511,7 +511,7 @@ async function mapIntegrationAuditResult(params: {
       {
         code: finalization.error_code ?? 'GIT_COMMIT_ERROR',
         message,
-        resumable: finalization.final_commit_sha !== null,
+        resumable: true,
         suggested_action: 'Review .agent/integration evidence and retry Phase 8E R3 finalization.',
       },
       finalization.final_commit_sha,

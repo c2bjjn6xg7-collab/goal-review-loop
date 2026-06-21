@@ -7,7 +7,10 @@ import {
   runFixtureIntegrationAudit,
   type IntegrationAuditFixture,
 } from '../helpers/integration-audit-fixture.js';
-import { runIntegrationFinalization } from '../../src/orchestrator/integration-finalizer.js';
+import {
+  R3_FINALIZATION_BLOCKED_MARKER,
+  runIntegrationFinalization,
+} from '../../src/orchestrator/integration-finalizer.js';
 import { runOrchestrator } from '../../src/orchestrator/run-orchestrator.js';
 
 function git(repoDir: string, args: string[]): string {
@@ -243,6 +246,26 @@ describe('Phase 8E R3 integration finalization', () => {
     const state = JSON.parse(readFileSync(path.join(fixture.agentDir, 'state.json'), 'utf8'));
     expect(state.phase).toBe('BLOCKED');
     expect(state.last_error).toMatch(/git\.push is not supported/);
+    expect(state.last_error).toMatch(R3_FINALIZATION_BLOCKED_MARKER);
+  }, 120000);
+
+  it('resumes a pre-commit BLOCKED R3 run after the blocker is fixed', async () => {
+    fixture = await prepareR2Passed('r3-precommit-blocked-retry');
+    fixture.config.git.push = true;
+
+    const first = await runR3(fixture);
+    expect(first.status).toBe('blocked');
+    expect(first.final_commit_sha).toBeNull();
+
+    fixture.config.git.push = false;
+    const second = await runR3(fixture);
+
+    expect(second.status).toBe('passed');
+    expect(second.final_commit_sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(fixture.repoDir, ['rev-parse', fixture.integrationBranch])).toBe(second.final_commit_sha);
+    const state = JSON.parse(readFileSync(path.join(fixture.agentDir, 'state.json'), 'utf8'));
+    expect(state.phase).toBe('PASSED');
+    expect(state.last_error).toBeNull();
   }, 120000);
 
   it('checks the audited business diff before honoring noCommit', async () => {
@@ -463,6 +486,119 @@ describe('Phase 8E R3 integration finalization', () => {
     expect(git(fixture.repoDir, ['rev-list', '-n', '1', tagName])).toBe(first.final_commit_sha);
     const finalAudit = readFileSync(path.join(fixture.agentDir, 'final-audit.md'), 'utf8');
     expect(finalAudit).toContain('decision: "PASS"');
+  }, 180000);
+
+  it('top-level task-graph BLOCKED resume retries pre-commit R3 finalization', async () => {
+    fixture = await prepareR2Passed('r3-top-level-precommit-retry');
+    fixture.config.git.push = true;
+
+    const first = await runR3(fixture);
+    expect(first.status).toBe('blocked');
+    expect(first.error_code).toBe('UNSUPPORTED_PUSH');
+    expect(first.final_commit_sha).toBeNull();
+
+    const resumeConfig = structuredClone(fixture.config);
+    resumeConfig.git.push = false;
+    resumeConfig.loop.max_agent_retries = 1;
+    resumeConfig.parallel = { enabled: true, max_parallel_workers: 2 };
+    const finalAuditorCommand = resumeConfig.agents.final_auditor.command;
+    const behaviorIndex = finalAuditorCommand.indexOf('--behavior');
+    expect(behaviorIndex).toBeGreaterThanOrEqual(0);
+    finalAuditorCommand[behaviorIndex + 1] = 'audit-fail';
+    const resumeConfigPath = path.join(fixture.agentDir, 'resume-review-loop.yaml');
+    writeFileSync(resumeConfigPath, JSON.stringify(resumeConfig, null, 2), 'utf8');
+
+    const statePath = path.join(fixture.agentDir, 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.phase).toBe('BLOCKED');
+    expect(state.final_commit_sha).toBeNull();
+    state.task_graph_state = {
+      current_task_index: 0,
+      task_statuses: { 'task-1': 'passed' },
+      task_attempts: { 'task-1': 1 },
+    };
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const result = await runOrchestrator({
+      project_root: fixture.repoDir,
+      config_path: resumeConfigPath,
+      task_slug: fixture.runId,
+      max_iterations: 3,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: state.iteration,
+        phase: state.phase,
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    expect(result.phase, result.message).toBe('PASSED');
+    expect(result.commit_sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.branch).toBe(fixture.integrationBranch);
+    const finalAudit = readFileSync(path.join(fixture.agentDir, 'final-audit.md'), 'utf8');
+    expect(finalAudit).toContain('decision: "PASS"');
+    const updatedState = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(updatedState.last_error).toBeNull();
+  }, 180000);
+
+  it('top-level task-graph BLOCKED resume does not treat R2 audit blockers as R3 finalization', async () => {
+    fixture = await createIntegrationAuditFixture({
+      suffix: 'r3-top-level-r2-blocked',
+      finalAuditorBehavior: 'audit-fail',
+    });
+    const audit = await runFixtureIntegrationAudit(fixture);
+    expect(audit.status).toBe('blocked');
+
+    const resumeConfig = structuredClone(fixture.config);
+    resumeConfig.loop.max_agent_retries = 1;
+    resumeConfig.parallel = { enabled: true, max_parallel_workers: 2 };
+    const finalAuditorCommand = resumeConfig.agents.final_auditor.command;
+    const behaviorIndex = finalAuditorCommand.indexOf('--behavior');
+    expect(behaviorIndex).toBeGreaterThanOrEqual(0);
+    finalAuditorCommand[behaviorIndex + 1] = 'audit-pass';
+    const resumeConfigPath = path.join(fixture.agentDir, 'resume-review-loop.yaml');
+    writeFileSync(resumeConfigPath, JSON.stringify(resumeConfig, null, 2), 'utf8');
+
+    const statePath = path.join(fixture.agentDir, 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    state.phase = 'BLOCKED';
+    state.branch = fixture.integrationBranch;
+    state.last_error = 'Final Audit decision: FAIL. R2 will not create final commit or tag.';
+    state.final_commit_sha = null;
+    state.final_commit_message = null;
+    state.commit_skipped = true;
+    state.skip_reason = 'Phase 8E R2 blocked before final project commit/tag.';
+    state.finalized_at = null;
+    state.task_graph_state = {
+      current_task_index: 0,
+      task_statuses: { 'task-1': 'passed' },
+      task_attempts: { 'task-1': 1 },
+    };
+    writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
+
+    const result = await runOrchestrator({
+      project_root: fixture.repoDir,
+      config_path: resumeConfigPath,
+      task_slug: fixture.runId,
+      max_iterations: 3,
+      resume_from: {
+        run_id: state.run_id,
+        iteration: state.iteration,
+        phase: state.phase,
+        branch: state.branch,
+        base_commit: state.base_commit,
+        task_slug: state.task_slug,
+        goal_digest: state.goal_digest,
+      },
+    });
+
+    expect(result.phase, result.message).toBe('PASSED');
+    expect(result.message).not.toMatch(/R2 (integration )?evidence missing|R3 finalization blocker/i);
+    const updatedState = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(updatedState.last_error).not.toMatch(R3_FINALIZATION_BLOCKED_MARKER);
   }, 180000);
 
   it('top-level wave FINALIZING resume blocks missing R2 evidence without rerunning Final Auditor', async () => {

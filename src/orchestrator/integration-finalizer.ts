@@ -119,6 +119,7 @@ interface IntegrationPlanEvidence {
 const REQUIRED_FINAL_COMMIT_ARTIFACTS = [...INTEGRATION_VERSIONED_ARTIFACT_PATHS];
 
 const SKIP_REASON_NO_COMMIT = 'Phase 8E R3 final commit skipped (--no-commit or commit_on_pass is false)';
+export const R3_FINALIZATION_BLOCKED_MARKER = 'Phase 8E R3 finalization BLOCKED';
 
 /**
  * Run Phase 8E R3 finalization: validate R2 evidence, recompute and compare the
@@ -197,12 +198,16 @@ export async function runIntegrationFinalization(
     ...buildExistingAllowlistArtifacts(projectRoot),
   ]);
 
-  // Resume: if state already records a final commit, verify it and only run tag
-  // handling if needed (idempotent — no duplicate commit).
+  // Resume: R3 BLOCKED states are retryable once the external blocker has been
+  // fixed. Leave BLOCKED before either validating an existing final commit or
+  // creating a fresh one; BLOCKED has no legal outgoing transition to PASSED.
   let state = await stateStore.read();
-  if (state.phase === PhaseEnum.BLOCKED && state.final_commit_sha && !state.tag_created) {
+  if (state.phase === PhaseEnum.BLOCKED) {
     state = await stateStore.forceTransitionForResume(PhaseEnum.FINALIZING);
   }
+
+  // If state already records a final commit, verify it and only run tag
+  // handling if needed (idempotent — no duplicate commit).
   if (state.final_commit_sha) {
     const resume = await tryResumeFromExistingCommit({
       projectRoot,
@@ -291,6 +296,7 @@ export async function runIntegrationFinalization(
   if (noCommit || !config.git.commit_on_pass) {
     await stateStore.update(() => ({
       branch: integrationBranch,
+      last_error: null,
       commit_skipped: true,
       skip_reason: SKIP_REASON_NO_COMMIT,
       tag_name: null,
@@ -464,6 +470,7 @@ export async function runIntegrationFinalization(
   }
 
   await stateStore.update(() => ({
+    last_error: null,
     finalized_at: new Date().toISOString(),
     tag_name: tagResult.tagName,
     tag_created: tagResult.tagCreated,
@@ -961,7 +968,7 @@ async function tryResumeFromExistingCommit(params: {
   });
   if (tagResult.outcome === 'blocked') {
     await stateStore.update(() => ({
-      last_error: tagResult.error_message ?? 'tag failed',
+      last_error: formatR3BlockedError(tagResult.error_message ?? 'tag failed'),
       tag_name: tagResult.tagName,
       tag_created: false,
     }));
@@ -981,6 +988,7 @@ async function tryResumeFromExistingCommit(params: {
 
   await stateStore.update(() => ({
     branch: integrationBranch,
+    last_error: null,
     final_commit_sha: finalCommitSha,
     commit_skipped: false,
     skip_reason: null,
@@ -1164,7 +1172,7 @@ async function blockFinalization(params: {
 }): Promise<IntegrationFinalizationResult> {
   await params.stateStore.update(() => ({
     branch: params.integrationBranch,
-    last_error: params.message,
+    last_error: formatR3BlockedError(params.message),
     commit_skipped: false,
     skip_reason: null,
     ...(params.finalCommitSha !== undefined ? { final_commit_sha: params.finalCommitSha } : {}),
@@ -1177,6 +1185,10 @@ async function blockFinalization(params: {
     await params.stateStore.transition(PhaseEnum.BLOCKED);
   }
   return blockedResult(params);
+}
+
+function formatR3BlockedError(message: string): string {
+  return `${R3_FINALIZATION_BLOCKED_MARKER}: ${message}`;
 }
 
 function blockedResult(params: {

@@ -20,7 +20,10 @@ import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { runTaskGraphLoop } from './task-graph-loop.js';
 import { runTaskGraphWaveLoop } from './task-graph-wave-loop.js';
-import { runIntegrationFinalization } from './integration-finalizer.js';
+import {
+  R3_FINALIZATION_BLOCKED_MARKER,
+  runIntegrationFinalization,
+} from './integration-finalizer.js';
 import { resolveTaskGraphResumeDecision } from './task-graph-resume.js';
 import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
@@ -354,17 +357,26 @@ export async function runOrchestrator(params: {
         const resumeTaskIndex = resumeDecision.taskIndex;
         const r2IntegrationBranch = readR2IntegrationBranch(projectRoot, runId);
         const stateIntegrationBranch = tgState.branch === `integration/${runId}` ? tgState.branch : null;
-        const isR3TagRetry =
+        const hasR3IntegrationBranch = Boolean(r2IntegrationBranch ?? stateIntegrationBranch);
+        const hasR3FinalizingResumeTarget = Boolean(
+          r2IntegrationBranch
+          ?? stateIntegrationBranch
+          ?? (parallelDecision.mode === 'wave' ? `integration/${runId}` : null),
+        );
+        const hasR3BlockedMarker =
+          typeof tgState.last_error === 'string'
+          && tgState.last_error.startsWith(R3_FINALIZATION_BLOCKED_MARKER);
+        const hasR3FinalCommitTagRetry = Boolean(tgState.final_commit_sha) && !tgState.tag_created;
+        const isR3BlockedResume =
           resume.phase === PhaseEnum.BLOCKED
-          && Boolean(tgState.final_commit_sha)
-          && !tgState.tag_created
           && resumeDecision.kind === 'all_tasks_complete'
-          && Boolean(r2IntegrationBranch ?? stateIntegrationBranch);
+          && hasR3IntegrationBranch
+          && (hasR3BlockedMarker || hasR3FinalCommitTagRetry);
         const isR3FinalizingResume =
           resume.phase === PhaseEnum.FINALIZING
           && resumeDecision.kind === 'all_tasks_complete'
-          && Boolean(r2IntegrationBranch ?? stateIntegrationBranch ?? (parallelDecision.mode === 'wave' ? `integration/${runId}` : null));
-        if (isR3FinalizingResume || isR3TagRetry) {
+          && hasR3FinalizingResumeTarget;
+        if (isR3FinalizingResume || isR3BlockedResume) {
           const finalizationIteration = resumeDecision.taskIndex + 1;
           const integrationBranch = r2IntegrationBranch ?? stateIntegrationBranch;
           if (integrationBranch) {
@@ -373,7 +385,7 @@ export async function runOrchestrator(params: {
               runId,
               finalizationIteration,
               'FINALIZING',
-              'task graph resume from FINALIZING',
+              'task graph resume into R3 finalization',
               'PASS',
               `R2 integration evidence found — resuming Phase 8E R3 finalization on ${integrationBranch}`,
             );
@@ -407,7 +419,7 @@ export async function runOrchestrator(params: {
                 {
                   code: finalization.error_code ?? 'GIT_COMMIT_ERROR',
                   message,
-                  resumable: finalization.final_commit_sha !== null,
+                  resumable: true,
                   suggested_action: 'Review .agent/integration evidence and retry Phase 8E R3 finalization.',
                 },
                 finalization.final_commit_sha,
@@ -443,7 +455,7 @@ export async function runOrchestrator(params: {
               runId,
               finalizationIteration,
               'FINALIZING',
-              'task graph resume from FINALIZING',
+              'task graph resume into R3 finalization',
               'FAIL',
               message,
             );
