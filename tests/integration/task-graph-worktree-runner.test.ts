@@ -19,6 +19,27 @@ import { TaskStatus, type ReviewLoopConfig, type TaskGraph, type TaskNode } from
 
 const RUN_ID = 'run-pass-path';
 const TASK_ID = 'task-1';
+const TRACKED_MODIFY_SCRIPT = `import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+
+const projectRoot = process.argv[2];
+const agentDir = join(projectRoot, '.agent');
+const handoffPath = join(agentDir, 'developer-handoff.md');
+writeFileSync(join(projectRoot, 'src', 'index.ts'), 'export const touched = true;\\n', 'utf8');
+mkdirSync(dirname(handoffPath), { recursive: true });
+writeFileSync(handoffPath, \`---
+schema_version: 1
+run_id: "\${process.env.REVIEW_LOOP_RUN_ID ?? 'run-pass-path'}"
+iteration: 1
+author_role: "developer"
+status: "COMPLETED"
+---
+
+# Developer Handoff
+
+Modified a tracked source file.
+\`, 'utf8');
+`;
 
 function git(repoDir: string, args: string[]): string {
   return execFileSync('git', args, { cwd: repoDir, encoding: 'utf8' }).trim();
@@ -100,6 +121,27 @@ function makeConfig(developerBehavior: string = 'task-success'): ReviewLoopConfi
           '--behavior',
           developerBehavior,
         ],
+        timeout_seconds: 60,
+      },
+    },
+    loop: {
+      ...DEFAULT_CONFIG.loop,
+      max_iterations: 1,
+    },
+    runtime: {
+      ...DEFAULT_CONFIG.runtime,
+      agent_idle_timeout_seconds: 30,
+    },
+  };
+}
+
+function makeTrackedModifyConfig(): ReviewLoopConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    agents: {
+      ...DEFAULT_CONFIG.agents,
+      developer: {
+        command: ['node', '-e', TRACKED_MODIFY_SCRIPT, '{prompt_file}', '{project_root}'],
         timeout_seconds: 60,
       },
     },
@@ -199,8 +241,8 @@ describe('runTaskInWorktree', () => {
     });
 
     expect(result.taskId).toBe(TASK_ID);
-    expect(result.status).toBe('passed');
     expect(result.error).toBeNull();
+    expect(result.status).toBe('passed');
     expect(result.branch).toBe(`agent/${RUN_ID}/${TASK_ID}-part-a`);
     expect(realpathSync(result.worktreePath)).toBe(
       realpathSync(path.join(fixture.repoDir, '.agent', 'worktrees', RUN_ID, TASK_ID)),
@@ -231,6 +273,41 @@ describe('runTaskInWorktree', () => {
     const committedPaths = git(fixture.repoDir, ['show', '--name-only', '--format=', result.finalCommitSha ?? '']);
     expect(committedPaths.split(/\r?\n/).filter(Boolean)).toEqual(['src/part-a/impl.ts']);
 
+    expect(git(fixture.repoDir, ['status', '--short', '--untracked-files=all'])).toBe('');
+  }, 120000);
+
+  it('commits modified tracked task files without trimming porcelain status paths', async () => {
+    const fixture = createTestRepo();
+    repoDir = fixture.repoDir;
+    const trackedTask = {
+      ...fixture.task,
+      allowed_changes: ['src/index.ts'],
+    };
+    const taskGraph = {
+      ...fixture.taskGraph,
+      tasks: [trackedTask],
+    };
+
+    const result = await runTaskInWorktree({
+      projectRoot: fixture.repoDir,
+      runId: RUN_ID,
+      taskGraph,
+      task: trackedTask,
+      config: makeTrackedModifyConfig(),
+      baseCommit: fixture.baseCommit,
+      maxIterations: 1,
+      taskIndex: 0,
+      taskTotal: 1,
+      slug: 'tracked-modify',
+    });
+
+    expect(result.error).toBeNull();
+    expect(result.status).toBe('passed');
+    expect(result.finalCommitSha).toMatch(/^[0-9a-f]{40}$/);
+
+    const committedPaths = git(fixture.repoDir, ['show', '--name-only', '--format=', result.finalCommitSha ?? '']);
+    expect(committedPaths.split(/\r?\n/).filter(Boolean)).toEqual(['src/index.ts']);
+    expect(git(fixture.repoDir, ['show', `${result.finalCommitSha}:src/index.ts`])).toContain('touched');
     expect(git(fixture.repoDir, ['status', '--short', '--untracked-files=all'])).toBe('');
   }, 120000);
 

@@ -2,7 +2,7 @@ import path from 'node:path';
 import fs from 'fs-extra';
 import { computeDigest } from '../runtime/digest.js';
 import { ArtifactStore } from '../artifacts/artifact-store.js';
-import { runGit } from '../git/git-manager.js';
+import { runGit, runGitRaw } from '../git/git-manager.js';
 import { writeTaskRunResult, type TaskRunResultStatus } from '../scheduler/task-run-result.js';
 import { initialTaskAttempts, initialTaskStatuses, orderedTasks } from '../scheduler/task-graph.js';
 import { WorktreeManager } from '../scheduler/worktree-manager.js';
@@ -326,13 +326,13 @@ async function commitTaskChanges(
   worktreePath: string,
   task: TaskNode,
 ): Promise<CommitTaskChangesResult> {
-  const statusResult = await runGit(
+  const statusResult = await runGitRaw(
     ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
     worktreePath,
   );
   assertGitOk(statusResult, 'git status');
 
-  const entries = parseGitStatusPorcelainZ(statusResult.stdout);
+  const entries = parseGitStatusPorcelainZ(statusResult.stdout.toString('utf8'));
   const pathsToStage = businessPathsFromStatus(entries);
 
   if (pathsToStage.length === 0) {
@@ -429,7 +429,7 @@ async function readGitStdout(
 }
 
 function assertGitOk(
-  result: { stdout: string; stderr: string; exit_code: number },
+  result: { stdout: string | Buffer; stderr: string; exit_code: number },
   label: string,
 ): void {
   if (result.exit_code !== 0) {
