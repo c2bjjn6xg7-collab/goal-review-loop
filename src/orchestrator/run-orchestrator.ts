@@ -352,9 +352,21 @@ export async function runOrchestrator(params: {
           `${resumeDecision.kind} at index ${resumeDecision.taskIndex}${resumeDecision.taskId ? ` (${resumeDecision.taskId})` : ''}: ${resumeDecision.reason}`,
         );
         const resumeTaskIndex = resumeDecision.taskIndex;
-        if (resume.phase === PhaseEnum.FINALIZING && resumeDecision.kind === 'all_tasks_complete') {
+        const r2IntegrationBranch = readR2IntegrationBranch(projectRoot, runId);
+        const stateIntegrationBranch = tgState.branch === `integration/${runId}` ? tgState.branch : null;
+        const isR3TagRetry =
+          resume.phase === PhaseEnum.BLOCKED
+          && Boolean(tgState.final_commit_sha)
+          && !tgState.tag_created
+          && resumeDecision.kind === 'all_tasks_complete'
+          && Boolean(r2IntegrationBranch ?? stateIntegrationBranch);
+        const isR3FinalizingResume =
+          resume.phase === PhaseEnum.FINALIZING
+          && resumeDecision.kind === 'all_tasks_complete'
+          && Boolean(r2IntegrationBranch ?? stateIntegrationBranch ?? (parallelDecision.mode === 'wave' ? `integration/${runId}` : null));
+        if (isR3FinalizingResume || isR3TagRetry) {
           const finalizationIteration = resumeDecision.taskIndex + 1;
-          const integrationBranch = readR2IntegrationBranch(projectRoot, runId);
+          const integrationBranch = r2IntegrationBranch ?? stateIntegrationBranch;
           if (integrationBranch) {
             await appendLog(
               artifactStore,
@@ -424,7 +436,7 @@ export async function runOrchestrator(params: {
               finalization.skip_reason,
             );
           }
-          if (parallelDecision.mode === 'wave') {
+          if (parallelDecision.mode === 'wave' || stateIntegrationBranch) {
             const message = 'R2 integration evidence missing or unreadable on Phase 8E R3 FINALIZING resume; refusing to rerun Final Aggregate Audit.';
             await appendLog(
               artifactStore,
@@ -444,6 +456,45 @@ export async function runOrchestrator(params: {
               currentBranch,
             );
           }
+        }
+        if (
+          resume.phase === PhaseEnum.BLOCKED
+          && tgState.final_commit_sha
+          && !tgState.tag_created
+          && resumeDecision.kind === 'all_tasks_complete'
+        ) {
+          const finalizationIteration = resumeDecision.taskIndex + 1;
+          await stateStore.forceTransitionForResume(PhaseEnum.FINALIZING);
+          await appendLog(
+            artifactStore,
+            runId,
+            finalizationIteration,
+            'FINALIZING',
+            'task graph tag retry',
+            'PASS',
+            'final commit exists and tag is incomplete — resuming serial finalization tag handling',
+          );
+          return await runFinalization({
+            projectRoot,
+            agentDir,
+            runId,
+            stateStore,
+            artifactStore,
+            config,
+            currentBranch,
+            baseCommit,
+            goalFm,
+            goalDigest,
+            diffDigest: tgState.audited_diff_digest ?? goalDigest,
+            iteration: finalizationIteration,
+            noCommit: params.no_commit ?? !config.git.commit_on_pass,
+            tag: params.tag ?? config.git.create_tag,
+            combinedSignal,
+            orchestratorRegistry,
+          });
+        }
+        if (resume.phase === PhaseEnum.FINALIZING && resumeDecision.kind === 'all_tasks_complete') {
+          const finalizationIteration = resumeDecision.taskIndex + 1;
           await appendLog(
             artifactStore,
             runId,

@@ -145,7 +145,8 @@ export async function runIntegrationFinalization(
   } = params;
 
   if (config.git.push) {
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.UNSUPPORTED_PUSH,
       message: 'git.push is not supported in Phase 8E R3 finalization.',
@@ -153,7 +154,8 @@ export async function runIntegrationFinalization(
   }
 
   if (integrationBranch !== `integration/${runId}`) {
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.STATE_CONFLICT,
       message: `Expected integration branch integration/${runId}, got ${integrationBranch}`,
@@ -164,7 +166,8 @@ export async function runIntegrationFinalization(
   // resume may start elsewhere). Never move the original branch.
   const switched = await ensureOnIntegrationBranch(projectRoot, integrationBranch);
   if (!switched.ok) {
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.STATE_CONFLICT,
       message: switched.message,
@@ -181,7 +184,8 @@ export async function runIntegrationFinalization(
     stateStore,
   });
   if (!evidence.ok) {
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: evidence.code,
       message: evidence.message,
@@ -195,7 +199,10 @@ export async function runIntegrationFinalization(
 
   // Resume: if state already records a final commit, verify it and only run tag
   // handling if needed (idempotent — no duplicate commit).
-  const state = await stateStore.read();
+  let state = await stateStore.read();
+  if (state.phase === PhaseEnum.BLOCKED && state.final_commit_sha && !state.tag_created) {
+    state = await stateStore.forceTransitionForResume(PhaseEnum.FINALIZING);
+  }
   if (state.final_commit_sha) {
     const resume = await tryResumeFromExistingCommit({
       projectRoot,
@@ -230,7 +237,8 @@ export async function runIntegrationFinalization(
     expectedHead: evidence.value.integrationHead,
   });
   if (!liveHead.ok) {
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.STATE_CONFLICT,
       message: liveHead.message,
@@ -238,8 +246,48 @@ export async function runIntegrationFinalization(
     });
   }
 
-  // --no-commit / commit_on_pass=false: preserve skip behavior only when the
-  // caller explicitly opted out. The normal Phase 8E R3 path creates a commit.
+  // Recompute the business diff from base_commit and compare against R2 evidence.
+  const diffCheck = await verifyBusinessDiff({
+    projectRoot,
+    baseCommit,
+    evidence: evidence.value,
+  });
+  if (!diffCheck.ok) {
+    await appendLog(
+      artifactStore,
+      runId,
+      iteration,
+      'FINALIZING',
+      'integration business diff verification',
+      'FAIL',
+      diffCheck.message,
+    );
+    return blockFinalization({
+      stateStore,
+      integrationBranch,
+      code: ErrorCategory.STATE_CONFLICT,
+      message: diffCheck.message,
+      artifactPaths,
+    });
+  }
+
+  // Build the final commit file set: business files + existing R3 versioned artifacts.
+  const businessFiles = diffCheck.businessFiles;
+  const existingArtifacts = buildExistingAllowlistArtifacts(projectRoot);
+  const missingRequiredArtifacts = INTEGRATION_VERSIONED_ARTIFACT_PATHS
+    .filter((filePath) => !existsSync(path.join(projectRoot, filePath)));
+  if (missingRequiredArtifacts.length > 0) {
+    return blockFinalization({
+      stateStore,
+      integrationBranch,
+      code: ErrorCategory.STATE_CONFLICT,
+      message: `Required R3 artifact(s) missing: ${missingRequiredArtifacts.join(', ')}`,
+      artifactPaths,
+    });
+  }
+
+  // --no-commit / commit_on_pass=false: preserve skip behavior only after all
+  // R2 evidence and business-diff checks pass. The normal R3 path creates a commit.
   if (noCommit || !config.git.commit_on_pass) {
     await stateStore.update(() => ({
       branch: integrationBranch,
@@ -281,39 +329,13 @@ export async function runIntegrationFinalization(
     };
   }
 
-  // Recompute the business diff from base_commit and compare against R2 evidence.
-  const diffCheck = await verifyBusinessDiff({
-    projectRoot,
-    baseCommit,
-    evidence: evidence.value,
-  });
-  if (!diffCheck.ok) {
-    await appendLog(
-      artifactStore,
-      runId,
-      iteration,
-      'FINALIZING',
-      'integration business diff verification',
-      'FAIL',
-      diffCheck.message,
-    );
-    return blockedResult({
-      integrationBranch,
-      code: ErrorCategory.STATE_CONFLICT,
-      message: diffCheck.message,
-      artifactPaths,
-    });
-  }
-
-  // Build the final commit file set: business files + existing R3 versioned artifacts.
-  const businessFiles = diffCheck.businessFiles;
-  const existingArtifacts = buildExistingAllowlistArtifacts(projectRoot);
   const allowedSet = buildAllowedCommitSet(existingArtifacts, businessFiles);
 
   // Reject if any local-only runtime artifact is tracked by git.
   const trackedLocalOnly = await findTrackedLocalOnlyArtifacts(projectRoot);
   if (trackedLocalOnly.length > 0) {
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.PRE_COMMIT_STAGED_SET_VIOLATION,
       message: `Local-only artifacts are tracked by git: ${trackedLocalOnly.join(', ')}. Remove them before finalizing.`,
@@ -331,7 +353,8 @@ export async function runIntegrationFinalization(
   const stageResult = await stageFilesControlled(projectRoot, stageEntries);
   if (!stageResult.success) {
     await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.GIT_COMMIT_ERROR,
       message: `Staging failed: ${stageResult.error}`,
@@ -344,7 +367,8 @@ export async function runIntegrationFinalization(
   const violations = findStagedSetViolations(stagedFiles, allowedSet);
   if (violations.length > 0) {
     await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.PRE_COMMIT_STAGED_SET_VIOLATION,
       message: `Staged set contains disallowed files: ${violations.join(', ')}`,
@@ -365,7 +389,8 @@ export async function runIntegrationFinalization(
     });
   } catch (err) {
     await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.GIT_COMMIT_ERROR,
       message: `Commit message template error: ${err instanceof Error ? err.message : String(err)}`,
@@ -377,7 +402,8 @@ export async function runIntegrationFinalization(
   const commitResult = await createCommit(projectRoot, commitMessage);
   if (!commitResult.success) {
     await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.GIT_COMMIT_ERROR,
       message: `Commit failed: ${commitResult.error}`,
@@ -416,7 +442,6 @@ export async function runIntegrationFinalization(
     commitSha,
   });
   if (tagResult.outcome === 'blocked') {
-    await stateStore.transition(PhaseEnum.BLOCKED);
     await appendLog(
       artifactStore,
       runId,
@@ -426,7 +451,8 @@ export async function runIntegrationFinalization(
       'FAIL',
       tagResult.error_message ?? 'tag failed',
     );
-    return blockedResult({
+    return blockFinalization({
+      stateStore,
       integrationBranch,
       code: ErrorCategory.GIT_TAG_ERROR,
       message: tagResult.error_message ?? 'tag failed',
@@ -867,15 +893,12 @@ async function tryResumeFromExistingCommit(params: {
     return { outcome: 'stale' };
   }
 
-  // 2. Reachable from integration/{run_id}.
-  const reachable = await runGit(
-    ['merge-base', '--is-ancestor', finalCommitSha, integrationBranch],
-    projectRoot,
-  );
-  const headIsCommit = await runGit(['rev-parse', '--verify', integrationBranch], projectRoot);
-  const onTip = headIsCommit.exit_code === 0 && headIsCommit.stdout.trim() === finalCommitSha;
-  if (reachable.exit_code !== 0 && !onTip) {
-    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'resume commit verification', 'FAIL', `commit ${finalCommitSha} not reachable from ${integrationBranch}`);
+  // 2. The recorded final commit must be the current integration branch tip.
+  const branchTip = await runGit(['rev-parse', '--verify', integrationBranch], projectRoot);
+  const onTip = branchTip.exit_code === 0 && branchTip.stdout.trim() === finalCommitSha;
+  if (!onTip) {
+    const actualTip = branchTip.exit_code === 0 ? branchTip.stdout.trim() : '(unreadable)';
+    await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'resume commit verification', 'FAIL', `commit ${finalCommitSha} is not current ${integrationBranch} tip ${actualTip}`);
     return { outcome: 'stale' };
   }
 
@@ -937,6 +960,11 @@ async function tryResumeFromExistingCommit(params: {
     commitSha: finalCommitSha,
   });
   if (tagResult.outcome === 'blocked') {
+    await stateStore.update(() => ({
+      last_error: tagResult.error_message ?? 'tag failed',
+      tag_name: tagResult.tagName,
+      tag_created: false,
+    }));
     await stateStore.transition(PhaseEnum.BLOCKED);
     return {
       outcome: 'blocked',
@@ -1003,14 +1031,15 @@ async function handleTag(params: {
 > {
   const { projectRoot, stateStore, config, tag, runId, commitSha } = params;
 
-  if (!(tag || config.git.create_tag)) {
+  const state = await stateStore.read();
+  const retryRequestedTag = Boolean(state.tag_name && !state.tag_created);
+  if (!(tag || config.git.create_tag || retryRequestedTag)) {
     return { outcome: 'ok', tagName: null, tagCreated: false };
   }
 
   let tagName: string;
   try {
-    const state = await stateStore.read();
-    tagName = renderTagName(config.git.tag_template, {
+    tagName = state.tag_name ?? renderTagName(config.git.tag_template, {
       run_id: runId,
       task_slug: state.task_slug,
     });
@@ -1121,6 +1150,33 @@ function stableStringify(value: unknown): string {
 
 function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)];
+}
+
+async function blockFinalization(params: {
+  stateStore: StateStore;
+  integrationBranch: string;
+  code: ErrorCategoryType;
+  message: string;
+  artifactPaths?: string[];
+  finalCommitSha?: string | null;
+  finalCommitMessage?: string | null;
+  tagName?: string | null;
+}): Promise<IntegrationFinalizationResult> {
+  await params.stateStore.update(() => ({
+    branch: params.integrationBranch,
+    last_error: params.message,
+    commit_skipped: false,
+    skip_reason: null,
+    ...(params.finalCommitSha !== undefined ? { final_commit_sha: params.finalCommitSha } : {}),
+    ...(params.finalCommitMessage !== undefined ? { final_commit_message: params.finalCommitMessage } : {}),
+    ...(params.tagName !== undefined ? { tag_name: params.tagName } : {}),
+    ...(params.tagName !== undefined ? { tag_created: false } : {}),
+  }));
+  const state = await params.stateStore.read();
+  if (state.phase !== PhaseEnum.BLOCKED) {
+    await params.stateStore.transition(PhaseEnum.BLOCKED);
+  }
+  return blockedResult(params);
 }
 
 function blockedResult(params: {
