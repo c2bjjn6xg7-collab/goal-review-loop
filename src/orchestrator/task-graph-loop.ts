@@ -53,6 +53,7 @@ import { Phase as PhaseEnum } from '../types.js';
 import type { StateStore } from './state-store.js';
 import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { OrchestratorResult, OrchestratorFileRegistry } from './run-orchestrator.js';
+import { EventBus } from '../runtime/event-bus.js';
 import {
   checkCancelRequest,
   makeResult,
@@ -770,6 +771,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     tag,
     combinedSignal,
     orchestratorRegistry,
+    eventBus: EventBus.createNull(),
   });
 }
 

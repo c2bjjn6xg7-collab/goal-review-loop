@@ -29,6 +29,7 @@ const SYSTEM_PROTECTED_PATHS = [
   '.agent/feedback-notes.md',
   '.agent/parse-warnings.md',
   '.agent/worktrees/**',
+  '.agent/events.jsonl',
 ];
 
 const DEVELOPER_HANDOFF_EXCEPTION = '.agent/developer-handoff.md';
@@ -57,6 +58,7 @@ const ORCHESTRATOR_OWNED_PATTERNS = [
   '.agent/feedback-notes.md',
   '.agent/parse-warnings.md',
   '.agent/worktrees/**',
+  '.agent/events.jsonl',
 ];
 
 // F-315R1: Only UNTRACKED dependency cache files are excluded.
