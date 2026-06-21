@@ -53,7 +53,7 @@ import { Phase as PhaseEnum } from '../types.js';
 import type { StateStore } from './state-store.js';
 import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { OrchestratorResult, OrchestratorFileRegistry } from './run-orchestrator.js';
-import { EventBus } from '../runtime/event-bus.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 import {
   checkCancelRequest,
   makeResult,
@@ -91,6 +91,7 @@ interface TaskGraphLoopParams {
   tag: boolean;
   /** When resuming, the 0-based task index to restart from. */
   resumeTaskIndex?: number;
+  eventBus: IEventBus;
 }
 
 /**
@@ -484,7 +485,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     projectRoot, agentDir, runId, stateStore, artifactStore,
     orchestratorRegistry, config, currentBranch, baseCommit,
     goalFm, verificationCommands, goalDigest, taskGraph,
-    maxIterations, combinedSignal, noCommit, tag, resumeTaskIndex,
+    maxIterations, combinedSignal, noCommit, tag, resumeTaskIndex, eventBus,
   } = params;
 
   const ordered = orderedTasks(taskGraph);
@@ -533,6 +534,14 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     tgState.task_statuses[task.id] = 'running';
     await stateStore.update(() => ({ task_graph_state: { ...tgState } }));
     await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex: i, taskStatus: 'running', lastEvent: `Starting task ${taskIndexDisplay}/${ordered.length}: ${task.title}` });
+    await eventBus.emit({
+      kind: 'task.started',
+      phase: 'DEVELOPING',
+      level: 'info',
+      message: `Task ${taskIndexDisplay}/${ordered.length}: ${task.title}`,
+      task_id: task.id,
+      payload: { task_index: i, task_total: ordered.length },
+    });
 
     await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} start`, 'PASS', `Task ${taskIndexDisplay} of ${ordered.length}: ${task.title}`);
     await emitProgress({ projectRoot, stateStore, lastEvent: `Task ${taskIndexDisplay}/${ordered.length}: ${task.title}`, registry: orchestratorRegistry });
@@ -592,10 +601,18 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
       ? `Task ${taskIndexDisplay}/${ordered.length} passed: ${task.title}`
       : `Task ${taskIndexDisplay}/${ordered.length} failed: ${task.title}${taskError ? ` — ${taskError}` : ''}`;
     await emitTaskProgress({ projectRoot, stateStore, taskGraph, taskIndex: i, taskStatus: taskPassed ? 'passed' : 'failed', lastEvent: taskProgressEvent });
+    await eventBus.emit({
+      kind: taskPassed ? 'task.completed' : 'task.blocked',
+      phase: 'DEVELOPING',
+      level: taskPassed ? 'info' : 'warn',
+      message: taskProgressEvent,
+      task_id: task.id,
+      status: taskPassed ? 'passed' : 'failed',
+    });
 
     if (!taskPassed) {
       // Task failed after max rework — BLOCKED the entire run.
-      await transitionToBlocked(stateStore, `Task "${task.id}" failed after ${tgState.task_attempts[task.id]} attempt(s): ${taskError}`);
+      await transitionToBlocked(stateStore, `Task "${task.id}" failed after ${tgState.task_attempts[task.id]} attempt(s): ${taskError}`, eventBus);
       await appendLog(artifactStore, runId, i + 1, 'DEVELOPING', `task ${task.id} exhausted`, 'BLOCKED', taskError ?? 'unknown');
       return makeBlockedResult(runId, projectRoot, `Task "${task.id}" failed after ${tgState.task_attempts[task.id]} attempt(s): ${taskError ?? 'unknown'}`, 'VERIFICATION_FAILED', currentBranch);
     }
@@ -627,7 +644,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
 
   if (!finalScopeResult.passed) {
     const deniedPaths = finalScopeResult.report.denied.map(d => `${d.path} (${d.reason})`).join(', ');
-    await transitionToBlocked(stateStore, `Final integration scope violation: ${deniedPaths}`);
+    await transitionToBlocked(stateStore, `Final integration scope violation: ${deniedPaths}`, eventBus);
     await appendLog(artifactStore, runId, integrationIteration, 'VERIFYING', 'integration scope', 'FAIL', deniedPaths);
     return makeBlockedResult(runId, projectRoot, `Final integration scope violation: ${deniedPaths}`, 'SCOPE_VIOLATION', currentBranch);
   }
@@ -658,7 +675,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     const failedCmds = integrationVerification.manifest.commands
       .filter(c => c.required && c.status !== 'success')
       .map(c => c.id);
-    await transitionToBlocked(stateStore, `Final integration verification failed: ${failedCmds.join(', ')}`);
+    await transitionToBlocked(stateStore, `Final integration verification failed: ${failedCmds.join(', ')}`, eventBus);
     await appendLog(artifactStore, runId, integrationIteration, 'VERIFYING', 'integration verification', 'FAIL', failedCmds.join(', '));
     return makeBlockedResult(runId, projectRoot, `Final integration verification failed: ${failedCmds.join(', ')}`, 'VERIFICATION_FAILED', currentBranch);
   }
@@ -730,7 +747,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     registerAgentLogs(auditorResult, orchestratorRegistry);
 
     if (auditorCleanupResult && !auditorCleanupResult.success) {
-      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
+      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`, eventBus);
       return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
     }
     if (auditorResult.status === 'cancelled') {
@@ -738,7 +755,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
       return makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled', 'Auditor cancelled', auditorResult.error);
     }
     if (auditorResult.status !== 'success') {
-      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
+      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, eventBus);
       return makeBlockedResult(runId, projectRoot, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
     }
 
@@ -771,7 +788,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     tag,
     combinedSignal,
     orchestratorRegistry,
-    eventBus: EventBus.createNull(),
+    eventBus,
   });
 }
 

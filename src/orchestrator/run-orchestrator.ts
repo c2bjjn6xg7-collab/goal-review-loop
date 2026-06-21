@@ -71,6 +71,7 @@ import { emitPermissionWarnings } from '../providers/permission-guard.js';
 import { EventBus } from '../runtime/event-bus.js';
 import type { IEventBus } from '../runtime/event-bus.js';
 import type { EventDraft } from '../runtime/event-store.js';
+import { classifyProviderFailure } from '../runtime/provider-failure.js';
 import { buildReworkInstructions, writeReworkInstructions, buildReworkFindingsFromScope, buildReworkFindingsFromVerification, buildReworkFindingsFromAudit } from './rework-instructions.js';
 import { validateCancelRequest } from '../artifacts/json-schemas.js';
 import type {
@@ -579,6 +580,7 @@ export async function runOrchestrator(params: {
           noCommit: params.no_commit ?? !config.git.commit_on_pass,
           tag: params.tag ?? config.git.create_tag,
           resumeTaskIndex,
+          eventBus,
         });
       }
 
@@ -776,6 +778,14 @@ export async function runOrchestrator(params: {
     }
 
     if (plannerResult.result.status !== 'success') {
+      await emitProviderFailureIfClassified({
+        eventBus,
+        stderrPath: plannerResult.result.stderr_path,
+        exitCode: plannerResult.result.exit_code,
+        provider: config.agents.planner.provider ?? 'claude',
+        role: 'planner',
+        phase: 'PLANNING',
+      });
       await transitionToBlocked(stateStore, `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`, eventBus);
       await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'FAIL', plannerResult.result.error?.message);
       return makeResult(runId, PhaseEnum.BLOCKED, 3, originalBranch, null, [], 'Fix Planner configuration or check agent availability', `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`, plannerResult.result.error);
@@ -905,6 +915,7 @@ export async function runOrchestrator(params: {
           combinedSignal,
           noCommit: params.no_commit ?? !config.git.commit_on_pass,
           tag: params.tag ?? config.git.create_tag,
+          eventBus,
         });
       }
       return await runTaskGraphLoop({
@@ -926,6 +937,7 @@ export async function runOrchestrator(params: {
         noCommit: params.no_commit ?? !config.git.commit_on_pass,
         tag: params.tag ?? config.git.create_tag,
         resumeTaskIndex: undefined,
+        eventBus,
       });
     }
 
@@ -1355,6 +1367,14 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       }
 
       if (developerResult.status !== 'success') {
+        await emitProviderFailureIfClassified({
+          eventBus,
+          stderrPath: developerResult.stderr_path,
+          exitCode: developerResult.exit_code,
+          provider: config.agents.developer.provider ?? 'claude',
+          role: 'developer',
+          phase: iteration === 1 ? 'DEVELOPING' : 'REWORKING',
+        });
         await transitionToBlocked(stateStore, `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, eventBus);
         await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'FAIL', developerResult.error?.message);
         return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Developer configuration or check agent availability', `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, developerResult.error);
@@ -1770,6 +1790,14 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     }
 
     if (auditorResult.status !== 'success') {
+      await emitProviderFailureIfClassified({
+        eventBus,
+        stderrPath: auditorResult.stderr_path,
+        exitCode: auditorResult.exit_code,
+        provider: config.agents.auditor.provider ?? 'codex',
+        role: 'auditor',
+        phase: 'AUDITING',
+      });
       await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, eventBus);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditorResult.error?.message);
       return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Auditor configuration or check agent availability', `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, auditorResult.error);
@@ -2656,6 +2684,14 @@ export async function runFinalization(params: {
   }
 
   if (finalAuditorResult.status !== 'success') {
+    await emitProviderFailureIfClassified({
+      eventBus,
+      stderrPath: finalAuditorResult.stderr_path,
+      exitCode: finalAuditorResult.exit_code,
+      provider: config.agents.final_auditor.provider ?? 'codex',
+      role: 'final-auditor',
+      phase: 'FINALIZING',
+    });
     await transitionToBlocked(stateStore, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`, eventBus);
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final auditor completed', 'FAIL', finalAuditorResult.error?.message);
     return makeBlockedResult(runId, projectRoot, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
@@ -2966,6 +3002,53 @@ export async function runFinalization(params: {
     null,
     commitSha, false, tagName, tagCreated,
   );
+}
+
+/**
+ * Phase 9 R1: classify an agent failure as a provider failure and emit a
+ * structured `provider.failure` event when the stderr matches a known
+ * provider signature (quota, rate-limit, overload, auth). Fail-soft and
+ * observability-only — never affects scheduling.
+ *
+ * Returns true if a provider.failure was emitted, false otherwise.
+ */
+export async function emitProviderFailureIfClassified(params: {
+  eventBus: IEventBus;
+  stderrPath?: string;
+  exitCode?: number | null;
+  provider?: string;
+  model?: string;
+  role: string;
+  phase: string;
+}): Promise<boolean> {
+  const { eventBus, stderrPath, exitCode, provider, model, role, phase } = params;
+  if (!stderrPath || !provider) return false;
+  try {
+    const classification = await classifyProviderFailure({
+      stderrPath,
+      provider,
+      exitCode,
+    });
+    if (!classification) return false;
+    await eventBus.emit({
+      kind: 'provider.failure',
+      phase,
+      level: 'error',
+      message: `${role} provider failure (${provider}): ${classification.classification}`,
+      role,
+      provider,
+      model,
+      artifact_refs: [{ type: 'stderr', path: stderrPath }],
+      payload: {
+        classification: classification.classification,
+        retry_recommended: classification.retry_recommended,
+        evidence: classification.evidence,
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

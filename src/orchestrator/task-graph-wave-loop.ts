@@ -9,6 +9,7 @@ import {
 } from '../scheduler/wave-executor.js';
 import { orderedTasks, initialTaskAttempts, initialTaskStatuses } from '../scheduler/task-graph.js';
 import { runTaskInWorktree } from './task-graph-worktree-runner.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 import {
   loadTaskResults,
   upsertTaskResult,
@@ -64,6 +65,7 @@ export interface TaskGraphWaveLoopParams {
   combinedSignal: AbortSignal;
   noCommit: boolean;
   tag: boolean;
+  eventBus: IEventBus;
 }
 
 export async function runTaskGraphWaveLoop(
@@ -88,6 +90,7 @@ export async function runTaskGraphWaveLoop(
     combinedSignal,
     noCommit,
     tag,
+    eventBus,
   } = params;
 
   const tasks = orderedTasks(taskGraph);
@@ -118,6 +121,25 @@ export async function runTaskGraphWaveLoop(
     tasks,
     trackedFiles,
     maxParallelWorkers,
+    onEvent: (event) => {
+      // Only forward wave/task lifecycle events; skip plan-computed and batches.
+      if (event.type === 'plan-computed' || event.type === 'batch-start' || event.type === 'batch-finish') return;
+      const kind = event.type === 'wave-start' ? 'wave.started'
+        : event.type === 'wave-finish' ? 'wave.completed'
+        : event.type === 'task-start' ? 'task.started'
+        : event.type === 'task-finish' ? 'task.completed'
+        : 'task.started';
+      const isFinish = event.type === 'task-finish';
+      void eventBus.emit({
+        kind,
+        phase: 'DEVELOPING',
+        level: isFinish && event.status !== 'passed' ? 'warn' : 'info',
+        message: `wave ${event.waveIndex + 1} ${event.type}`,
+        wave_index: event.waveIndex,
+        task_id: event.type === 'task-start' || event.type === 'task-finish' ? event.taskId : undefined,
+        status: isFinish ? event.status : undefined,
+      }).catch(() => { /* fail-soft */ });
+    },
     runTask: async (task, context): Promise<WaveTaskRunnerResult> => {
       const taskIndex = taskIndexById.get(task.id) ?? 0;
       startedAtByTask.set(task.id, new Date().toISOString());
@@ -129,6 +151,15 @@ export async function runTaskGraphWaveLoop(
         taskIndex,
         taskStatus: 'running',
         lastEvent: `Wave ${context.waveIndex + 1} batch ${context.batchIndex + 1}: starting ${task.id}`,
+      });
+      await eventBus.emit({
+        kind: 'task.started',
+        phase: 'DEVELOPING',
+        level: 'info',
+        message: `Wave ${context.waveIndex + 1}: starting ${task.id}`,
+        task_id: task.id,
+        wave_index: context.waveIndex,
+        payload: { task_index: taskIndex, batch_index: context.batchIndex },
       });
 
       const result = await runTaskInWorktree({
@@ -155,6 +186,16 @@ export async function runTaskGraphWaveLoop(
         taskIndex,
         taskStatus: status === TaskStatus.PASSED ? 'passed' : 'failed',
         lastEvent: `Wave ${context.waveIndex + 1} batch ${context.batchIndex + 1}: ${task.id} ${status}`,
+      });
+      await eventBus.emit({
+        kind: status === TaskStatus.PASSED ? 'task.completed' : 'task.blocked',
+        phase: 'DEVELOPING',
+        level: status === TaskStatus.PASSED ? 'info' : 'warn',
+        message: `Wave ${context.waveIndex + 1}: ${task.id} ${status}`,
+        task_id: task.id,
+        wave_index: context.waveIndex,
+        status,
+        payload: { worker_branch: result.branch ?? null, error: result.error ?? null },
       });
       await appendLog(
         artifactStore,
