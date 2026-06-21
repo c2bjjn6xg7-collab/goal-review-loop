@@ -45,3 +45,36 @@ Ask: "Can this task leave the repository green by itself?"
 
 - If yes, it can be a task.
 - If no, merge it into the surrounding atomic module instead of splitting it smaller.
+
+## Long-Prompt Provider Patience
+
+When dogfooding Review Loop with real providers, do not treat heartbeat-only output
+as immediate failure for large Planner or Developer prompts. Large atomic
+orchestrator tasks can spend several minutes reasoning before writing files.
+
+Recommended operator behavior:
+
+- Keep long provider timeouts for large prompts: at least 60 minutes for Planner
+  and 90-120 minutes for Developer when the task is an atomic orchestrator
+  module.
+- Keep heartbeat output enabled at roughly 30 second intervals, but use it only
+  as liveness evidence, not as proof of progress.
+- Give Claude Planner or Claude Developer a 10-20 minute observation window
+  before cancelling, unless there is clear evidence of workspace contamination,
+  prompt transport failure, runaway process fan-out, or wrong-run writes.
+- During the observation window, monitor task worktree file mtimes, debug
+  stdout/stderr, handoff file creation, process CPU, and `.agent/state.json`.
+  Any legitimate file activity should reset the patience window.
+- Before starting a new dogfood run, clear or back up stale `.agent/` runtime
+  state and terminate old provider child processes for the same repository.
+  This prevents orphaned provider processes from writing artifacts for an old
+  run into a fresh `.agent` directory.
+- If Codex CLI reports account or workspace credit exhaustion, record it as an
+  external provider blocker. Do not misclassify that as a Review Loop code
+  failure, and do not burn more retries on alternate Codex models unless a quick
+  smoke prompt proves the model is available.
+
+Cancellation is appropriate before the 10-20 minute window only when there is
+direct evidence that the provider is damaging correctness, such as an orphaned
+old-run process writing into the current `.agent`, invalid run IDs in generated
+artifacts, or a provider error that has already returned.

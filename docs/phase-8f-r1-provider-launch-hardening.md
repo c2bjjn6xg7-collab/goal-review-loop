@@ -36,6 +36,21 @@ Important findings from dogfood and local audit:
 - `docs/configuration.md` includes `provider_kind` examples, but the current `ProviderConfig` schema in `src/artifacts/config.ts` does not accept `provider_kind`. Documentation examples and loadable config schema must be brought back into agreement.
 - Phase 8B task graph and multi-worker work is intentionally not a clean baseline yet. Do not start multi-worker implementation in this phase.
 
+Additional dogfood finding from Phase 8E R2:
+
+- Claude Code can respond successfully to a small `claude -p` prompt while still
+  appearing quiet for several minutes on a large Review Loop Planner or
+  Developer prompt. Heartbeat-only output is therefore not enough to declare
+  failure for large atomic tasks.
+- A previous Claude run left an orphaned child process that wrote old-run
+  artifacts into a fresh `.agent` directory. That is a correctness risk and
+  should be treated differently from a quiet but still-owned long-running
+  provider process.
+- Codex CLI may fail independently with `Your workspace is out of credits`.
+  That is an external account/provider blocker, not a Review Loop code failure.
+  Retrying alternate Codex models is useful only if a tiny smoke prompt proves
+  that the selected model is available.
+
 ## Objective
 
 Harden provider launch configuration so a user can reliably run domestic Claude Code and Codex in the same Review Loop setup without hand-writing fragile shell snippets.
@@ -108,6 +123,24 @@ P=$(cat "$1"); exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy 
    - Official Codex: use inherited or custom proxy such as `127.0.0.1:7897` when needed.
    - Proxy and no-proxy providers must be able to coexist in one `review-loop.yaml`.
 
+9. Long-prompt provider liveness must be observable without premature cancellation.
+   - Large Planner and Developer prompts must be allowed a realistic quiet
+     reasoning window. For atomic orchestrator modules, operators should wait
+     at least 10-20 minutes before cancelling a heartbeat-only Claude process
+     unless there is clear contamination or a returned provider error.
+   - Recommended long-prompt timeout defaults or examples should be at least
+     60 minutes for Planner and 90-120 minutes for Developer.
+   - Heartbeats must be documented as liveness signals only. They do not prove
+     progress and they do not prove a hang by themselves.
+   - Operator guidance must list concrete progress signals: task worktree file
+     mtimes, debug stdout/stderr growth, handoff creation, process CPU, and
+     `.agent/state.json` updates.
+   - Starting a fresh dogfood run must include clearing or backing up stale
+     `.agent/` runtime state and terminating orphan provider child processes
+     for the same repository.
+   - Wrong-run writes, invalid run IDs in artifacts, orphan process writes, or
+     an already-returned provider error are valid reasons to cancel immediately.
+
 ## Acceptance Criteria
 
 1. `providers test claude` or an explicit prompt-smoke variant can send a prompt beginning with `---` through the configured Claude launch path and receive a successful response in an environment where proxy variables are present in the parent shell.
@@ -125,6 +158,11 @@ P=$(cat "$1"); exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy 
    - `npm pack --dry-run`
    - `git diff --check`
 8. A small Review Loop smoke run can be executed with the hardened profiles, or a documented reason is recorded when local provider availability prevents the real-model smoke.
+9. A long-prompt Claude smoke or documented dry-run procedure demonstrates that
+   Review Loop does not cancel merely because only heartbeat output appears for
+   the first few minutes.
+10. Provider blocker reporting distinguishes external account/provider failures
+    such as Codex credit exhaustion from Review Loop implementation failures.
 
 ## Non-Goals
 
@@ -145,6 +183,9 @@ P=$(cat "$1"); exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy 
 5. Fix `docs/configuration.md` examples so they match the actual schema, or add intentional schema/type support for any documented metadata fields.
 6. Add focused unit and integration tests for front matter prompt transport, proxy stripping, and config example validity.
 7. Run all gates and record any real-model smoke limitations.
+8. Add operator documentation for long-prompt observation windows, stale
+   `.agent` cleanup, orphan provider process cleanup, and provider-credit
+   blocker classification.
 
 ## Handoff Notes
 
@@ -152,3 +193,10 @@ P=$(cat "$1"); exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy 
 - Keep `review-loop-test-report.md` out of commits unless the user explicitly decides to version it.
 - Keep temporary `.agent/debug/`, `.agent/evidence/`, `.agent/transcripts/`, `.agent/verification/`, and `.agent/state.json` local-only.
 - Do not use the dirty public repository as the implementation baseline.
+- When a Claude Planner or Developer process only emits heartbeat lines on a
+  large prompt, wait 10-20 minutes and inspect worktree/log/process activity
+  before cancelling. Cancel early only for concrete contamination, wrong-run
+  artifacts, orphan process writes, or a returned provider error.
+- If Codex reports workspace credit exhaustion, record it as an external
+  provider blocker and avoid spending more Review Loop retries until a tiny
+  Codex smoke prompt succeeds.
