@@ -32,13 +32,16 @@ import {
   runIntegrationMerge,
   writeIntegrationPlanEvidence,
 } from './integration-runner.js';
+import { integrationAuditSkipReason, runIntegrationAudit } from './integration-audit.js';
 import {
   Phase as PhaseEnum,
   TaskStatus,
   type ReviewLoopConfig,
+  type GoalFrontMatter,
   type TaskGraph,
   type TaskGraphState,
   type TaskResult,
+  type VerificationCommand,
 } from '../types.js';
 
 export interface TaskGraphWaveLoopParams {
@@ -52,6 +55,8 @@ export interface TaskGraphWaveLoopParams {
   currentBranch: string;
   baseCommit: string;
   goalDigest: string;
+  goalFm: GoalFrontMatter;
+  verificationCommands: VerificationCommand[];
   taskGraph: TaskGraph;
   maxIterations: number;
   maxParallelWorkers: number;
@@ -72,6 +77,8 @@ export async function runTaskGraphWaveLoop(
     currentBranch,
     baseCommit,
     goalDigest,
+    goalFm,
+    verificationCommands,
     taskGraph,
     maxIterations,
     maxParallelWorkers,
@@ -320,39 +327,146 @@ export async function runTaskGraphWaveLoop(
     );
   }
 
-  await stateStore.update(() => ({
-    branch: integrationResult.integration_branch,
-    commit_skipped: true,
-    skip_reason: 'Phase 8E R1 assembled the integration branch; Final Aggregate Audit and final project commit/tag are deferred.',
-  }));
-  await stateStore.transition(PhaseEnum.VERIFYING);
-  await stateStore.transition(PhaseEnum.AUDITING);
-  await stateStore.transition(PhaseEnum.FINALIZING);
+  const integrationAuditResult = await runIntegrationAudit({
+    projectRoot,
+    agentDir,
+    runId,
+    baseCommit,
+    goalDigest,
+    goalFrontMatter: goalFm,
+    verificationCommands,
+    integrationBranch: integrationResult.integration_branch,
+    stateStore,
+    artifactStore,
+    orchestratorRegistry,
+    config,
+    combinedSignal,
+    iteration: tasks.length + 2,
+  });
+  return makeResult(
+    ...(await mapIntegrationAuditResult({
+      projectRoot,
+      agentDir,
+      runId,
+      stateStore,
+      artifactStore,
+      orchestratorRegistry,
+      taskResultsPath,
+      integrationResult,
+      integrationAuditResult,
+      iteration: tasks.length + 2,
+    })),
+  );
+}
+
+async function mapIntegrationAuditResult(params: {
+  projectRoot: string;
+  agentDir: string;
+  runId: string;
+  stateStore: StateStore;
+  artifactStore: ArtifactStore;
+  orchestratorRegistry: OrchestratorFileRegistry;
+  taskResultsPath: string;
+  integrationResult: Awaited<ReturnType<typeof runIntegrationMerge>>;
+  integrationAuditResult: Awaited<ReturnType<typeof runIntegrationAudit>>;
+  iteration: number;
+}): Promise<Parameters<typeof makeResult>> {
+  const {
+    projectRoot,
+    agentDir,
+    runId,
+    stateStore,
+    artifactStore,
+    orchestratorRegistry,
+    taskResultsPath,
+    integrationResult,
+    integrationAuditResult,
+    iteration,
+  } = params;
+  registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
+  const artifactPaths = uniquePaths([
+    taskResultsPath,
+    join(agentDir, 'task-runs'),
+    integrationArtifactDir(projectRoot),
+    ...integrationResult.artifact_paths,
+    ...integrationAuditResult.artifact_paths,
+  ]);
+
+  if (integrationAuditResult.status === 'blocked') {
+    const message = integrationAuditResult.error_message ?? 'Phase 8E R2 integrated audit BLOCKED';
+    await stateStore.update(() => ({
+      branch: integrationAuditResult.integration_branch,
+      commit_skipped: true,
+      skip_reason: 'Phase 8E R2 blocked before final project commit/tag.',
+      tag_name: null,
+      tag_created: false,
+    }));
+    await stateStore.transition(PhaseEnum.BLOCKED);
+    await appendLog(
+      artifactStore,
+      runId,
+      iteration,
+      'FINALIZING',
+      'integration audit',
+      'BLOCKED',
+      message,
+    );
+    await emitProgress({
+      projectRoot,
+      stateStore,
+      lastEvent: 'Phase 8E R2 integrated audit BLOCKED',
+      registry: orchestratorRegistry,
+      finalAuditDecision: integrationAuditResult.audit_decision,
+    });
+    return [
+      runId,
+      PhaseEnum.BLOCKED,
+      3,
+      integrationAuditResult.integration_branch,
+      integrationAuditResult.audit_decision,
+      artifactPaths,
+      'Review .agent/integration evidence and resolve the integrated audit blocker',
+      message,
+      {
+        code: integrationAuditResult.error_code ?? 'FINAL_AUDIT_FAILED',
+        message,
+        resumable: false,
+        suggested_action: 'Review .agent/integration evidence and retry after fixing the blocker.',
+      },
+      null,
+      true,
+      null,
+      false,
+      'Phase 8E R2 blocked before final project commit/tag.',
+    ];
+  }
+
   await stateStore.transition(PhaseEnum.PASSED);
   await emitProgress({
     projectRoot,
     stateStore,
-    lastEvent: `Phase 8E R1 integration branch assembled: ${integrationResult.integration_branch}`,
+    lastEvent: `Phase 8E R2 integrated audit PASSED: ${integrationAuditResult.integration_branch}`,
     registry: orchestratorRegistry,
+    finalAuditDecision: 'PASS',
   });
 
-  const message = `Parallel wave task execution PASSED. Phase 8E R1 assembled integration branch ${integrationResult.integration_branch}; Final Aggregate Audit and final project commit/tag are deferred to a later Phase 8E slice.`;
-  return makeResult(
+  const skipReason = integrationAuditSkipReason();
+  return [
     runId,
     PhaseEnum.PASSED,
     0,
-    integrationResult.integration_branch,
-    null,
-    uniquePaths([taskResultsPath, join(agentDir, 'task-runs'), integrationArtifactDir(projectRoot), ...integrationResult.artifact_paths]),
-    'Run the later Phase 8E Final Aggregate Audit/final commit slice when ready',
-    message,
+    integrationAuditResult.integration_branch,
+    'PASS',
+    artifactPaths,
+    'Run Phase 8E R3 final commit/tag slice when ready',
+    `Parallel wave task execution PASSED. Phase 8E R2 verified and Final Aggregate Audited integration branch ${integrationAuditResult.integration_branch}; final project commit/tag are deferred to R3.`,
     null,
     null,
     true,
     null,
     false,
-    'Phase 8E R1 assembled the integration branch; Final Aggregate Audit and final project commit/tag are deferred.',
-  );
+    skipReason,
+  ];
 }
 
 async function ensureWaveTaskGraphState(

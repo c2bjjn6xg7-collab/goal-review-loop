@@ -126,11 +126,12 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
     expect(result.phase).toBe('PASSED');
     expect(result.exit_code).toBe(0);
     expect(result.error).toBeNull();
+    expect(result.audit_decision).toBe('PASS');
     expect(result.commit_sha).toBeNull();
     expect(result.commit_skipped).toBe(true);
-    expect(result.skip_reason).toMatch(/Phase 8E R1 assembled the integration branch/i);
-    expect(result.message).toMatch(/assembled integration branch/i);
-    expect(result.message).toMatch(/Final Aggregate Audit and final project commit\/tag are deferred/i);
+    expect(result.skip_reason).toMatch(/Phase 8E R2 ran integrated verification and Final Aggregate Audit/i);
+    expect(result.message).toMatch(/Phase 8E R2 verified and Final Aggregate Audited/i);
+    expect(result.message).toMatch(/final project commit\/tag are deferred to R3/i);
     expect(result.branch).toBe(`integration/${result.run_id}`);
     expect(git(repoDir, ['branch', '--show-current'])).toBe(`integration/${result.run_id}`);
     expect(git(repoDir, ['rev-parse', '--verify', `integration/${result.run_id}`])).toMatch(/^[0-9a-f]{40}$/);
@@ -139,6 +140,9 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
       join(repoDir, '.agent', 'integration'),
       join(repoDir, '.agent', 'integration', 'integration-plan.json'),
       join(repoDir, '.agent', 'integration', 'cherry-pick-log.jsonl'),
+      join(repoDir, '.agent', 'integration', 'integrated-diff-metadata.json'),
+      join(repoDir, '.agent', 'integration', 'final-audit-context.json'),
+      join(repoDir, '.agent', 'final-audit.md'),
     ]));
 
     for (const taskId of ['task-1', 'task-2', 'task-3']) {
@@ -172,6 +176,14 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
       .filter(Boolean)
       .map((line) => JSON.parse(line));
     expect(cherryPickLog.map((entry: { outcome: string }) => entry.outcome)).toEqual(['applied', 'applied', 'applied']);
+    const integratedMetadata = JSON.parse(readFileSync(join(repoDir, '.agent', 'integration', 'integrated-diff-metadata.json'), 'utf8'));
+    expect(integratedMetadata.integrated_diff_digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(integratedMetadata.changed_files).toEqual(expect.arrayContaining(expectedTaskFiles));
+
+    const finalAuditContext = JSON.parse(readFileSync(join(repoDir, '.agent', 'integration', 'final-audit-context.json'), 'utf8'));
+    expect(finalAuditContext.integrated_diff_digest).toBe(integratedMetadata.integrated_diff_digest);
+    expect(finalAuditContext.per_task_diff_digest_reused).toBe(false);
+    expect(existsSync(join(repoDir, '.agent', 'final-audit.md'))).toBe(true);
 
     const taskResults = JSON.parse(readFileSync(join(repoDir, '.agent', 'task-results.json'), 'utf8'));
     expect(taskResults.results.map((entry: { task_id: string }) => entry.task_id)).toEqual(['task-1', 'task-2', 'task-3']);
@@ -181,7 +193,8 @@ describe('Phase 8D P5: parallel wave task-graph execution', () => {
     expect(state.phase).toBe('PASSED');
     expect(state.branch).toBe(`integration/${result.run_id}`);
     expect(state.commit_skipped).toBe(true);
-    expect(state.skip_reason).toMatch(/Phase 8E R1 assembled the integration branch/i);
+    expect(state.skip_reason).toMatch(/Phase 8E R2 ran integrated verification and Final Aggregate Audit/i);
+    expect(state.audited_diff_digest).toBe(integratedMetadata.integrated_diff_digest);
     expect(Object.values(state.task_graph_state.task_statuses).every((status) => status === 'passed')).toBe(true);
   }, 120000);
 

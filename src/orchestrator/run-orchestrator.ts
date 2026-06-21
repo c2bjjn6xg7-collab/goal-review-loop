@@ -693,6 +693,8 @@ export async function runOrchestrator(params: {
           currentBranch,
           baseCommit,
           goalDigest,
+          goalFm,
+          verificationCommands,
           taskGraph: plannerValidation.taskGraph,
           maxIterations: params.max_iterations ?? config.loop.max_iterations,
           maxParallelWorkers: parallelDecision.maxParallelWorkers,
