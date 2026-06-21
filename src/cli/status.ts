@@ -8,6 +8,7 @@ import { resolve, join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
+import { EventStore, type ReviewLoopEvent } from '../runtime/event-store.js';
 import type { RunState, StatusOutput, ReviewLoopError } from '../types.js';
 import { Phase as PhaseEnum } from '../types.js';
 import { isTerminal } from '../orchestrator/state-machine.js';
@@ -23,6 +24,13 @@ function parseWatchInterval(value: string): number {
   return Number(value);
 }
 
+function parseWatchTimeout(value: string): number {
+  if (!/^[0-9]+$/.test(value) || Number(value) < 1) {
+    throw new Error(`--watch-timeout must be a positive integer, got "${value}"`);
+  }
+  return Number(value);
+}
+
 export function createStatusCommand(): Command {
   const cmd = new Command('status');
   cmd
@@ -30,6 +38,7 @@ export function createStatusCommand(): Command {
     .option('--json', 'Output status as JSON')
     .option('--watch', 'Continuously poll status until terminal phase')
     .option('--watch-interval <ms>', 'Watch polling interval in ms', parseWatchInterval, 2000)
+    .option('--watch-timeout <ms>', 'Max wall-clock ms before watch exits (test-friendly)', parseWatchTimeout, 0)
     .option('--project-root <path>', 'Project root directory', process.cwd())
     .action(async (options) => {
       try {
@@ -57,10 +66,150 @@ export function createStatusCommand(): Command {
   return cmd;
 }
 
-async function watchStatus(options: { projectRoot: string; json?: boolean; watchInterval?: number }): Promise<void> {
+/**
+ * Terminal event kinds that signal the watch loop should exit.
+ */
+const TERMINAL_EVENT_KINDS = new Set(['run.completed', 'run.blocked', 'run.failed']);
+
+/**
+ * Phase 9 R1: watch status by reading the durable event stream.
+ *
+ * When `.agent/events.jsonl` exists, watch replays existing events then
+ * polls for newly appended events. JSON mode emits one JSON event per line;
+ * text mode renders a compact live view. The loop exits when it sees a
+ * terminal run event or when --watch-timeout (ms) elapses.
+ *
+ * Falls back to the legacy state-polling watch when no event stream exists,
+ * so older runs without events.jsonl remain observable.
+ */
+async function watchStatus(options: {
+  projectRoot: string;
+  json?: boolean;
+  watchInterval?: number;
+  watchTimeout?: number;
+}): Promise<void> {
+  const projectRoot = resolve(options.projectRoot);
+  const agentDir = join(projectRoot, '.agent');
+  const eventsPath = join(agentDir, 'events.jsonl');
+
+  if (existsSync(eventsPath)) {
+    await watchEventStream({ agentDir, eventsPath, json: options.json ?? false, watchInterval: options.watchInterval ?? 1000, watchTimeout: options.watchTimeout ?? 0 });
+    return;
+  }
+
+  // Legacy fallback: poll state.json + progress.json.
+  await watchStatePoll(options);
+}
+
+async function watchEventStream(params: {
+  agentDir: string;
+  eventsPath: string;
+  json: boolean;
+  watchInterval: number;
+  watchTimeout: number;
+}): Promise<void> {
+  const { agentDir, json, watchInterval, watchTimeout } = params;
+  // Derive run_id from state.json if present, else from the first event.
+  let runId = 'unknown';
+  const statePath = join(agentDir, 'state.json');
+  if (existsSync(statePath)) {
+    try {
+      const st = JSON.parse(readFileSync(statePath, 'utf8')) as { run_id?: string };
+      if (typeof st.run_id === 'string') runId = st.run_id;
+    } catch { /* ignore */ }
+  }
+  const store = new EventStore(agentDir, runId);
+
+  const startMs = Date.now();
+  let lastSeq = 0;
+
+  // Replay existing events.
+  const existing = await store.readAll();
+  for (const ev of existing) {
+    emitWatchLine(ev, json);
+    lastSeq = ev.seq;
+    if (TERMINAL_EVENT_KINDS.has(ev.kind)) {
+      renderTextSummary(existing, json);
+      return;
+    }
+  }
+
+  // Follow newly appended events.
+  while (true) {
+    if (watchTimeout > 0 && Date.now() - startMs > watchTimeout) {
+      renderTextSummary(existing.concat(await store.readSince(lastSeq)), json);
+      return;
+    }
+    const tail = await store.readSince(lastSeq);
+    if (tail.length > 0) {
+      for (const ev of tail) {
+        emitWatchLine(ev, json);
+        lastSeq = ev.seq;
+        if (TERMINAL_EVENT_KINDS.has(ev.kind)) {
+          renderTextSummary(existing.concat(await store.readAll()), json);
+          return;
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, watchInterval));
+  }
+}
+
+function emitWatchLine(ev: ReviewLoopEvent, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(ev));
+  }
+  // In text mode, each new event is rendered inline; the full summary is
+  // printed once at the end (or on timeout) by renderTextSummary.
+}
+
+function renderTextSummary(events: ReviewLoopEvent[], json: boolean): void {
+  if (json) return; // JSON mode already emitted each event inline.
+  if (events.length === 0) return;
+  const last = events[events.length - 1];
+  const runId = last.run_id;
+
+  // Derive current phase and active role from the latest relevant events.
+  const lastRoleStarted = [...events].reverse().find((e) => e.kind === 'role.started');
+  const terminalEv = events.find((e) => TERMINAL_EVENT_KINDS.has(e.kind));
+  const phase = terminalEv ? terminalEv.phase : last.phase;
+
+  const recent = events.slice(-6);
+
+  console.log('');
+  console.log(`Run: ${runId}  Phase: ${phase}`);
+  if (lastRoleStarted?.role) {
+    const providerInfo = lastRoleStarted.provider ? `  Provider: ${lastRoleStarted.provider}` : '';
+    console.log(`Active: ${lastRoleStarted.role}${providerInfo}`);
+  }
+  console.log('Latest:');
+  for (const ev of recent) {
+    const ts = new Date(ev.ts).toLocaleTimeString();
+    console.log(`${ts} ${ev.kind} ${ev.message}`);
+  }
+
+  // Surface artifact refs from recent events.
+  const refs = new Set<string>();
+  for (const ev of recent) {
+    if (ev.artifact_refs) {
+      for (const ref of ev.artifact_refs) refs.add(ref.path);
+    }
+  }
+  if (refs.size > 0) {
+    console.log('Artifacts:');
+    for (const p of refs) console.log(`  ${p}`);
+  }
+}
+
+/**
+ * Legacy state-polling watch, used when no events.jsonl exists.
+ */
+async function watchStatePoll(options: { projectRoot: string; json?: boolean; watchInterval?: number; watchTimeout?: number }): Promise<void> {
   const interval = options.watchInterval ?? 2000;
+  const deadline = options.watchTimeout && options.watchTimeout > 0 ? Date.now() + options.watchTimeout : 0;
   let lastKey = '';
   while (true) {
+    if (deadline > 0 && Date.now() > deadline) return;
     const result = await executeStatus({ project_root: options.projectRoot, json: false });
     if (result) {
       // F-604: Read progress.json for finer-grained last_event_at
