@@ -39,4 +39,16 @@ describe('renderDashboardHtml', () => {
   it('returns the same content on repeated calls', () => {
     expect(renderDashboardHtml()).toBe(html);
   });
+
+  it('renders the cancel button with all label states', () => {
+    expect(html).toContain('cancel-btn');
+    expect(html).toContain('Cancel Run');
+    expect(html).toContain('Cancelling');
+    expect(html).toContain('Run ended');
+  });
+
+  it('posts to /api/cancel from the cancel handler', () => {
+    expect(html).toContain("fetch('/api/cancel'");
+    expect(html).toContain("method: 'POST'");
+  });
 });

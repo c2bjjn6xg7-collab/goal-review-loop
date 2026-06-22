@@ -1,93 +1,68 @@
 ---
 schema_version: 1
-run_id: "20260622043223-giis2q"
+run_id: "20260622053529-cukmg2"
 iteration: 1
 author_role: "developer"
 status: "COMPLETED"
 ---
 
-# Phase 9 R2B — SSE Realtime Bridge
+# Phase 9 R2C — Dashboard Cancel Button
 
 ## Summary
 
-Implemented the Server-Sent Events push channel for the read-only dashboard. The
-JSON snapshot endpoint and 2 s polling path remain intact as a fallback; SSE
-is preferred when `EventSource` is available client-side.
+Implemented `POST /api/cancel` on the dashboard HTTP server plus a
+`Cancel Run` button in the dashboard HTML. The route reuses the
+existing cancel mechanism (`.agent/cancel-request.json` + best-effort
+SIGTERM via `LockManager`) — no new cancel protocol.
 
 ## Changes
 
-- `src/web/event-source.ts`
-  - Added exported `resolveRunIdFromAgentDir(agentDir)` helper that reads
-    `state.json` and returns `run_id | null`. Used by both the snapshot path
-    and the new SSE route.
-  - `DashboardEventSource.readRunIdFromState` now delegates to the new helper.
-  - Removed the unused `statePath` field (was only referenced by the inlined
-    state read).
-
 - `src/web/dashboard-server.ts`
-  - Added `ssePollMs` (default 500 ms) and `sseHeartbeatMs` (default 15 000 ms)
-    to `DashboardServerOptions`.
-  - New `GET /api/events/stream` handler placed before the 404 fallback. It
-    writes `Content-Type: text/event-stream`, `Cache-Control: no-cache,
-    no-transform`, `Connection: keep-alive`, `X-Accel-Buffering: no`, flushes
-    headers, then:
-    1. Emits `event: hello\ndata: {"run_id":"<value>"}\n\n` where `<value>`
-       comes from `resolveRunIdFromAgentDir` (falls back to `"unknown"`).
-    2. Initializes `lastSeq` from `EventStore.getLastSequence()` so only
-       *new* events are pushed (no historical replay; matches the GOAL
-       non-goal of "no catch-up replay").
-    3. Polls `EventStore.readSince(lastSeq)` every `ssePollMs`, writes
-       `data: <json>\n\n` per new event in seq order, and advances
-       `lastSeq`. Per-tick errors are swallowed so a mid-write JSONL line
-       cannot kill the connection — `readAll()` already skips malformed lines.
-    4. Writes `: heartbeat\n\n` on a separate interval every
-       `sseHeartbeatMs`.
-    5. Cleans up both intervals, removes the connection from the active set,
-       and `res.end()`s on `req.close`, `req.error`, `res.close`, or
-       `res.error`.
-  - `DashboardServer.stop()` iterates the active-connections `Set` and
-    proactively cleans up each open SSE response *before* awaiting
-    `server.close()`, so lingering SSE sockets never hold the close open.
+  - Added `POST /api/cancel` handler, matched **before** the generic
+    non-GET 405 path so `GET /api/cancel` correctly returns 405.
+  - 409 when `state.json` is missing (no active run).
+  - 409 when `state.phase` ∈ `{PASSED, FAILED, BLOCKED, CANCELLED}`.
+  - 200 with `{ ok: true, message: 'cancel requested', run_id,
+    requested_at }` on the happy path; writes `.agent/cancel-request.json`
+    via `atomicWriteJSON` matching the `CancelRequest` type with
+    `requested_by = "dashboard:<pid>"`.
+  - Best-effort `process.kill(pid, 'SIGTERM')` when a lock file is
+    present and the PID is alive; signal errors are swallowed so the
+    cancel-request file remains the durable signal. Never blocks waiting
+    for orchestrator exit.
 
 - `src/web/dashboard-html.ts`
-  - Refactored the inline IIFE to encode the SSE↔polling exclusivity with a
-    `mode` flag (`'idle' | 'sse' | 'poll'`).
-  - On load: `tick()` for an initial paint, then `startSse()`.
-  - `startSse()` guards on `typeof EventSource === 'function'`, opens
-    `new EventSource('/api/events/stream')`, calls `tick()` on each `hello`
-    or `message` event (the JSON snapshot remains the source of truth), and
-    on `onerror` closes the SSE channel and starts the 2 s poll fallback.
-  - When SSE is open, the 2 s `setInterval` is not running. Polling only
-    starts on missing `EventSource` or on an SSE error. The `tick` symbol
-    and `setInterval(tick, 2000)` remain reachable in the source so the
-    existing `dashboard-html.test.ts` regex assertions still pass.
+  - New `<button id="cancel-btn">` adjacent to the run id.
+  - Three states: `Cancel Run` (enabled, active phase), `Cancelling…`
+    (disabled, click in flight) and `Run ended` (disabled, terminal /
+    unknown phase).
+  - Click handler POSTs `/api/cancel`. Non-2xx responses clear the
+    in-flight flag, surface the error via `textContent` only, and
+    re-enable the button so the user can retry. No `innerHTML` writes
+    of run-supplied strings.
 
-- `tests/unit/dashboard-server-sse.test.ts` (new)
-  - Boots the real server on an ephemeral port with `ssePollMs: 30`,
-    `sseHeartbeatMs: 80`.
-  - Asserts hello frame with the resolved `run_id`, `data:` frame for an
-    `events.jsonl` append (matched by `"seq":N` and `"kind"`), heartbeat
-    line within ~500 ms, header content, `run_id: "unknown"` fallback when
-    `state.json` is missing, prompt teardown via destroying the client and
-    `server.stop()` (< 1 s) including with two open connections, and that
-    `GET /api/events` still returns the R2A JSON snapshot.
+- `tests/unit/dashboard-cancel.test.ts` (new)
+  - 200 happy path + `cancel-request.json` written with
+    `dashboard:<pid>` (fixture deliberately omits `run.lock` to skip
+    the SIGTERM branch).
+  - 409 when state.json is in a terminal phase (FAILED).
+  - 409 when state.json is missing.
+  - 405 on GET `/api/cancel`.
 
 - `tests/unit/dashboard-html.test.ts`
-  - Added one new assertion block that the script contains
-    `new EventSource('/api/events/stream')`, the `typeof EventSource` guard,
-    `onerror`, and the polling fallback name.
+  - Added assertions for the strings `cancel-btn`, `Cancel Run`,
+    `Cancelling`, and `Run ended`.
+  - Added assertion that the page POSTs to `/api/cancel`.
 
 ## Verification
 
-- `npm run typecheck`: **passes**.
-- `npm test`: **passes** — 93 test files, 1262 tests.
+- `npm test` → **94 files, 1263 tests passed**.
+- Existing dashboard tests (`dashboard-html.test.ts`,
+  `dashboard-server.test.ts`) still pass unchanged.
+- No new npm dependencies added.
 
-## Constraints respected
+## Scope Notes
 
-- Only files under `src/web/**` and the four allowed test files were touched.
-- No new runtime dependencies (no `package.json` change).
-- Server still binds to `127.0.0.1`.
-- `fs.watch` was not used; tail detection is via `EventStore.readSince`.
-- `src/runtime/event-store.ts`, `src/runtime/event-bus.ts`,
-  `src/orchestrator/**`, `src/cli/status.ts`, `review-loop.yaml`, and the
-  protected `.agent/*` files were not modified.
+All changes confined to the four allowed paths. No modifications to
+`src/cli/*`, `src/orchestrator/**`, the event store / bus, or
+`review-loop.yaml`.
