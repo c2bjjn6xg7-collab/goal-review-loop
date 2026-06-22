@@ -1,195 +1,196 @@
 ---
 schema_version: 1
-run_id: "20260622053529-cukmg2"
+run_id: "20260622110907-p3so08"
 author_role: "planner"
 ---
 
-# Phase 9 R2C — Dashboard Cancel Button
+# Phase 9 Observability Gaps — R11 next-action hint + R5/R12 artifact_refs
 
 ## Requirement Understanding
 
-The user wants to extend the read-only Phase 9 dashboard (R2A, polling
-`/api/events`; R2B, SSE bridge at `/api/events/stream`) with a single
-operational control: a **Cancel Run** button.
+The user wants two low-risk observability patches to close spec gaps in Phase 9:
 
-Key constraints derived from the request:
+**R11 — next-action hint.** When a run is resumed or in flight, both
+`review-loop status --watch` and the dashboard should show "what happens next"
+for the current phase. The hint logic already exists as `computeNextStep` in
+`src/cli/status.ts:371-406`, but only the non-watch status path calls it. The
+watch path (`watchEventStream` → `renderTextSummary`) and the dashboard
+(`DashboardEventSource.getSnapshot` + `dashboard-html.ts`) do not. The user
+wants the logic extracted into a shared pure function and reused by all three
+call sites, with no behavior change to the existing strings.
 
-- Only the **cancel** action is in scope. Resume / retry are explicitly
-  out of scope because they would require restarting the orchestrator
-  process, which lives outside the dashboard HTTP server.
-- The HTTP endpoint must **reuse the existing cancel mechanism** already
-  used by `review-loop cancel` (the CLI). No new cancel protocol.
-- The button must reflect run state: disabled in terminal phases, enabled
-  while the run is in progress, and shown as `Cancelling…` after the
-  user clicks until the phase transitions to `CANCELLED`.
-- Basic safety: the POST endpoint must verify there is an active run
-  (state.json exists, phase is non-terminal) before writing the cancel
-  request. Otherwise return `409 Conflict`.
-- Tests are mandatory at the HTTP route level.
-- R2A read-only routes (`GET /`, `GET /api/events`) and R2B SSE route
-  (`GET /api/events/stream`) must remain functional.
-- Do not touch event-store / event-bus / orchestrator (R1 territory),
-  do not modify `review-loop.yaml`, do not modify `src/cli/status.ts`.
+**R5/R12 — artifact_refs on existing events.** Several orchestrator emit
+call sites are missing artifact references that are already on disk:
+
+- `role.exited` for planner/developer/auditor/final-auditor — should carry a
+  `transcript` ref pointing at `.agent/transcripts/iteration-NN-<role>.md`
+  (the file `emitTranscript` writes one line above each `role.exited`).
+- `audit.decision` (~line 1866) — payload should carry `finding_count`
+  (number) and `rework_reason` (string, only when `decision !== 'PASS'`).
+  The audit-report body is not structured, so `rework_reason` is a
+  path-reference fallback per the spec.
+- `run.completed` (PASSED, three sites in `runFinalization`) — should carry
+  a `final-audit` artifact_ref at `.agent/final-audit.md`.
+- `verification.completed` (~line 1533) — already has a `verification-log`
+  ref; just needs an explicit test assertion.
+
+The user explicitly excludes: the event schema (`EventDraft`/`ReviewLoopEvent`
+already have `artifact_refs` and `payload`), `integration.*` events,
+`review-loop.yaml`, task-graph/wave event details, and orchestrator
+scheduling logic. No new dependencies.
 
 ## Current Project Status
 
-- Base commit: `bee382d5ea92369cc921991e412996105e640d9e` (main).
-- Dashboard server: `src/web/dashboard-server.ts` exposes `GET /` and
-  `GET /api/events`, bound to `127.0.0.1`. The handler currently treats
-  any non-GET method as `405`. R2C will need to add `POST /api/cancel`
-  to the routing table before the method check.
-- Dashboard HTML: `src/web/dashboard-html.ts` polls `/api/events` every
-  2s and renders the snapshot. It already exposes the run id and the
-  current phase in dedicated DOM elements — R2C will add a button
-  adjacent to the run id node.
-- Event source: `src/web/event-source.ts` returns a snapshot with
-  `run_id` and `current_phase`. It already classifies terminal phases
-  (`run.completed`, `run.blocked`, `run.failed`). The dashboard treats
-  any of `PASSED / FAILED / BLOCKED / CANCELLED` as terminal.
-- Existing cancel mechanism in `src/cli/cancel.ts`:
-  1. Read state, refuse if phase ∈ `{PASSED, FAILED, BLOCKED, CANCELLED}`.
-  2. Read lock to get orchestrator PID.
-  3. Write `.agent/cancel-request.json` via `atomicWriteJSON`.
-  4. Send `SIGTERM` to the PID and wait for grace period (config).
-  The orchestrator polls the cancel-request file on every iteration and
-  transitions to `CANCELLED` itself.
-- R2B (SSE bridge) lives on branch `agent/20260622043223-giis2q-...` and
-  is not yet merged into `main` at the base commit. R2C is written so
-  its HTML works regardless of whether snapshots arrive via polling
-  (R2A) or SSE (R2B) — both populate the same `render()` snapshot. If
-  R2B is merged before R2C lands, no additional wiring is needed.
-- Tests live in `tests/unit/dashboard-server.test.ts` and
-  `tests/unit/dashboard-html.test.ts`. R2C will add a focused test file
-  for the cancel route.
+Codebase explored; the relevant call sites are:
+
+- `src/cli/status.ts:371-406` — `computeNextStep(phase, iteration, max)`. Pure
+  function. Branches on `isTerminal(phase)` (PASSED/FAILED/BLOCKED/CANCELLED)
+  then on the non-terminal phase. Used only by `executeStatus` at line 294.
+- `src/cli/status.ts:171-207` — `renderTextSummary(events, json)`. Already
+  derives `phase = terminalEv ? terminalEv.phase : last.phase`. This is where
+  the watch path's `Next:` line belongs.
+- `src/web/event-source.ts:41-46` — `DashboardSnapshot` interface
+  (`run_id`, `current_phase`, `latest_events`, `artifacts`). Needs
+  `next_action: string`.
+- `src/web/event-source.ts:90-165` — `getSnapshot` (active path).
+- `src/web/event-source.ts:172-193` — `buildSnapshot` (archive path).
+- `src/web/dashboard-html.ts:46` — `Phase:` pill markup. The `Next:` line
+  goes adjacent. `render(snapshot)` at line 118 sets `phaseEl` text; a new
+  `nextActionEl` setter follows the same `setText` pattern.
+- `src/orchestrator/run-orchestrator.ts` — four `role.exited` emit sites
+  (planner ~752, developer ~1350, auditor ~1769, final-auditor ~2673), one
+  `audit.decision` site (~1866), three PASSED `emitRunTerminal` sites in
+  `runFinalization` (~2455, ~2825, ~3007), and the existing
+  `verification.completed` ref at ~1533.
+- `src/orchestrator/run-orchestrator.ts:3429-3456` — `emitTranscript` already
+  uses the path `.agent/transcripts/iteration-${NN}-${role}.md` with
+  `String(iteration).padStart(2, '0')`. The new `transcript` artifact_ref
+  must reuse this exact convention.
+- `src/agents/auditor-adapter.ts:235-242` — `AuditorValidationResult` has
+  `errors: string[]` and `decision`. `errors.length` is the only structured
+  finding count available at `audit.decision` emit time.
+- Existing tests: `tests/integration/orchestrator-events.test.ts` already
+  drives a full PASSED run and asserts event kinds; it is the natural place
+  to add artifact_ref assertions. `tests/unit/event-source.test.ts` already
+  seeds events and asserts snapshot fields. `tests/integration/status-watch.test.ts`
+  covers `watchEventStream`.
 
 ## Technical Approach
 
-### 1. New POST /api/cancel route
+**Shared next-action module.** Create `src/runtime/next-action.ts`
+exporting `computeNextAction(phase, iteration, maxIterations)`. Move the
+body of `computeNextStep` there verbatim, including the `isTerminal` import
+from `src/orchestrator/state-machine.js`. `status.ts` imports it; the local
+function is deleted. `event-source.ts` imports it for snapshot population.
+Keeping the module under `src/runtime/` matches the existing
+`src/runtime/` location of `event-store.ts` and avoids a new top-level
+directory.
 
-Add a `POST /api/cancel` branch to the dashboard server's request
-handler, **before** the `method !== 'GET'` rejection. It must:
+**Watch path.** `renderTextSummary` already computes `phase`. Add a small
+derivation of `iteration`/`max_iterations` from the latest `role.started` or
+`role.exited` event (these events don't currently carry iteration on the
+event itself, but `lastRoleStarted` is already captured; if iteration isn't
+on the event, pass 0/0 — `computeNextAction` still returns a meaningful
+phase-based message). Print `Next: <hint>` on the line after `Phase:`.
 
-1. Reject any method other than `POST` on `/api/cancel` with `405`.
-2. Read `.agent/state.json`. If missing, return `409 Conflict` with
-   `{ error: 'no_active_run', ... }`.
-3. If `state.phase ∈ TERMINAL_PHASES`, return `409 Conflict` with
-   `{ error: 'run_terminal', phase, ... }`.
-4. Otherwise, write `.agent/cancel-request.json` using the same
-   `CancelRequest` shape from `src/types.ts` and the same
-   `atomicWriteJSON` helper used by `src/cli/cancel.ts`. `requested_by`
-   should be `dashboard:${pid}` so the audit trail distinguishes the
-   dashboard source.
-5. If a lock file is present and its PID is alive, attempt
-   `process.kill(pid, 'SIGTERM')` to mirror the CLI behaviour. Do **not**
-   block waiting for the process to exit — the dashboard route returns
-   immediately.
-6. Return `200 OK` with `{ ok: true, message: 'cancel requested',
-   run_id, requested_at }`.
+**Dashboard snapshot.** Add `next_action: string` to `DashboardSnapshot`.
+Populate in both `getSnapshot` (active path) and `buildSnapshot` (archive
+path) via `computeNextAction(currentPhase, iter, max)`. Empty-events
+snapshots return `next_action: ''`.
 
-Reuse:
+**Dashboard HTML.** Add `<div>Next: <span id="next-action">…</span></div>`
+after the `Phase:` line. Wire `nextActionEl` in the script and set its text
+in `render(snapshot)`. No `innerHTML` (existing tests assert this).
 
-- `StateStore` from `src/orchestrator/state-store.js`.
-- `LockManager` from `src/runtime/lock-manager.js`.
-- `atomicWriteJSON` from `src/runtime/atomic-file.js`.
-- `CancelRequest` type from `src/types.js`.
+**Orchestrator artifact_refs.** At each of the four `role.exited` sites,
+build the transcript path from the in-scope `iteration` (planner uses 0)
+and add `artifact_refs: [{ type: 'transcript', path: transcriptPath }]`
+(merged with any existing refs — none of the four sites currently has one).
+At the `audit.decision` site, extend `payload` to include `finding_count:
+auditValidation.errors.length` and conditionally `rework_reason:
+'.agent/audit-report.md'` when `decision !== 'PASS'`. At the three PASSED
+`emitRunTerminal` sites, append `{ type: 'final-audit', path:
+'.agent/final-audit.md' }` to the existing `artifact_refs` array.
 
-This deliberately mirrors `executeCancel` in `src/cli/cancel.ts` but
-without the grace-period wait, so the HTTP request finishes quickly.
-
-### 2. Dashboard HTML — Cancel button
-
-Add a `<button id="cancel-btn" type="button">` next to the run id in the
-`<header>` block. The script section will:
-
-- Maintain a small client-side `cancelling` flag set on click.
-- On render, update the button:
-  - If `current_phase` ∈ `{PASSED, FAILED, BLOCKED, CANCELLED}` →
-    disabled, label `Run ended`, clear `cancelling`.
-  - Else if `cancelling` is true → disabled, label `Cancelling…`.
-  - Else → enabled, label `Cancel Run`.
-- On click:
-  - Disable button immediately, set `cancelling = true`, label
-    `Cancelling…`.
-  - `fetch('/api/cancel', { method: 'POST' })`. On non-2xx response,
-    revert `cancelling = false`, surface the error message in a small
-    inline status element under the button (no `innerHTML` — text only).
-- The `cancelling` flag is cleared whenever a snapshot reports a
-  terminal phase, which is the documented success signal.
-
-All DOM updates use `textContent` only (consistent with R2A's
-XSS-conscious style).
-
-### 3. Tests
-
-Add `tests/unit/dashboard-cancel.test.ts` that boots the dashboard
-server against a temporary `.agent` directory:
-
-- **Happy path**: state.json with a non-terminal phase (e.g.
-  `EXECUTING_DEVELOPER`) → POST returns 200, `.agent/cancel-request.json`
-  is created with the right `run_id`, response body is
-  `{ ok: true, message: 'cancel requested', ... }`. No real process is
-  signalled because no lock file is present.
-- **Terminal phase**: state.json with phase `PASSED` → POST returns 409,
-  no `cancel-request.json` is written.
-- **No active run**: `.agent/state.json` missing → POST returns 409,
-  no `cancel-request.json` is written.
-- **Wrong method**: `GET /api/cancel` → 405.
-
-Also add a small assertion to `tests/unit/dashboard-html.test.ts` that
-the rendered HTML contains a Cancel button element id (`cancel-btn`)
-and the strings `Cancel Run`, `Cancelling…`, `Run ended` so the UI
-contract is locked in.
-
-### 4. Out of scope (explicit)
-
-- No resume button. No retry button. No WebSocket.
-- No edits to event-store, event-bus, orchestrator, run-orchestrator,
-  task-graph-loop, review-loop.yaml, or `src/cli/status.ts`.
-- No change to the cancel protocol — only an HTTP wrapper around the
-  existing one.
+**Tests.** New `tests/unit/next-action.test.ts` exercises every branch.
+Extend `tests/unit/event-source.test.ts` with `next_action` assertions.
+Extend `tests/integration/status-watch.test.ts` with a `Next:` line
+assertion. Extend `tests/integration/orchestrator-events.test.ts` with
+artifact_ref and payload assertions on the four event kinds.
 
 ## Work Breakdown
 
-This is intentionally a **single atomic task**. Per
-`docs/superpowers/agent-task-planning-guidelines.md`, source + adjacent
-tests for a route should land together; splitting the route, HTML, and
-tests into separate Developer rounds would leave the repo in a state
-where either the server returns 404 for a button the UI exposes, or the
-button is hidden behind a working route. One task keeps typecheck and
-tests green at each commit boundary.
+The work splits into two independently-verifiable modules. They touch
+disjoint source files (task-1: `src/runtime/`, `src/cli/status.ts`,
+`src/web/`; task-2: `src/orchestrator/run-orchestrator.ts`) and can be
+landed in either order. Each task's `npm test` runs the full suite, so
+cross-module regressions are caught regardless of order.
 
-Scope of the task:
+- **task-1 — R11 next-action hint.** Create `src/runtime/next-action.ts`,
+  rewire `src/cli/status.ts` (import + delete local `computeNextStep` +
+  `renderTextSummary` `Next:` line), add `next_action` to
+  `DashboardSnapshot` and populate it in `event-source.ts`, render it in
+  `dashboard-html.ts`. New `tests/unit/next-action.test.ts`; extend
+  `tests/unit/event-source.test.ts` and `tests/integration/status-watch.test.ts`.
+  Verification: `npm test` (covers typecheck-free unit + integration).
+- **task-2 — R5/R12 artifact_refs.** In `src/orchestrator/run-orchestrator.ts`,
+  add `transcript` artifact_ref to the four `role.exited` emits, extend
+  `audit.decision` payload with `finding_count` + conditional
+  `rework_reason`, and add `final-audit` artifact_ref to the three PASSED
+  `emitRunTerminal` sites. Extend
+  `tests/integration/orchestrator-events.test.ts` with the corresponding
+  assertions (including a `verification-log` assertion on
+  `verification.completed`). Verification: `npm test`.
 
-- `src/web/dashboard-server.ts` — add `POST /api/cancel` handler.
-- `src/web/dashboard-html.ts` — add Cancel button and click handler.
-- `tests/unit/dashboard-cancel.test.ts` — new file with the four cases
-  above.
-- `tests/unit/dashboard-html.test.ts` — add UI contract assertion.
+No separate integration task is needed: the two modules have no compile
+coupling, and `npm test` already runs the full integration suite
+(including `orchestrator-events.test.ts` which exercises the whole
+pipeline end-to-end) for each task.
 
 ## Risks
 
-1. **Race with terminal-state transitions.** Between the phase check and
-   writing the cancel request, the run could enter a terminal phase.
-   Re-reading state in the route is sufficient; if a benign race causes
-   a cancel request to be written for a just-terminated run, the
-   orchestrator simply will not act on it (it stops polling on terminal
-   exit). This matches the CLI behaviour.
-2. **R2B not yet merged at base commit.** The user request says R2B is
-   in place; the base commit is on `main` where R2B is still on a
-   feature branch. R2C is designed to work whether the dashboard data
-   source is the R2A poller or the R2B SSE stream — both push the same
-   snapshot shape into the same `render()` function. The Cancel button
-   does not depend on `/api/events/stream`.
-3. **SIGTERM in tests.** Tests run inside the same node process. We
-   must not signal a real PID. The test fixtures will omit `run.lock`,
-   which causes the route to skip the kill attempt — the same path the
-   CLI takes when no lock is present.
-4. **HTML injection.** Phase / run id strings come from `events.jsonl`
-   and `state.json`. All DOM updates already use `textContent`; the
-   Cancel button must continue this discipline.
-5. **Method routing regression.** Adding `POST /api/cancel` requires
-   handling it before the generic `method !== 'GET'` rejection. The
-   `405` response must still hold for unsupported method/path
-   combinations elsewhere (e.g. `POST /api/events` → 405). The route
-   test covers wrong method on `/api/cancel`; the existing
-   dashboard-server test covers other paths.
+- **Watch-path iteration derivation.** `role.started`/`role.exited` events
+  do not currently carry `iteration` on the event object. The fallback
+  (pass 0/0 to `computeNextAction`) yields the terminal/unknown-phase
+  branch for terminal phases and the non-terminal message with `0/0`
+  interpolation for live phases. This is acceptable — the hint is still
+  useful — but the iteration number will be missing from the watch `Next:`
+  line. Mitigation: document the fallback in the code comment; do not
+  expand the event schema (out of scope). *Risk: low.*
+- **`audit.decision` `finding_count` semantics.** `auditValidation.errors`
+  are *mechanical* check failures, not auditor-emitted findings. The
+  audit-report body has unstructured findings prose. The spec explicitly
+  allows the path-reference fallback for `rework_reason`, and
+  `finding_count = errors.length` is the only structured count available
+  without parsing markdown. Mitigation: name the field `finding_count`
+  (per spec) and document in a comment that it reflects mechanical-check
+  findings; `rework_reason` carries the audit-report path for human
+  follow-up. *Risk: low.*
+- **Three PASSED emit sites.** The three `emitRunTerminal` calls in
+  `runFinalization` (~2455, ~2825, ~3007) are easy to miss. Mitigation:
+  the integration test asserts `run.completed` PASSED has a `final-audit`
+  ref, which fails if any path that actually executes in the test omits
+  it. The commit-exists path (~2455) only fires on resume with an existing
+  commit and may not be exercised by the default test — call this out in
+  the task description so the Developer applies the edit to all three
+  sites uniformly. *Risk: low.*
+- **`computeNextStep` relocation regression.** Any typo in moving the
+  function body changes user-facing strings and breaks existing status
+  tests. Mitigation: the move is verbatim; success criterion 1 requires
+  byte-for-byte equivalence; existing status tests guard the non-watch
+  path. *Risk: low.*
+- **Dashboard HTML `innerHTML` invariant.** Existing
+  `tests/unit/dashboard-html.test.ts` asserts no `innerHTML` use. The new
+  `Next:` line must use `setText`/`createTextNode`. Mitigation: success
+  criterion 5 calls this out; the existing test will fail otherwise. *Risk:
+  low.*
+
+```ReviewLoopRequest
+type: risk_note
+origin_agent: planner
+priority: medium
+message: iteration/max not present on role.started/role.exited events
+target: planner
+question: The watch path and dashboard snapshot cannot derive iteration/max from the event stream today (events don't carry iteration). Should we (a) pass 0/0 and accept that the live-phase hint omits the iteration number, or (b) add iteration to role.started/role.exited events (schema change, out of scope per Non-Goals)? The plan defaults to (a) per the user's "不要改事件 schema" constraint.
+blocking: false
+```

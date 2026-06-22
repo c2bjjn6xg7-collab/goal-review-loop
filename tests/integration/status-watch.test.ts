@@ -160,6 +160,8 @@ describe('Phase 9 R1 status --watch event stream', () => {
     expect(stdout).toContain('watch-run-1');
     // Should render at least one event line.
     expect(stdout.length).toBeGreaterThan(0);
+    // Text summary should include a Next: hint line.
+    expect(/\nNext: /.test(stdout)).toBe(true);
   });
 
   it('JSON watch returns no events gracefully for a run without events.jsonl', () => {

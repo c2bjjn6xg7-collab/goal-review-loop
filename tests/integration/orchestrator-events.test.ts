@@ -117,6 +117,61 @@ describe('Phase 9 R1 orchestrator event stream', () => {
     for (let i = 1; i < events.length; i++) {
       expect(events[i].seq).toBe(events[i - 1].seq + 1);
     }
+
+    // R5/R12: at least one role.exited event must carry a transcript
+    // artifact_ref whose path matches the iteration-NN-<role>.md convention.
+    const roleExited = events.filter((e) => e.kind === 'role.exited');
+    expect(roleExited.length).toBeGreaterThan(0);
+    const transcriptRefPattern = /^\.agent\/transcripts\/iteration-\d{2}-(planner|developer|auditor|final-auditor)\.md$/;
+    const hasTranscriptRef = roleExited.some((e) =>
+      (e.artifact_refs ?? []).some((ref) => ref.type === 'transcript' && transcriptRefPattern.test(ref.path)),
+    );
+    expect(hasTranscriptRef).toBe(true);
+
+    // R5/R12: every audit.decision event payload must include a numeric
+    // finding_count.
+    const auditDecisions = events.filter((e) => e.kind === 'audit.decision');
+    expect(auditDecisions.length).toBeGreaterThan(0);
+    for (const ev of auditDecisions) {
+      expect(typeof ev.payload?.finding_count).toBe('number');
+    }
+
+    // R5: the PASS audit.decision must carry status 'PASS' and must NOT
+    // include rework_reason (rework_reason only appears on REWORK/FAIL).
+    const passDecision = auditDecisions.find((e) => e.status === 'PASS');
+    expect(passDecision).toBeDefined();
+    expect(passDecision?.status).toBe('PASS');
+    expect(passDecision?.payload && 'rework_reason' in passDecision.payload).toBe(false);
+
+    // R5/R12: when rework_reason is present on an audit.decision event it
+    // must be the audit-report path.
+    for (const ev of auditDecisions) {
+      if (ev.payload && 'rework_reason' in ev.payload) {
+        expect(ev.payload.rework_reason).toBe('.agent/audit-report.md');
+      }
+    }
+
+    // R5/R12: the PASSED run.completed terminal event must carry a
+    // final-audit artifact_ref.
+    const runCompleted = events.filter((e) => e.kind === 'run.completed');
+    expect(runCompleted.length).toBeGreaterThan(0);
+    const passedTerminal = runCompleted.find((e) => e.status === 'PASSED');
+    expect(passedTerminal).toBeDefined();
+    expect(
+      (passedTerminal!.artifact_refs ?? []).some(
+        (ref) => ref.type === 'final-audit' && ref.path === '.agent/final-audit.md',
+      ),
+    ).toBe(true);
+
+    // R5/R12: the verification.completed event must carry a verification-log
+    // artifact_ref.
+    const verification = events.filter((e) => e.kind === 'verification.completed');
+    expect(verification.length).toBeGreaterThan(0);
+    expect(
+      (verification[0].artifact_refs ?? []).some(
+        (ref) => ref.type === 'verification-log' && ref.path === '.agent/verification/manifest.json',
+      ),
+    ).toBe(true);
   });
 
   it('emits role.started for planner, developer, auditor, and final-auditor', async () => {
@@ -195,6 +250,15 @@ describe('Phase 9 R1 orchestrator event stream', () => {
     expect(failed?.level).toBe('error');
     // run.failed must be the last event so watch exits cleanly.
     expect(events[events.length - 1].kind).toBe('run.failed');
+
+    // R5/R12: a FAIL audit.decision must carry rework_reason pointing at the
+    // audit-report path, and finding_count must be numeric.
+    const auditDecisions = events.filter((e) => e.kind === 'audit.decision');
+    expect(auditDecisions.length).toBeGreaterThan(0);
+    const failDecision = auditDecisions.find((e) => e.status !== 'PASS');
+    expect(failDecision).toBeDefined();
+    expect(typeof failDecision!.payload?.finding_count).toBe('number');
+    expect(failDecision!.payload?.rework_reason).toBe('.agent/audit-report.md');
   });
 
   it('appends to the existing events.jsonl on resume instead of truncating', async () => {
