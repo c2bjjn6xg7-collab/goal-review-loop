@@ -1,93 +1,80 @@
 ---
 schema_version: 1
-run_id: "20260622020433-0g30a6"
+run_id: "20260622043223-giis2q"
 author_role: "auditor"
 decision: "PASS"
 final_iteration: 2
-goal_digest: "sha256:860255d389cadee5f28c2af7e6a1fb2f81fd1a488b1995cf8bfaf0c98b1c9607"
-diff_digest: "sha256:d366612df18679313a72ef7e7ab4821b5c7aa236b64daa6b27e382b8735715e0"
-audit_report_digest: "sha256:e4e4e9b93cef91f8c97e83ac598d85f5d452f8735d462576f4456b12df9e0232"
-verification_manifest_digest: "sha256:528fed2dec1517ae43561b93dd9e737f18ef1662d01af16ffda79d0887f96378"
-created_at: "2026-06-22T02:23:46.000Z"
+goal_digest: "sha256:b14519548cf0ecb6645117eb7de156c982966293c38a7a54b0cd88e81f719ab9"
+diff_digest: "sha256:82dbab751510ced76ae8e8f5af432c35184b1c3b3a1ef8084f25ecebad505578"
+audit_report_digest: "sha256:8de17595cf9b2ecafb653b3b9e042c204404d32a5a34fd83d966642f6851ca4a"
+verification_manifest_digest: "sha256:0b51e7ef1b7e058fb34bacf1e9c5d059210c9700b674e83596ff4a32e7c76831"
+created_at: "2026-06-22T04:49:47.000Z"
 ---
 
 # Final Decision
 
-PASS. The Phase 9 R2A read-only dashboard implementation satisfies the GOAL success criteria, the recorded verification commands passed, scope evidence is clean, and the supplied digests match current evidence. A local git commit is safe to create.
+PASS. The Phase 9 R2B SSE dashboard implementation meets the GOAL success criteria, required verification passed, scope evidence is clean, and the supplied GOAL, audit report, verification manifest, and iteration-02 diff digests are consistent with the provided evidence. A local git commit is safe to create.
 
 # Success Criteria Review
 
 | # | Criterion | Status | Evidence |
 |---:|---|---|---|
-| 1 | CLI command registration and help output show `--port`, `--project-root`, and a read-only dashboard description. | PASS | `src/cli/dashboard.ts:22` defines the command, `src/cli/dashboard.ts:25` describes it as read-only, and `src/cli/dashboard.ts:26` to `src/cli/dashboard.ts:27` define both options. `node dist/cli/main.js dashboard --help` shows both options and the read-only description. |
-| 2 | Server listens on a local port, returns a non-zero random port from `.start(0)`, binds only `127.0.0.1`, and `.stop()` closes the listener. | PASS | `src/web/dashboard-server.ts:26` sets `HOST = '127.0.0.1'`, `src/web/dashboard-server.ts:95` listens on that host, `src/web/dashboard-server.ts:98` to `src/web/dashboard-server.ts:104` returns the actual port, and `src/web/dashboard-server.ts:107` to `src/web/dashboard-server.ts:114` closes the server. Tests cover port and stop behavior in `tests/unit/dashboard-server.test.ts:55` to `tests/unit/dashboard-server.test.ts:58` and `tests/unit/dashboard-server.test.ts:122` to `tests/unit/dashboard-server.test.ts:125`. |
-| 3 | `GET /` returns a single-page HTML response with polling and XSS-safe dynamic rendering. | PASS | `src/web/dashboard-server.ts:44` to `src/web/dashboard-server.ts:48` returns HTML with `text/html; charset=utf-8`. `src/web/dashboard-html.ts:97` to `src/web/dashboard-html.ts:107` contains `fetch('/api/events')` and `setInterval(..., 2000)`. Dynamic fields use `textContent` and `document.createTextNode` at `src/web/dashboard-html.ts:62` to `src/web/dashboard-html.ts:64`, `src/web/dashboard-html.ts:79` to `src/web/dashboard-html.ts:80`, and `src/web/dashboard-html.ts:90` to `src/web/dashboard-html.ts:92`. |
-| 4 | `GET /api/events` returns the required JSON snapshot, ascending events, and at most 20 latest events. | PASS | `src/web/event-source.ts:18` to `src/web/event-source.ts:23` defines `run_id`, `current_phase`, `latest_events`, and `artifacts`. `src/web/event-source.ts:79` to `src/web/event-source.ts:87` sorts by `seq` and slices to `MAX_LATEST_EVENTS = 20`. API routing returns JSON at `src/web/dashboard-server.ts:52` to `src/web/dashboard-server.ts:55`. Tests assert shape, order, and truncation in `tests/unit/dashboard-server.test.ts:69` to `tests/unit/dashboard-server.test.ts:83` and `tests/unit/event-source.test.ts:67` to `tests/unit/event-source.test.ts:77`. |
-| 5 | Missing `.agent` or `events.jsonl` degrades gracefully with 200, empty events, and state/unknown run id. | PASS | `src/web/event-source.ts:56` to `src/web/event-source.ts:64` returns an empty snapshot when `.agent` or `events.jsonl` is missing, and `src/web/event-source.ts:97` to `src/web/event-source.ts:105` reads `state.json` safely. Tests cover missing `.agent`, missing `events.jsonl`, and state run id fallback in `tests/unit/event-source.test.ts:22` to `tests/unit/event-source.test.ts:39`. |
-| 6 | Unknown paths return 404 JSON and non-GET methods return 405 JSON. | PASS | `src/web/dashboard-server.ts:39` to `src/web/dashboard-server.ts:41` handles non-GET as 405 JSON, and `src/web/dashboard-server.ts:65` handles unknown paths as 404 JSON. Tests cover both in `tests/unit/dashboard-server.test.ts:105` to `tests/unit/dashboard-server.test.ts:120`. |
-| 7 | Implementation is read-only for `.agent/`, except tests may seed temporary fixtures. | PASS | Dashboard source uses `existsSync`, `readFile`, and `EventStore.readAll()` only in `src/web/event-source.ts:58`, `src/web/event-source.ts:68`, and `src/web/event-source.ts:100`. Write/remove scans found file writes only in unit test setup, cleanup, and fixture seeding under temporary directories. |
-| 8 | Zero new npm dependencies. | PASS | `git diff -- package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml` is empty. New code imports only `node:*`, existing `commander`, existing `fs-extra`, and existing runtime exports. |
-| 9 | Required unit test files exist and cover HTML, API, graceful degradation, routing, and event-source derivation. | PASS | The changed files include `tests/unit/dashboard-server.test.ts`, `tests/unit/dashboard-html.test.ts`, and `tests/unit/event-source.test.ts`. Coverage is present at `tests/unit/dashboard-html.test.ts:13` to `tests/unit/dashboard-html.test.ts:22`, `tests/unit/dashboard-server.test.ts:60` to `tests/unit/dashboard-server.test.ts:125`, and `tests/unit/event-source.test.ts:22` to `tests/unit/event-source.test.ts:121`. |
-| 10 | `npm test`, `npm run typecheck`, and `npm run build` all pass. | PASS | `.agent/verification/manifest.json` reports `"passed": true`, with `unit-tests`, `typecheck`, and `build` each `status: "success"` and `exit_code: 0`. The unit test log reports `91 passed` test files and `1253 passed` tests. |
-| 11 | Disallowed existing modules remain unchanged. | PASS | `git diff -- src/runtime/event-store.ts src/runtime/event-bus.ts src/cli/status.ts review-loop.yaml` is empty. The scope report lists no denied paths and no warnings. |
-| 12 | CLI registration is visible in `src/cli/index.ts`. | PASS | `src/cli/index.ts:13` imports `createDashboardCommand`; `src/cli/index.ts:30` registers it with `program.addCommand(createDashboardCommand())`. |
+| 1 | `GET /api/events/stream` serves SSE headers and streams bytes as written. | PASS | `src/web/dashboard-server.ts` handles `/api/events/stream` before `/api/events` and 404 fallback, sets `Content-Type: text/event-stream`, `Cache-Control: no-cache, no-transform`, `Connection: keep-alive`, flushes headers, and writes frames with `res.write`. Header behavior is tested in `tests/unit/dashboard-server-sse.test.ts`. |
+| 2 | First non-comment frame is `event: hello` with resolved `run_id` or `"unknown"`. | PASS | `resolveRunIdFromAgentDir()` reads `.agent/state.json`; the SSE handler falls back to `"unknown"` and writes `event: hello\ndata: {"run_id":"..."}` before data or heartbeat frames. Tests cover both resolved and missing `state.json` run ids. |
+| 3 | New appended events are delivered via `EventStore.readSince(lastSeq)` at the configured/default interval, in `seq` order, once per connection. | PASS | The server initializes per-connection `lastSeq` from `getLastSequence()`, polls `readSince(lastSeq)` on `ssePollMs` defaulting to 500 ms, writes one `data: <json>\n\n` frame per event, and advances `lastSeq`. The SSE test appends after connection open and observes the pushed event. |
+| 4 | Heartbeat comment is written at the configured/default interval for open connections. | PASS | `sseHeartbeatMs` defaults to 15,000 ms and the heartbeat interval writes `: heartbeat\n\n`. The test uses `sseHeartbeatMs: 80` and asserts a heartbeat within 500 ms. |
+| 5 | Client disconnect clears poll and heartbeat timers and removes the active connection. | PASS | The shared cleanup clears both intervals, deletes the connection from the active set, and is wired to request/response close and error events. Tests cover client teardown plus prompt server stop. |
+| 6 | `DashboardServer.stop()` proactively ends active SSE responses and resolves within 1 second in tests. | PASS | `stop()` iterates active SSE connections before `server.close()`. The new SSE test opens two lingering clients and asserts `stop()` finishes in under 1 second. |
+| 7 | Browser attempts `EventSource`, updates on hello/message, and falls back to 2 second polling only when SSE is unavailable or errors. | PASS | `dashboard-html.ts` starts with `tick()` for initial paint, opens `new EventSource('/api/events/stream')`, calls `tick()` on hello/message, stops polling in SSE mode, and starts `setInterval(tick, 2000)` only through fallback polling. HTML tests assert the EventSource and fallback tokens. |
+| 8 | `GET /api/events` snapshot behavior remains intact and pre-existing tests still pass. | PASS | The `/api/events` branch remains separate from SSE. Existing dashboard server, dashboard HTML, and event-source tests pass under `npm test`; the new SSE suite also confirms `/api/events` returns the JSON snapshot. |
+| 9 | New real-server SSE unit test exists with reduced timing and required assertions. | PASS | `tests/unit/dashboard-server-sse.test.ts` starts an ephemeral server with `ssePollMs: 30` and `sseHeartbeatMs: 80`, then asserts hello, appended event delivery, heartbeat, client teardown, prompt `stop()`, headers, missing-state fallback, and JSON snapshot preservation. |
+| 10 | `npm run typecheck` and `npm test` both succeed. | PASS | `.agent/verification/manifest.json` reports `passed: true`; `unit-tests` and `typecheck` both have `status: "success"`, `exit_code: 0`, and `timed_out: false`. |
+| 11 | No new runtime npm dependencies are introduced. | PASS | Changed-file evidence contains no `package.json` or lockfile changes. The implementation uses Node built-ins, existing `fs-extra`, and existing project modules; browser code uses built-in `EventSource`. |
 
 # Verification Summary
 
-All required verification commands passed according to `.agent/verification/manifest.json`:
+All required verification commands passed:
 
 | Command ID | Command | Status |
 |---|---|---|
-| `unit-tests` | `npm test` | PASS, exit code 0 |
-| `typecheck` | `npm run typecheck` | PASS, exit code 0 |
-| `build` | `npm run build` | PASS, exit code 0 |
+| `unit-tests` | `npm test` | PASS, exit code 0, no timeout |
+| `typecheck` | `npm run typecheck` | PASS, exit code 0, no timeout |
 
-Additional final-audit checks:
+Digest checks:
 
-- `sha256` for `.agent/GOAL.md`, `.agent/audit-report.md`, and `.agent/verification/manifest.json` matched the prompt digests.
-- `.agent/evidence/iteration-02/diff-metadata.json` reports the expected diff digest `sha256:d366612df18679313a72ef7e7ab4821b5c7aa236b64daa6b27e382b8735715e0`.
-- Current `git status --short` matches the evidence: one tracked modification and seven new dashboard source/test files.
-- The hashes of all seven new untracked files match `.agent/evidence/iteration-02/untracked-files.json`.
-- `node dist/cli/main.js dashboard --help` shows the dashboard command, read-only description, `--port`, and `--project-root`.
+| Artifact | Expected | Observed |
+|---|---|---|
+| `.agent/GOAL.md` | `sha256:b14519548cf0ecb6645117eb7de156c982966293c38a7a54b0cd88e81f719ab9` | Match |
+| `.agent/audit-report.md` | `sha256:8de17595cf9b2ecafb653b3b9e042c204404d32a5a34fd83d966642f6851ca4a` | Match |
+| `.agent/verification/manifest.json` | `sha256:0b51e7ef1b7e058fb34bacf1e9c5d059210c9700b674e83596ff4a32e7c76831` | Match |
+| `.agent/evidence/iteration-02/diff-metadata.json` | `sha256:82dbab751510ced76ae8e8f5af432c35184b1c3b3a1ef8084f25ecebad505578` | Match in `diff_digest` |
 
 # Scope Summary
 
-Scope is clean. The only business/source changes are:
-
-- `src/cli/dashboard.ts`
-- `src/cli/index.ts`
-- `src/web/dashboard-html.ts`
-- `src/web/dashboard-server.ts`
-- `src/web/event-source.ts`
-- `tests/unit/dashboard-html.test.ts`
-- `tests/unit/dashboard-server.test.ts`
-- `tests/unit/event-source.test.ts`
-
-These paths are all allowed by the GOAL. `.agent/evidence/iteration-02/scope-report.json` reports `passed: true`, `denied: []`, and `warnings: []`. No disallowed files have a diff.
+Scope is respected. `.agent/evidence/iteration-02/scope-report.json` reports `passed: true`, `denied: []`, and `warnings: []`. Actual `git status --short` matches the expected evidence set plus this final-audit artifact: allowed `src/web/**` changes, allowed dashboard unit test changes, the new allowed SSE test, and versioned `.agent/` run artifacts. No disallowed runtime/orchestrator/status files, `review-loop.yaml`, package manifests, or dependency lockfiles are modified.
 
 # Change Summary
 
 | File | Status | Audit Result |
 |---|---|---|
-| `src/cli/dashboard.ts` | New | PASS: implements `review-loop dashboard`, port parsing, project-root option, startup message, and shutdown hooks. |
-| `src/cli/index.ts` | Modified | PASS: imports and registers `createDashboardCommand()`. |
-| `src/web/dashboard-html.ts` | New | PASS: inline dashboard HTML with native polling and XSS-safe text insertion. |
-| `src/web/dashboard-server.ts` | New | PASS: `node:http` server bound to `127.0.0.1`, serving `/`, `/api/events`, 404 JSON, and 405 JSON. |
-| `src/web/event-source.ts` | New | PASS: read-only snapshot layer using `EventStore.readAll()`, graceful fallback, sorted/latest events, and artifact dedupe. |
-| `tests/unit/dashboard-html.test.ts` | New | PASS: covers HTML structure, polling tokens, and safe text rendering tokens. |
-| `tests/unit/dashboard-server.test.ts` | New | PASS: covers HTML/API responses, missing events, missing `.agent`, 404/405, and stop behavior. |
-| `tests/unit/event-source.test.ts` | New | PASS: covers empty states, phase derivation, truncation, artifact dedupe, and state run id precedence. |
+| `src/web/dashboard-html.ts` | Modified | PASS: adds EventSource-first client path, mutually exclusive polling fallback, and updates on hello/message. |
+| `src/web/dashboard-server.ts` | Modified | PASS: adds `/api/events/stream`, SSE timers, heartbeat, per-connection cleanup, and proactive stop cleanup. |
+| `src/web/event-source.ts` | Modified | PASS: factors reusable run-id resolution while preserving snapshot behavior. |
+| `tests/unit/dashboard-html.test.ts` | Modified | PASS: adds SSE/fallback token assertions without weakening existing assertions. |
+| `tests/unit/dashboard-server-sse.test.ts` | New | PASS: covers real-server hello, data push, heartbeat, cleanup, headers, missing state fallback, and snapshot preservation. |
+| `.agent/developer-handoff.md` | Modified | PASS: versioned developer handoff for this run. |
+| `.agent/audit-report.md` | Modified | PASS: versioned auditor PASS report for iteration 2. |
+| `.agent/GOAL.md` | Modified | Orchestrator-owned versioned GOAL artifact; excluded from scope enforcement but should enter the commit. |
+| `.agent/plan.md` | Modified | Orchestrator-owned versioned plan artifact; excluded from scope enforcement but should enter the commit. |
+| `.agent/final-audit.md` | Modified | PASS: this final pre-commit audit report. |
 
 # Files To Commit
 
-- `src/cli/dashboard.ts`
-- `src/cli/index.ts`
 - `src/web/dashboard-html.ts`
 - `src/web/dashboard-server.ts`
 - `src/web/event-source.ts`
 - `tests/unit/dashboard-html.test.ts`
-- `tests/unit/dashboard-server.test.ts`
-- `tests/unit/event-source.test.ts`
+- `tests/unit/dashboard-server-sse.test.ts`
 - `.agent/plan.md`
 - `.agent/GOAL.md`
 - `.agent/developer-handoff.md`
@@ -95,8 +82,6 @@ These paths are all allowed by the GOAL. `.agent/evidence/iteration-02/scope-rep
 - `.agent/final-audit.md`
 
 # Versioned Artifacts
-
-These `.agent/` artifacts should enter the commit as the run's versioned review evidence:
 
 - `.agent/plan.md`
 - `.agent/GOAL.md`
@@ -106,25 +91,34 @@ These `.agent/` artifacts should enter the commit as the run's versioned review 
 
 # Local-only Artifacts Excluded
 
-These `.agent/` artifacts are local runtime/evidence/debug outputs and should be excluded from the commit:
-
 - `.agent/state.json`
+- `.agent/events.jsonl`
+- `.agent/evidence/`
+- `.agent/verification/`
+- `.agent/debug/`
+- `.agent/history/`
+- `.agent/transcripts/`
 - `.agent/run.lock`
-- `.agent/iteration-log.md`
 - `.agent/progress.json`
 - `.agent/progress.md`
-- `.agent/events.jsonl`
+- `.agent/iteration-log.md`
 - `.agent/task-graph.json`
 - `.agent/task-results.json`
-- `.agent/verification/`
-- `.agent/evidence/`
-- `.agent/debug/`
-- `.agent/transcripts/`
 
 # Accepted Residual Risks
 
-None.
+- Low reliability hardening opportunity: close/error listeners are registered after short asynchronous run-id and sequence reads. Established SSE connections are covered by tests and stop cleanup, so this does not block the commit; a future hardening pass can attach listeners before async initialization and guard timer setup with a closed flag.
 
 # Commit Recommendation
 
-Commit is recommended. Include the eight dashboard source/test files and the five versioned `.agent/` artifacts listed above. Exclude local-only `.agent/` runtime, verification, evidence, debug, transcript, and event-stream artifacts.
+Commit is recommended. Include the files listed under **Files To Commit** and exclude local-only `.agent/` runtime, verification, evidence, debug, history, transcript, lock, progress, and event-stream artifacts.
+
+```ReviewLoopRequest
+type: risk_note
+origin_agent: final_auditor
+priority: low
+message: SSE close handlers are registered after async initialization
+category: reliability
+description: Established SSE connection cleanup and server stop behavior are tested and pass, but an extremely early client disconnect before async initialization completes could be hardened further.
+mitigation_hint: Attach close/error listeners before async initialization and guard timer setup with req.destroyed/res.destroyed or a closed flag.
+```

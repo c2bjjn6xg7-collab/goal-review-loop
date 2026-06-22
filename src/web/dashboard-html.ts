@@ -103,8 +103,67 @@ const HTML = `<!DOCTYPE html>
       });
   }
 
+  // Mode flag ensures the SSE and polling paths are mutually exclusive.
+  // 'idle' before start, 'sse' when EventSource is live, 'poll' otherwise.
+  var mode = 'idle';
+  var pollTimer = null;
+  var es = null;
+
+  function startPolling() {
+    if (mode === 'poll') return;
+    stopSse();
+    mode = 'poll';
+    if (pollTimer == null) {
+      pollTimer = setInterval(tick, 2000);
+    }
+  }
+
+  function stopPolling() {
+    if (pollTimer != null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function stopSse() {
+    if (es != null) {
+      try { es.close(); } catch (e) { /* ignore */ }
+      es = null;
+    }
+  }
+
+  function startSse() {
+    if (typeof EventSource !== 'function') {
+      startPolling();
+      return;
+    }
+    try {
+      es = new EventSource('/api/events/stream');
+    } catch (e) {
+      es = null;
+      startPolling();
+      return;
+    }
+    mode = 'sse';
+    stopPolling();
+    es.addEventListener('hello', function () {
+      setText(updatedEl, new Date().toLocaleTimeString());
+      tick();
+    });
+    es.onmessage = function () {
+      // SSE acts as a freshness signal; the JSON snapshot is the source of
+      // truth and keeps artifacts/current_phase accurate.
+      tick();
+    };
+    es.onerror = function () {
+      stopSse();
+      mode = 'idle';
+      startPolling();
+    };
+  }
+
   tick();
-  setInterval(tick, 2000);
+  startSse();
 })();
 </script>
 </body>

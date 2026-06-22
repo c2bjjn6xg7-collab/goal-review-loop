@@ -1,74 +1,93 @@
 ---
 schema_version: 1
-run_id: "20260622020433-0g30a6"
+run_id: "20260622043223-giis2q"
 iteration: 1
 author_role: "developer"
 status: "COMPLETED"
 ---
 
-# Phase 9 R2A — Read-only Dashboard
+# Phase 9 R2B — SSE Realtime Bridge
 
-Implemented the read-only Phase 9 R2A web dashboard end-to-end.
+## Summary
 
-## Files added
+Implemented the Server-Sent Events push channel for the read-only dashboard. The
+JSON snapshot endpoint and 2 s polling path remain intact as a fallback; SSE
+is preferred when `EventSource` is available client-side.
 
-- `src/web/event-source.ts` — `DashboardEventSource` builds a snapshot
-  (`run_id`, `current_phase`, `latest_events`, `artifacts`) by reusing
-  `EventStore.readAll()`. Prefers `run_id` from `state.json` when present
-  and falls back to `"unknown"`. Gracefully handles missing `.agent` or
-  `events.jsonl` (returns empty snapshot, no throw). `latest_events` is
-  truncated to the most recent `MAX_LATEST_EVENTS = 20`, sorted by `seq`
-  ascending. `current_phase` is taken from the first terminal event
-  (`run.completed|blocked|failed`) when present, otherwise the last event.
-  Artifacts are deduped by `type:path`, keeping the first label seen.
-- `src/web/dashboard-html.ts` — `renderDashboardHtml()` returns the inline
-  HTML page. The client uses `fetch('/api/events', …)` + `setInterval(…,
-  2000)` and renders all dynamic fields via `textContent` /
-  `document.createTextNode` only (no `innerHTML`).
-- `src/web/dashboard-server.ts` — `createDashboardServer({ projectRoot })`
-  returns `{ start, stop, port }`. Server is built on `node:http`, bound
-  to `127.0.0.1` only. Routes: `GET /` → HTML 200; `GET /api/events` →
-  JSON snapshot 200; any other path → 404 JSON; non-GET → 405 JSON.
-  `start(port=0)` returns the actual listening port; `stop()` closes the
-  listener so further requests are refused.
-- `src/cli/dashboard.ts` — `createDashboardCommand()` registers the
-  Commander subcommand with `--port` (default 0) and `--project-root`
-  (default `process.cwd()`). On start it prints
-  `Dashboard listening on http://127.0.0.1:<port>` and wires
-  SIGINT/SIGTERM to call `server.stop()` before exit.
-- `tests/unit/event-source.test.ts`,
-  `tests/unit/dashboard-html.test.ts`,
-  `tests/unit/dashboard-server.test.ts` — vitest unit coverage for:
-  - HTML 200 + `text/html; charset=utf-8` + key tokens.
-  - `/api/events` happy path, sort order, and 20-event truncation.
-  - Graceful degrade when `.agent` and/or `events.jsonl` are missing.
-  - 404 JSON for unknown paths; 405 JSON for non-GET methods.
-  - Artifact dedupe & label preservation, `state.json` `run_id` precedence.
-  - `stop()` closes the listener so a fresh request fails.
+## Changes
 
-## Files modified
+- `src/web/event-source.ts`
+  - Added exported `resolveRunIdFromAgentDir(agentDir)` helper that reads
+    `state.json` and returns `run_id | null`. Used by both the snapshot path
+    and the new SSE route.
+  - `DashboardEventSource.readRunIdFromState` now delegates to the new helper.
+  - Removed the unused `statePath` field (was only referenced by the inlined
+    state read).
 
-- `src/cli/index.ts` — added
-  `program.addCommand(createDashboardCommand())` and the matching import.
-  No other change.
+- `src/web/dashboard-server.ts`
+  - Added `ssePollMs` (default 500 ms) and `sseHeartbeatMs` (default 15 000 ms)
+    to `DashboardServerOptions`.
+  - New `GET /api/events/stream` handler placed before the 404 fallback. It
+    writes `Content-Type: text/event-stream`, `Cache-Control: no-cache,
+    no-transform`, `Connection: keep-alive`, `X-Accel-Buffering: no`, flushes
+    headers, then:
+    1. Emits `event: hello\ndata: {"run_id":"<value>"}\n\n` where `<value>`
+       comes from `resolveRunIdFromAgentDir` (falls back to `"unknown"`).
+    2. Initializes `lastSeq` from `EventStore.getLastSequence()` so only
+       *new* events are pushed (no historical replay; matches the GOAL
+       non-goal of "no catch-up replay").
+    3. Polls `EventStore.readSince(lastSeq)` every `ssePollMs`, writes
+       `data: <json>\n\n` per new event in seq order, and advances
+       `lastSeq`. Per-tick errors are swallowed so a mid-write JSONL line
+       cannot kill the connection — `readAll()` already skips malformed lines.
+    4. Writes `: heartbeat\n\n` on a separate interval every
+       `sseHeartbeatMs`.
+    5. Cleans up both intervals, removes the connection from the active set,
+       and `res.end()`s on `req.close`, `req.error`, `res.close`, or
+       `res.error`.
+  - `DashboardServer.stop()` iterates the active-connections `Set` and
+    proactively cleans up each open SSE response *before* awaiting
+    `server.close()`, so lingering SSE sockets never hold the close open.
 
-## Constraints respected
+- `src/web/dashboard-html.ts`
+  - Refactored the inline IIFE to encode the SSE↔polling exclusivity with a
+    `mode` flag (`'idle' | 'sse' | 'poll'`).
+  - On load: `tick()` for an initial paint, then `startSse()`.
+  - `startSse()` guards on `typeof EventSource === 'function'`, opens
+    `new EventSource('/api/events/stream')`, calls `tick()` on each `hello`
+    or `message` event (the JSON snapshot remains the source of truth), and
+    on `onerror` closes the SSE channel and starts the 2 s poll fallback.
+  - When SSE is open, the 2 s `setInterval` is not running. Polling only
+    starts on missing `EventSource` or on an SSE error. The `tick` symbol
+    and `setInterval(tick, 2000)` remain reachable in the source so the
+    existing `dashboard-html.test.ts` regex assertions still pass.
 
-- No npm dependencies added (`package.json` unchanged).
-- No new code paths write to `.agent/` — server, event source, CLI, and
-  the new tests perform reads only (tests seed events in `os.tmpdir()`).
-- `src/runtime/event-store.ts`, `src/runtime/event-bus.ts`,
-  `src/cli/status.ts`, and `review-loop.yaml` are untouched.
-- Only paths in `allowed_changes` were modified.
+- `tests/unit/dashboard-server-sse.test.ts` (new)
+  - Boots the real server on an ephemeral port with `ssePollMs: 30`,
+    `sseHeartbeatMs: 80`.
+  - Asserts hello frame with the resolved `run_id`, `data:` frame for an
+    `events.jsonl` append (matched by `"seq":N` and `"kind"`), heartbeat
+    line within ~500 ms, header content, `run_id: "unknown"` fallback when
+    `state.json` is missing, prompt teardown via destroying the client and
+    `server.stop()` (< 1 s) including with two open connections, and that
+    `GET /api/events` still returns the R2A JSON snapshot.
+
+- `tests/unit/dashboard-html.test.ts`
+  - Added one new assertion block that the script contains
+    `new EventSource('/api/events/stream')`, the `typeof EventSource` guard,
+    `onerror`, and the polling fallback name.
 
 ## Verification
 
-All required commands pass locally on this branch:
+- `npm run typecheck`: **passes**.
+- `npm test`: **passes** — 93 test files, 1262 tests.
 
-- `npm run typecheck` — passed.
-- `npm run build` — passed.
-- `npm test` — 91 test files / 1253 tests pass.
+## Constraints respected
 
-Additionally, `node dist/cli/main.js dashboard --help` prints the new
-subcommand with `--port` and `--project-root` options and the read-only
-description, satisfying success criterion #1.
+- Only files under `src/web/**` and the four allowed test files were touched.
+- No new runtime dependencies (no `package.json` change).
+- Server still binds to `127.0.0.1`.
+- `fs.watch` was not used; tail detection is via `EventStore.readSince`.
+- `src/runtime/event-store.ts`, `src/runtime/event-bus.ts`,
+  `src/orchestrator/**`, `src/cli/status.ts`, `review-loop.yaml`, and the
+  protected `.agent/*` files were not modified.

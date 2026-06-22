@@ -15,6 +15,23 @@ import {
 
 export const MAX_LATEST_EVENTS = 20;
 
+/**
+ * Resolve `run_id` from `<agentDir>/state.json`, falling back to `null` when
+ * the file is missing or malformed. Used by both the snapshot path and the
+ * SSE stream to keep run-id resolution consistent.
+ */
+export async function resolveRunIdFromAgentDir(agentDir: string): Promise<string | null> {
+  const statePath = path.join(agentDir, 'state.json');
+  if (!fs.existsSync(statePath)) return null;
+  try {
+    const raw = await fs.readFile(statePath, 'utf8');
+    const parsed = JSON.parse(raw) as { run_id?: unknown };
+    return typeof parsed.run_id === 'string' ? parsed.run_id : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface DashboardSnapshot {
   run_id: string;
   current_phase: string;
@@ -39,12 +56,10 @@ const TERMINAL_KINDS = new Set([
 
 export class DashboardEventSource {
   private readonly agentDir: string;
-  private readonly statePath: string;
   private readonly eventsPath: string;
 
   constructor(opts: EventSourceOptions) {
     this.agentDir = path.join(opts.projectRoot, '.agent');
-    this.statePath = path.join(this.agentDir, 'state.json');
     this.eventsPath = path.join(this.agentDir, EVENTS_FILENAME);
   }
 
@@ -99,14 +114,7 @@ export class DashboardEventSource {
   }
 
   private async readRunIdFromState(): Promise<string | null> {
-    if (!fs.existsSync(this.statePath)) return null;
-    try {
-      const raw = await fs.readFile(this.statePath, 'utf8');
-      const parsed = JSON.parse(raw) as { run_id?: unknown };
-      return typeof parsed.run_id === 'string' ? parsed.run_id : null;
-    } catch {
-      return null;
-    }
+    return resolveRunIdFromAgentDir(this.agentDir);
   }
 }
 
