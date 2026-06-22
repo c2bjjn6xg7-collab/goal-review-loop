@@ -125,6 +125,46 @@ export class EventStore {
   }
 
   /**
+   * Phase 9 R1: archive any existing events.jsonl that belongs to a DIFFERENT
+   * run before this run starts writing. Moves the file to
+   * `.agent/history/events-<previousRunId>.jsonl` and returns the previous
+   * run_id (or null if no file / file already belongs to this run).
+   *
+   * This keeps each run's event stream isolated. Resume paths (same run_id)
+   * must NOT call this — they continue appending to the same file.
+   *
+   * If the existing file is malformed or has mixed run_ids, it is archived
+   * under the first run_id found.
+   */
+  async archivePreviousRun(): Promise<string | null> {
+    if (!fs.existsSync(this.eventsPath)) return null;
+    let firstRunId: string | null = null;
+    try {
+      const existing = await this.readAll();
+      if (existing.length > 0) {
+        firstRunId = existing[0].run_id;
+      }
+    } catch {
+      // malformed file — archive it under a sentinel name
+      firstRunId = 'unknown';
+    }
+    // If the existing stream already belongs to THIS run, do nothing (resume).
+    if (firstRunId === this.runId) return null;
+
+    const historyDir = path.join(path.dirname(this.eventsPath), 'history');
+    await fs.ensureDir(historyDir);
+    const archivePath = path.join(historyDir, `events-${firstRunId ?? 'unknown'}.jsonl`);
+    // If an archive for this run_id already exists (rare), append a timestamp
+    // suffix to avoid clobbering.
+    let finalPath = archivePath;
+    if (fs.existsSync(archivePath)) {
+      finalPath = path.join(historyDir, `events-${firstRunId ?? 'unknown'}-${Date.now()}.jsonl`);
+    }
+    await fs.move(this.eventsPath, finalPath);
+    return firstRunId;
+  }
+
+  /**
    * Append a draft and return the fully-formed event.
    * Assigns seq, event_id, ts. Serialized through an in-process promise chain
    * so concurrent appends (wave mode Promise.all) get monotonic seq values.

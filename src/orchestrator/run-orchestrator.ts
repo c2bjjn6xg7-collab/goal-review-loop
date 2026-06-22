@@ -625,6 +625,16 @@ export async function runOrchestrator(params: {
     runId = generateRunId();
     // Phase 9 R1: create the durable event stream for this run.
     eventBus = new EventBus(agentDir, runId);
+    // Isolate event streams: archive any events.jsonl left by a previous run
+    // so this run starts with a clean stream. Resume path (above) skips this
+    // because the file already belongs to the same run_id.
+    try {
+      await eventBus.archivePreviousRun?.();
+    } catch (err) {
+      // Fail-soft: never block a run because archiving failed.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[event-bus] failed to archive previous run events: ${msg}`);
+    }
     try {
       await lockManager.acquire(runId);
     } catch (err) {

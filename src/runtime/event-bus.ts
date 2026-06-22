@@ -15,6 +15,8 @@ export type EventListener = (event: ReviewLoopEvent) => void;
 export interface IEventBus {
   emit(draft: EventDraft): Promise<ReviewLoopEvent | undefined>;
   subscribe(listener: EventListener): () => void;
+  /** Phase 9 R1: archive a previous run's events.jsonl. Optional — null bus no-ops. */
+  archivePreviousRun?(): Promise<string | null>;
 }
 
 export class EventBus implements IEventBus {
@@ -25,6 +27,16 @@ export class EventBus implements IEventBus {
   constructor(agentDir: string, runId: string) {
     this.store = new EventStore(agentDir, runId);
     this.runId = runId;
+  }
+
+  /**
+   * Phase 9 R1: delegate to the underlying store's archivePreviousRun.
+   * Called by the orchestrator at fresh-run start to isolate event streams
+   * across runs. Returns the archived previous run_id, or null if nothing
+   * was archived.
+   */
+  async archivePreviousRun(): Promise<string | null> {
+    return this.store.archivePreviousRun();
   }
 
   /**
