@@ -1,143 +1,156 @@
 ---
 schema_version: 1
-run_id: "20260622020433-0g30a6"
+run_id: "20260622043223-giis2q"
 author_role: "planner"
 ---
 
-# Phase 9 R2A — Read-Only Web Dashboard Plan
+# Phase 9 R2B — Dashboard Realtime via Server-Sent Events
 
 ## Requirement Understanding
 
-Phase 9 R1 已落地 `.agent/events.jsonl`（append-only JSONL）与 `EventStore`
-（`src/runtime/event-store.ts`）。R2A 在此基础上交付**只读** Web Dashboard：
+R2A delivered a read-only dashboard that polls `/api/events` every 2 seconds. R2B layers a
+push channel on top **without** disturbing the polling path. The Developer must:
 
-- 新增 HTTP server，复用 `EventStore.readAll()` 读取事件流。
-- 根路径 `GET /` 返回一个内联 HTML 单页，每 2 秒用原生 `fetch` 轮询
-  `GET /api/events`，渲染 run_id / phase / 最近事件 / artifacts。
-- 新增 CLI 子命令 `review-loop dashboard`，支持 `--port`（默认 `0` = 随机端口）
-  与 `--project-root`（默认 `process.cwd()`），启动后打印实际监听端口。
-- **纯只读**：不修改 `.agent` 下任何文件，不触发 agent，不做写操作。
-- **零新依赖**：HTML 内联，前端用 `fetch`，server 用 `node:http`，测试用
-  `node:http` 直接发请求（不引入 supertest）。
-
-不在 R2A 范围内：SSE/WebSocket（R2B）、操作按钮（R2C）、event-bus/event-store/
-status watch 等 R1 既有模块的修改、`review-loop.yaml` 改动。
+1. Add a `GET /api/events/stream` route to `src/web/dashboard-server.ts` that responds with
+   `Content-Type: text/event-stream` and never closes from the server side unless the
+   client disconnects.
+2. On connect, send an `event: hello\ndata: {"run_id": "..."}\n\n` frame so the client can
+   confirm the channel is live before any events arrive.
+3. Tail `.agent/events.jsonl` by re-using `EventStore.readSince(lastSeq)` on a 500 ms
+   interval. For each new event, push `data: <json>\n\n`. Do **not** use `fs.watch`.
+4. Emit a heartbeat comment line `: heartbeat\n\n` every 15 seconds to keep proxies and
+   browser timeouts from killing the connection.
+5. Clean up timers and listeners on client `close` so server shutdown is clean and no
+   timers leak between connections.
+6. Update `src/web/dashboard-html.ts` so the client prefers `EventSource('/api/events/stream')`
+   when available and falls back to the existing 2-second poll only when `EventSource` is
+   missing or its `onerror` fires. The two paths are mutually exclusive — when SSE is
+   active, polling must be stopped.
+7. Cover the new behavior with a unit test that opens a real HTTP request against the
+   ephemeral server, reads the response stream, and asserts: a `hello` frame, a delivered
+   data event after an `events.jsonl` append, and a heartbeat comment within the test
+   window (the heartbeat interval is configurable so tests don't wait 15 s).
 
 ## Current Project Status
 
-- 仓库根：`/Users/dengyidong/Desktop/cc劳工系统`，基线提交 `c7d3dac`。
-- TypeScript ESM，构建 `npm run build`（`tsc` 输出到 `dist/`），测试 `npm test`
-  （vitest）。`tsconfig.json` `rootDir: src`，源文件互相 import 使用 `.js`
-  后缀。
-- CLI 入口：`src/cli/main.ts` → `src/cli/index.ts`。子命令工厂模式
-  （`createStatusCommand` 等）通过 `program.addCommand(...)` 注册。
-- Event 流：`src/runtime/event-store.ts` 暴露 `EventStore`（`constructor(agentDir, runId)`、`readAll()`、`getLastSequence()` 等）。
-  Run 终结事件 kind：`run.completed | run.blocked | run.failed`。
-- Status 文本渲染参考：`renderTextSummary` in `src/cli/status.ts:171`。
-- 测试目录：`tests/unit/`、`tests/integration/`，扩展名 `*.test.ts`。Vitest
-  globals 已开启。
-- 现有 `.agent/events.jsonl` 验证文件格式真实可用。
+- `src/web/dashboard-server.ts`: created in R2A; only `GET /` and `GET /api/events` exist.
+  The handler uses an in-scope `DashboardEventSource` and binds to `127.0.0.1`. The server
+  must continue to bind locally for R2B.
+- `src/web/event-source.ts`: `DashboardEventSource.getSnapshot()` reads the full log and is
+  unsuited for streaming. R2B will use `EventStore.readSince()` directly (re-using the
+  same `EVENTS_FILENAME` / `agentDir` resolution) rather than extending the snapshot
+  source.
+- `src/runtime/event-store.ts`: already exposes `readSince(afterSeq)` (line 223) and
+  `getLastSequence()` (line 229). R2B will compose them, not change them.
+- `src/web/dashboard-html.ts`: hosts the inline page with the 2 s `tick()` poller.
+- Tests: `tests/unit/dashboard-server.test.ts` and `tests/unit/dashboard-html.test.ts`
+  already validate the R2A surface and provide the testing pattern (start the server on a
+  random port, hit it with `node:http`).
 
 ## Technical Approach
 
-### 模块划分
+**Server (`dashboard-server.ts`)**
 
-1. **`src/web/event-source.ts`**（薄读取层）
-   - 暴露 `loadDashboardSnapshot(projectRoot)` 函数：定位 `.agent/`，读取
-     `state.json` 拿到 `run_id`（缺失时回退到首个事件的 `run_id` 或
-     `'unknown'`），实例化 `EventStore`，调用 `readAll()`，再加上派生字段
-     （`current_phase`、`latest_events`、`artifacts`）。
-   - 不写入；所有错误（缺 `.agent`、缺 `events.jsonl`、JSON 解析错误）都翻译
-     成 `{ ok: false, message }` 响应而不是抛出，保证 server 永远只读。
-   - 派生规则与 `renderTextSummary` 对齐：
-     - `run_id`：state.json 或事件流
-     - `current_phase`：终结事件存在 → 终结事件的 phase；否则最后一条事件的
-       phase
-     - `latest_events`：最后 N 条（N=20，足够展示但避免无限增长）
-     - `artifacts`：扫描最近 N 条事件的 `artifact_refs`，按 path 去重保序
+- Add a `pathOnly === '/api/events/stream'` branch before the 404 fallback. It must not
+  call `sendJson`; it writes SSE headers manually:
+  - `Content-Type: text/event-stream`
+  - `Cache-Control: no-cache, no-transform`
+  - `Connection: keep-alive`
+  - `X-Accel-Buffering: no` (defensive against reverse proxies that buffer)
+- Resolve `run_id` once at connect time by re-using the existing run-id-from-state logic.
+  To avoid widening `DashboardEventSource`'s public API, factor a tiny pure helper
+  `resolveRunIdFromAgentDir(agentDir)` in `event-source.ts` and reuse it from both the
+  snapshot path and the SSE path.
+- Track `lastSeq` per connection, initialized via `EventStore.getLastSequence()` so the
+  stream starts at the **current tail** (it pushes new events only, not history; the JSON
+  snapshot endpoint remains the canonical "catch-up" source).
+- Tail with `setInterval(..., pollMs)` (default 500 ms). On each tick:
+  - `await store.readSince(lastSeq)`
+  - For each event, write `data: ${JSON.stringify(event)}\n\n` and update `lastSeq`.
+  - Swallow per-tick read errors (the file may be mid-write); never crash the connection.
+- Heartbeat with a second `setInterval(..., heartbeatMs)` (default 15 000 ms) that writes
+  `: heartbeat\n\n`.
+- On `req.close` (client disconnect): clear both intervals, set them to `null`, end the
+  response.
+- On server `stop()`: also clear any registered active connections so `server.close()`
+  isn't blocked by lingering SSE sockets. Track them in a `Set<{ cleanup(): void }>`.
+- Expose internal pacing knobs on `DashboardServerOptions` (`ssePollMs`, `sseHeartbeatMs`)
+  defaulting to 500 / 15 000 so unit tests can drop them to ~50 / 80 ms without sleeping
+  for 15 s.
 
-2. **`src/web/dashboard-server.ts`**（HTTP 路由）
-   - 使用 `node:http` 创建 server。两个路由：
-     - `GET /` → 返回 inline HTML（`Content-Type: text/html; charset=utf-8`）
-     - `GET /api/events` → 返回 `loadDashboardSnapshot` 的 JSON
-       （`Content-Type: application/json`）
-   - 其他路径返回 404 JSON。其他方法返回 405。
-   - 仅监听 `127.0.0.1`，端口由调用方决定（0 = 随机）。
-   - 暴露 `createDashboardServer({ projectRoot })`：返回 `{ server, start(port), stop() }`，
-     便于测试 `await start(0)` 拿到实际端口。
+**Client (`dashboard-html.ts`)**
 
-3. **`src/web/dashboard-html.ts`**（HTML 模板）
-   - 导出 `renderDashboardHtml(): string`，返回完整 HTML 字符串：
-     - 顶部显示 `Run: <id>  Phase: <phase>`
-     - "Latest events" 表格：时间 / kind / message（带 role 后缀如有）
-     - "Artifacts" 列表
-     - `<script>` 中用 `fetch('/api/events')` 每 2000ms 轮询并刷新 DOM
-     - 所有动态文本通过 `textContent` 注入，避免 XSS（事件 message 可能含
-       任意字符）。
+- Refactor `tick()` into a `pollOnce()` helper that does a single fetch+render, and a
+  `startPolling()` / `stopPolling()` pair that owns the `setInterval` handle.
+- Add `startSse()`:
+  - Guard `typeof EventSource === 'function'`.
+  - `var es = new EventSource('/api/events/stream')`.
+  - On `hello`: update `updatedEl` (channel confirmed).
+  - On generic `message`: parse the event JSON, then trigger a one-shot `pollOnce()` so
+    artifacts and `current_phase` stay accurate. SSE here acts as a **freshness signal**;
+    the JSON snapshot remains the source of truth and shares the existing render code.
+  - On `error`: close `es`, fall back to `startPolling()`.
+- Call sequence on load: `pollOnce()` for initial paint, then attempt `startSse()`; if not
+  available, `startPolling()`.
+- Two paths must not run concurrently. Encode this with a single mutable mode flag
+  (`'sse' | 'poll' | 'idle'`) and guard the start functions.
+- Preserve `tick` and `setInterval(tick, 2000)` symbol presence in the source so the
+  existing `dashboard-html.test.ts` regex assertions keep passing (verify by reading that
+  test first).
 
-4. **`src/cli/dashboard.ts`**（CLI 子命令）
-   - `createDashboardCommand(): Command`：选项 `--port <port>`（默认 `'0'`，
-     解析成非负整数，0 表示随机），`--project-root <path>`（默认
-     `process.cwd()`）。
-   - 动作：创建 server → `start(port)` → 打印
-     `Dashboard listening on http://127.0.0.1:<actualPort>` → 注册 SIGINT/SIGTERM
-     stop 钩子。
+**Tests (`tests/unit/dashboard-server-sse.test.ts`, new file)**
 
-5. **`src/cli/index.ts`**：注册 `createDashboardCommand()`。
-
-### 测试策略
-
-`tests/unit/dashboard-server.test.ts`（vitest，无外部依赖）：
-
-- 用 `fs-extra` 在 `os.tmpdir()` 创建临时 `agentDir`，用 `EventStore` 预先
-  append 若干事件，并写最小 `state.json`。
-- 通过 `createDashboardServer({ projectRoot })` 启动，端口 `0`，使用
-  `node:http` 的 `http.get` 发起请求。
-- 覆盖：
-  - `GET /` 返回 HTML（status 200，content-type 含 `text/html`），body
-    包含轮询脚本与基本结构（如 `id="run-id"`、`fetch('/api/events')`）。
-  - `GET /api/events` 返回 JSON，结构包含 `run_id`、`current_phase`、
-    `latest_events`、`artifacts`。
-  - 当 `events.jsonl` 不存在或 `.agent` 不存在时，`/api/events` 仍返回 200
-    且 `latest_events: []`（不抛出）。
-  - 未知路径返回 404；非 GET 返回 405。
-  - server.stop() 后再次请求失败（确认资源释放）。
-
-`tests/unit/dashboard-html.test.ts`：snapshot + 关键 token assertion（含
-`fetch('/api/events')`、`setInterval`、`textContent`）。
-
-`tests/unit/event-source.test.ts`：构造若干 fixture 事件，验证派生
-`current_phase`、`latest_events` 长度、`artifacts` 去重保序、错误回退。
-
-### 不引入新依赖的具体做法
-
-- HTTP server：`import { createServer } from 'node:http'`
-- HTML：模板字面量字符串，CSS 内联（minimal styling）
-- 前端 fetch：`fetch('/api/events').then(r=>r.json()).then(render)`，浏览器
-  原生 ES。
-- 测试 HTTP 请求：`http.request` + 收集 chunks 转字符串的小 helper。
+- Create a temp project root with `.agent/events.jsonl` and a minimal `state.json`.
+- Start the server with `ssePollMs: 30`, `sseHeartbeatMs: 80`.
+- Open a manual `http.request` to `/api/events/stream`, consume the response as a stream,
+  accumulate the raw text into a buffer.
+- Assertions (within a single test, with a per-assertion poll-the-buffer helper):
+  1. Buffer contains `event: hello\n` and a `data: {"run_id":` line.
+  2. After appending a JSON event line to `events.jsonl`, the buffer eventually contains a
+     `data:` line whose JSON includes that event's `seq` and `kind`.
+  3. After waiting > one heartbeat interval, the buffer contains `: heartbeat\n\n`.
+- Tear down: destroy the request (triggers `req.close` on the server) and then
+  `server.stop()`. Assert `stop()` resolves promptly to prove the per-connection cleanup
+  ran.
+- Add one additional smaller test confirming `GET /api/events` (polling) still returns
+  JSON unchanged, so the R2A path isn't accidentally broken.
 
 ## Work Breakdown
 
-单一原子任务即可：所有文件互相耦合（HTML 模板嵌入到 server，server 调用
-event-source，CLI 注册 server），并且需要同步编译/测试通过。按 Phase 8B 指南
-"orchestrator wiring + integration tests" 属于必须一起落地的范畴；硬拆只会
-产生半就绪状态。
+This is a single atomic feature: the server route, the HTML wiring, and the unit test
+must land together for the build to typecheck and tests to pass. Per
+`docs/superpowers/agent-task-planning-guidelines.md`, it stays as one task.
 
-- **task-1 (atomic)**：实现 `src/web/event-source.ts`、`src/web/dashboard-html.ts`、
-  `src/web/dashboard-server.ts`、`src/cli/dashboard.ts`，在 `src/cli/index.ts`
-  注册子命令；新增上述测试；`npm test` 全绿。
+1. Extend `DashboardServerOptions` with optional `ssePollMs` and `sseHeartbeatMs`.
+2. Factor `resolveRunIdFromAgentDir` in `event-source.ts`; re-use it from the snapshot
+   path.
+3. Implement `/api/events/stream` in `dashboard-server.ts`, with per-connection state,
+   timers, heartbeat, and a `Set` of active connections cleaned up by `stop()`.
+4. Refactor `dashboard-html.ts` client script: split poll/SSE, mode flag, fallback on
+   `error`, initial paint via `pollOnce()`.
+5. Add `tests/unit/dashboard-server-sse.test.ts` covering hello / event push / heartbeat /
+   cleanup.
+6. Ensure existing tests still pass (`dashboard-server.test.ts`, `dashboard-html.test.ts`,
+   `event-source.test.ts`).
 
 ## Risks
 
-- **R1**: 旧 run 缺失 `events.jsonl` 或 `state.json`。缓解：`event-source` 全
-  路径 try/catch，永远返回结构化 JSON；UI 显示 "No events yet" 而非崩溃。
-- **R2**: 事件 message / artifact path 含恶意字符引起 XSS。缓解：前端只用
-  `textContent` / `appendChild`，HTML 模板不拼接事件内容；`/api/events` 永远
-  返回 JSON。
-- **R3**: 端口冲突或权限问题。缓解：默认 `--port 0` 让 OS 分配；监听
-  `127.0.0.1` 避免外部暴露与权限弹窗。
-- **R4**: 轮询期间 `events.jsonl` 被持续追加引起的 race。缓解：`EventStore.readAll`
-  已经容忍尾部不完整行；server 每次请求都重新 `readAll`，无内存状态。
-- **R5**: Windows / 非 ASCII 路径。缓解：仅使用 `path.join` / `path.resolve`，
-  不解析 URL 路径外的内容；测试覆盖 macOS 默认场景（与项目目标一致）。
+- **Timer leaks**: forgetting to clear either interval on `req.close` will leak across
+  reconnects. Mitigation: collect both into the same per-connection cleanup function,
+  registered in the connections `Set`, and call it from both `req.close` and `stop()`.
+- **`server.close()` blocking**: Node's `server.close()` waits for all sockets. SSE
+  sockets stay open until the client disconnects. Mitigation: in `stop()`, iterate the
+  connections set and end each response before awaiting `server.close()`.
+- **Test flakiness on heartbeat**: a hard-coded 15 s heartbeat would force a 15 s sleep.
+  Mitigation: expose `sseHeartbeatMs` as an option, default 15 000 in production, override
+  to ~80 ms in tests.
+- **HTML script regression**: refactoring the IIFE could break the existing
+  `dashboard-html.test.ts` (which likely greps for `tick`/`setInterval`). Mitigation:
+  retain `tick` as the poll function name and keep `setInterval(tick, 2000)` reachable in
+  the source so any structural assertions still pass; check that test file early.
+- **SSE message framing**: missing the trailing blank line causes clients to never flush a
+  frame. Mitigation: every payload write ends with `\n\n`; covered by the buffer-content
+  assertions in the new test.
+- **Mid-write JSONL line**: a partial trailing line could be re-read on the next tick.
+  `EventStore.readAll()` already skips malformed lines (line 215), and `lastSeq` only
+  advances on parsed events, so the next tick picks the line up once complete.

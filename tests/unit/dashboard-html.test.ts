@@ -16,6 +16,13 @@ describe('renderDashboardHtml', () => {
     expect(html).toContain('2000');
   });
 
+  it('prefers EventSource for /api/events/stream and falls back to polling', () => {
+    expect(html).toContain("new EventSource('/api/events/stream')");
+    expect(html).toContain("typeof EventSource");
+    expect(html).toContain('onerror');
+    expect(html).toContain('startPolling');
+  });
+
   it('uses textContent / createTextNode to avoid XSS injection', () => {
     expect(html).toContain('textContent');
     expect(html).toContain('createTextNode');
