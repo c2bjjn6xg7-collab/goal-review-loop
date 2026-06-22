@@ -71,6 +71,10 @@ loop:
   archive_history: true
   stop_on_infrastructure_error: true
 
+parallel:
+  enabled: true
+  max_parallel_workers: 2
+
 git:
   require_repository: true
   require_head: true
