@@ -118,7 +118,7 @@ Must be valid JSON with this shape:
       "description": "<what this task accomplishes, scoped narrowly>",
       "difficulty": "low|medium|high",
       "risk": "low|medium|high|critical",
-      "parallelizable": false,
+      "parallelizable": true,
       "depends_on": [],
       "allowed_changes": ["src/module-a/**"],
       "disallowed_changes": [".git/**", ".agent/state.json"],
@@ -126,6 +126,48 @@ Must be valid JSON with this shape:
         {
           "id": "task-1-tests",
           "command": ["npm", "test", "--", "src/module-a"],
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 300
+        }
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "task-2",
+      "title": "<short title>",
+      "description": "<independent module, can run alongside task-1>",
+      "difficulty": "low|medium|high",
+      "risk": "low|medium|high|critical",
+      "parallelizable": true,
+      "depends_on": [],
+      "allowed_changes": ["src/module-b/**"],
+      "disallowed_changes": [".git/**", ".agent/state.json"],
+      "verification_commands": [
+        {
+          "id": "task-2-tests",
+          "command": ["npm", "test", "--", "src/module-b"],
+          "cwd": ".",
+          "required": true,
+          "timeout_seconds": 300
+        }
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "task-3",
+      "title": "Integration verification",
+      "description": "<verify both modules work together>",
+      "difficulty": "low|medium|high",
+      "risk": "low|medium|high|critical",
+      "parallelizable": false,
+      "depends_on": ["task-1", "task-2"],
+      "allowed_changes": ["tests/integration/**"],
+      "disallowed_changes": [".git/**", ".agent/state.json"],
+      "verification_commands": [
+        {
+          "id": "task-3-integration",
+          "command": ["npm", "test", "--", "tests/integration"],
           "cwd": ".",
           "required": true,
           "timeout_seconds": 300
@@ -151,6 +193,13 @@ Must be valid JSON with this shape:
 10. Task IDs must be unique and match `^[A-Za-z0-9][A-Za-z0-9._-]*$`.
 11. The union of all tasks' `allowed_changes` should cover the GOAL's `allowed_changes`.
 12. `status` for every task must be `"pending"`.
+13. **Parallelism assessment**: For each task, carefully decide `parallelizable` and `depends_on`:
+    - Set `parallelizable: true` when the task modifies files in a **completely separate module/directory** from other tasks in the same wave, has **no code dependency** on them, and can **independently compile and pass tests** without their output.
+    - Set `parallelizable: false` when the task shares files with another task, or when its output (functions, types, APIs) is **consumed by** another task that would fail to compile without it.
+    - Use `depends_on` to express ordering: if task B calls functions defined in task A, set B's `depends_on: ["task-A-id"]` so B only starts after A completes.
+    - **Example (parallel)**: "Add `src/utils/format-bytes.ts`" and "Add `src/utils/debounce.ts`" are two independent files — both `parallelizable: true`, `depends_on: []`, same wave.
+    - **Example (serial)**: "Add `src/types.ts` schema" then "Add `src/api.ts` that imports the schema" — the second depends on the first, so `parallelizable: false`, `depends_on: ["task-schema"]`.
+    - **Example (mixed)**: Two independent features (parallel wave 0) followed by an integration test task that imports both (serial wave 1, `depends_on: ["task-1", "task-2"]`).
 
 ---
 
