@@ -122,22 +122,18 @@ export async function runTaskGraphWaveLoop(
     trackedFiles,
     maxParallelWorkers,
     onEvent: (event) => {
-      // Only forward wave/task lifecycle events; skip plan-computed and batches.
-      if (event.type === 'plan-computed' || event.type === 'batch-start' || event.type === 'batch-finish') return;
-      const kind = event.type === 'wave-start' ? 'wave.started'
-        : event.type === 'wave-finish' ? 'wave.completed'
-        : event.type === 'task-start' ? 'task.started'
-        : event.type === 'task-finish' ? 'task.completed'
-        : 'task.started';
-      const isFinish = event.type === 'task-finish';
+      // The runner (runTask below) emits task.started/completed/blocked with
+      // richer data (worker_branch, error, batch_index). To avoid double
+      // emission of task events, this bridge only forwards wave-level
+      // lifecycle events. Task-level events come from the runner.
+      if (event.type !== 'wave-start' && event.type !== 'wave-finish') return;
+      const kind = event.type === 'wave-start' ? 'wave.started' : 'wave.completed';
       void eventBus.emit({
         kind,
         phase: 'DEVELOPING',
-        level: isFinish && event.status !== 'passed' ? 'warn' : 'info',
-        message: `wave ${event.waveIndex + 1} ${event.type}`,
+        level: 'info',
+        message: `wave ${event.waveIndex + 1} ${event.type === 'wave-start' ? 'started' : 'completed'}`,
         wave_index: event.waveIndex,
-        task_id: event.type === 'task-start' || event.type === 'task-finish' ? event.taskId : undefined,
-        status: isFinish ? event.status : undefined,
       }).catch(() => { /* fail-soft */ });
     },
     runTask: async (task, context): Promise<WaveTaskRunnerResult> => {

@@ -111,6 +111,13 @@ export class EventStore {
   private readonly eventsPath: string;
   private readonly runId: string;
   private cachedLastSeq: number | null = null;
+  /**
+   * In-process append serialization. Wave mode fires events concurrently from
+   * `Promise.all` workers; without a chain, two appends can both read the same
+   * `lastSeq` and produce duplicate seq values. Each append awaits the
+   * previous one before computing its own seq.
+   */
+  private appendChain: Promise<unknown> = Promise.resolve();
 
   constructor(agentDir: string, runId: string) {
     this.eventsPath = path.join(agentDir, EVENTS_FILENAME);
@@ -119,11 +126,21 @@ export class EventStore {
 
   /**
    * Append a draft and return the fully-formed event.
-   * Assigns seq, event_id, ts. The append is a single `appendFile` call,
-   * which is atomic-enough for one orchestrator writer per run (the run lock
-   * already serializes writers).
+   * Assigns seq, event_id, ts. Serialized through an in-process promise chain
+   * so concurrent appends (wave mode Promise.all) get monotonic seq values.
    */
   async append(draft: EventDraft): Promise<ReviewLoopEvent> {
+    const run = (): Promise<ReviewLoopEvent> => this.doAppend(draft);
+    const next = this.appendChain.then(run, run);
+    // Keep the chain alive even if the caller drops the returned promise.
+    this.appendChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private async doAppend(draft: EventDraft): Promise<ReviewLoopEvent> {
     const seq = (await this.getLastSequence()) + 1;
     const event: ReviewLoopEvent = {
       schema_version: EVENT_SCHEMA_VERSION,

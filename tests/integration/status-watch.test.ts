@@ -112,6 +112,31 @@ describe('Phase 9 R1 status --watch event stream', () => {
     expect(code).toBe(0);
   });
 
+  it('JSON watch replays a resumed history past an earlier run.blocked', async () => {
+    // A resumed run's events.jsonl is append-only. A valid history is:
+    //   run.blocked (seq 2) -> run.resumed (seq 3) -> run.completed (seq 4)
+    // Watch must replay ALL events, not stop at the first terminal event.
+    repoDir = await makeRepoWithEvents('resumed', [
+      { kind: 'run.started', phase: 'INITIALIZING', level: 'info', message: 'Run started' },
+      { kind: 'run.blocked', phase: 'BLOCKED', level: 'warn', message: 'Blocked first time', status: 'BLOCKED' },
+      { kind: 'run.resumed', phase: 'BLOCKED', level: 'info', message: 'Resumed', status: 'BLOCKED' },
+      { kind: 'role.started', phase: 'DEVELOPING', level: 'info', message: 'Developer starting', role: 'developer' },
+      { kind: 'run.completed', phase: 'PASSED', level: 'info', message: 'Done on resume', status: 'PASSED' },
+    ]);
+
+    const { stdout, code } = runWatchJson(repoDir, 2000);
+    const lines = stdout.trim().split('\n').filter(Boolean);
+    const parsed = lines.map((l) => JSON.parse(l) as ReviewLoopEvent);
+
+    // All 5 events must be replayed, including those after run.blocked.
+    expect(parsed.length).toBe(5);
+    expect(parsed[1].kind).toBe('run.blocked');
+    expect(parsed[2].kind).toBe('run.resumed');
+    expect(parsed[4].kind).toBe('run.completed');
+    // The LAST event is terminal, so watch exits cleanly.
+    expect(code).toBe(0);
+  });
+
   it('Text watch shows phase, role, and latest event', async () => {
     repoDir = await makeRepoWithEvents('text', [
       { kind: 'run.started', phase: 'INITIALIZING', level: 'info', message: 'Run started' },

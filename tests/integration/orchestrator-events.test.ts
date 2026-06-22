@@ -175,6 +175,28 @@ describe('Phase 9 R1 orchestrator event stream', () => {
     expect(blocked?.status).toBe('BLOCKED');
   });
 
+  it('emits run.failed when the iteration loop exhausts without passing', async () => {
+    // Developer writes a completed handoff but auditor always FAILs.
+    repoDir = createTestRepo('failed', { auditor: 'audit-fail' });
+
+    const result = await runOrchestrator({
+      project_root: repoDir,
+      request: 'Add a hello function',
+      task_slug: 'hello-func',
+      max_iterations: 1,
+    });
+    expect(result.phase).toBe('FAILED');
+
+    const store = new EventStore(join(repoDir, '.agent'), result.run_id);
+    const events = await store.readAll();
+    const failed = events.find((e) => e.kind === 'run.failed');
+    expect(failed).toBeDefined();
+    expect(failed?.status).toBe('FAILED');
+    expect(failed?.level).toBe('error');
+    // run.failed must be the last event so watch exits cleanly.
+    expect(events[events.length - 1].kind).toBe('run.failed');
+  });
+
   it('appends to the existing events.jsonl on resume instead of truncating', async () => {
     repoDir = createTestRepo('resume', { auditor: 'audit-fail-then-pass' });
 

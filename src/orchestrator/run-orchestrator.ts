@@ -1071,6 +1071,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         breakerState.phase, 'circuit breaker tripped', 'FAIL',
         `consecutive_failure_count=${count}/${max}`,
       );
+      await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Circuit breaker tripped: consecutive_failure_count=${count}/${max}`);
       return makeResult(
         runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
         'Consecutive failure limit reached',
@@ -1482,6 +1483,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Scope violation after ${maxIterations} iterations`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
           'Max iterations reached — scope violation persists',
@@ -1551,6 +1553,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Required verification failed after ${maxIterations} iterations: ${failedCmds.join(', ')}`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
           'Max iterations reached — required verification still fails',
@@ -1614,6 +1617,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Post-verification scope violation after ${maxIterations} iterations: ${deniedPaths}`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
           'Max iterations reached — post-verification scope violation persists',
@@ -1831,6 +1835,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
         if (iteration >= maxIterations) {
           await stateStore.transition(PhaseEnum.FAILED);
+          await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Mechanical check failure after ${maxIterations} iterations: ${auditValidation.errors.join('; ')}`);
           return makeResult(
             runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
             'Max iterations reached — mechanical check overrides Auditor PASS',
@@ -1904,6 +1909,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Auditor FAIL after ${maxIterations} iterations`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, 'FAIL', [],
           'Max iterations reached — Auditor still returns FAIL',
@@ -1928,6 +1934,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
   // If we exit the loop without returning, max iterations was reached
   await stateStore.transition(PhaseEnum.FAILED);
+  await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Max iterations (${maxIterations}) reached without passing audit`);
   return makeResult(
     runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
     `Max iterations (${maxIterations}) reached without passing audit`,

@@ -123,15 +123,20 @@ async function watchEventStream(params: {
   const startMs = Date.now();
   let lastSeq = 0;
 
-  // Replay existing events.
+  // Replay ALL existing events first. A resumed run's history is append-only,
+  // so it can legitimately contain an earlier run.blocked followed by
+  // run.resumed and run.completed. Stopping at the first terminal event would
+  // truncate the resumed history. Only the LAST replayed event decides whether
+  // the run is currently terminal.
   const existing = await store.readAll();
   for (const ev of existing) {
     emitWatchLine(ev, json);
     lastSeq = ev.seq;
-    if (TERMINAL_EVENT_KINDS.has(ev.kind)) {
-      renderTextSummary(existing, json);
-      return;
-    }
+  }
+  const lastReplayed = existing[existing.length - 1];
+  if (lastReplayed && TERMINAL_EVENT_KINDS.has(lastReplayed.kind)) {
+    renderTextSummary(existing, json);
+    return;
   }
 
   // Follow newly appended events.
