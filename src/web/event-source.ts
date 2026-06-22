@@ -80,7 +80,11 @@ export class DashboardEventSource {
     const last = sorted[sorted.length - 1];
     const runId = runIdFromState ?? last.run_id ?? 'unknown';
 
-    const terminal = sorted.find((e) => TERMINAL_KINDS.has(e.kind));
+    // Choose the LAST terminal event, not the first: a resumed run's history
+    // is append-only and can contain an earlier run.blocked followed by
+    // run.resumed and run.completed. Picking the first would report the stale
+    // BLOCKED phase instead of the final PASSED.
+    const terminal = [...sorted].reverse().find((e) => TERMINAL_KINDS.has(e.kind));
     const currentPhase = terminal ? terminal.phase : last.phase;
 
     const latest = sorted.slice(-MAX_LATEST_EVENTS);

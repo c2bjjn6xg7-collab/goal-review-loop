@@ -64,6 +64,22 @@ describe('DashboardEventSource', () => {
     expect(snap.current_phase).toBe('PASSED');
   });
 
+  it('picks the LAST terminal event for a resumed history (run.blocked → run.resumed → run.completed)', async () => {
+    // A resumed run's events.jsonl is append-only and can contain an earlier
+    // run.blocked followed by run.resumed and run.completed. The dashboard
+    // must report the final phase (PASSED), not the stale BLOCKED.
+    const store = new EventStore(agentDir, 'run-1');
+    await store.append({ kind: 'run.started', phase: 'INITIALIZING', level: 'info', message: 'start' });
+    await store.append({ kind: 'run.blocked', phase: 'BLOCKED', level: 'warn', message: 'blocked first', status: 'BLOCKED' });
+    await store.append({ kind: 'run.resumed', phase: 'BLOCKED', level: 'info', message: 'resumed', status: 'BLOCKED' });
+    await store.append({ kind: 'role.started', phase: 'DEVELOPING', level: 'info', message: 'dev', role: 'developer' });
+    await store.append({ kind: 'run.completed', phase: 'PASSED', level: 'info', message: 'done', status: 'PASSED' });
+
+    const src = new DashboardEventSource({ projectRoot: tmpDir });
+    const snap = await src.getSnapshot();
+    expect(snap.current_phase).toBe('PASSED');
+  });
+
   it('truncates latest_events to the most recent MAX_LATEST_EVENTS', async () => {
     const store = new EventStore(agentDir, 'run-1');
     const total = MAX_LATEST_EVENTS + 5;
