@@ -200,6 +200,7 @@ Must be valid JSON with this shape:
     - **Example (parallel)**: "Add `src/utils/format-bytes.ts`" and "Add `src/utils/debounce.ts`" are two independent files — both `parallelizable: true`, `depends_on: []`, same wave.
     - **Example (serial)**: "Add `src/types.ts` schema" then "Add `src/api.ts` that imports the schema" — the second depends on the first, so `parallelizable: false`, `depends_on: ["task-schema"]`.
     - **Example (mixed)**: Two independent features (parallel wave 0) followed by an integration test task that imports both (serial wave 1, `depends_on: ["task-1", "task-2"]`).
+14. **Verification commands must not use `git status` or `git diff` to check file scope.** The orchestrator's scope guard already enforces `allowed_changes`/`disallowed_changes`. Verification commands should test **behavior** (typecheck, test, lint, build) not git state. In worktree mode, `.agent/` runtime artifacts and other untracked files appear in `git status`, causing false failures. Use commands like `npm test`, `npx tsc --noEmit`, or script-based assertions on file content — never `git status --porcelain`.
 
 ---
 
