@@ -10,8 +10,7 @@ import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { EventStore, type ReviewLoopEvent } from '../runtime/event-store.js';
 import type { RunState, StatusOutput, ReviewLoopError } from '../types.js';
-import { Phase as PhaseEnum } from '../types.js';
-import { isTerminal } from '../orchestrator/state-machine.js';
+import { computeNextAction } from '../runtime/next-action.js';
 import {
   readFeedbackSummary,
   feedbackSummaryHasContent,
@@ -109,6 +108,19 @@ async function watchEventStream(params: {
   watchTimeout: number;
 }): Promise<void> {
   const { agentDir, json, watchInterval, watchTimeout } = params;
+
+  /** Read iteration/maxIterations from state.json for the next-action hint. */
+  function readIterFromState(): { iteration?: number; maxIterations?: number } {
+    const statePath = join(agentDir, 'state.json');
+    if (!existsSync(statePath)) return {};
+    try {
+      const st = JSON.parse(readFileSync(statePath, 'utf8'));
+      return {
+        iteration: typeof st.iteration === 'number' ? st.iteration : undefined,
+        maxIterations: typeof st.max_iterations === 'number' ? st.max_iterations : undefined,
+      };
+    } catch { return {}; }
+  }
   // Derive run_id from state.json if present, else from the first event.
   let runId = 'unknown';
   const statePath = join(agentDir, 'state.json');
@@ -135,14 +147,14 @@ async function watchEventStream(params: {
   }
   const lastReplayed = existing[existing.length - 1];
   if (lastReplayed && TERMINAL_EVENT_KINDS.has(lastReplayed.kind)) {
-    renderTextSummary(existing, json);
+    renderTextSummary(existing, json, readIterFromState());
     return;
   }
 
   // Follow newly appended events.
   while (true) {
     if (watchTimeout > 0 && Date.now() - startMs > watchTimeout) {
-      renderTextSummary(existing.concat(await store.readSince(lastSeq)), json);
+      renderTextSummary(existing.concat(await store.readSince(lastSeq)), json, readIterFromState());
       return;
     }
     const tail = await store.readSince(lastSeq);
@@ -151,7 +163,7 @@ async function watchEventStream(params: {
         emitWatchLine(ev, json);
         lastSeq = ev.seq;
         if (TERMINAL_EVENT_KINDS.has(ev.kind)) {
-          renderTextSummary(existing.concat(await store.readAll()), json);
+          renderTextSummary(existing.concat(await store.readAll()), json, readIterFromState());
           return;
         }
       }
@@ -168,7 +180,7 @@ function emitWatchLine(ev: ReviewLoopEvent, json: boolean): void {
   // printed once at the end (or on timeout) by renderTextSummary.
 }
 
-function renderTextSummary(events: ReviewLoopEvent[], json: boolean): void {
+function renderTextSummary(events: ReviewLoopEvent[], json: boolean, opts?: { iteration?: number; maxIterations?: number }): void {
   if (json) return; // JSON mode already emitted each event inline.
   if (events.length === 0) return;
   const last = events[events.length - 1];
@@ -180,9 +192,12 @@ function renderTextSummary(events: ReviewLoopEvent[], json: boolean): void {
   const phase = terminalEv ? terminalEv.phase : last.phase;
 
   const recent = events.slice(-6);
+  const iteration = opts?.iteration ?? 0;
+  const maxIterations = opts?.maxIterations ?? 0;
 
   console.log('');
   console.log(`Run: ${runId}  Phase: ${phase}`);
+  console.log(`Next: ${computeNextAction(phase, iteration, maxIterations)}`);
   if (lastRoleStarted?.role) {
     const providerInfo = lastRoleStarted.provider ? `  Provider: ${lastRoleStarted.provider}` : '';
     console.log(`Active: ${lastRoleStarted.role}${providerInfo}`);
@@ -291,7 +306,7 @@ export async function executeStatus(params: {
     lockStatus = 'none';
   }
 
-  const nextStep = computeNextStep(state.phase, state.iteration, state.max_iterations);
+  const nextStep = computeNextAction(state.phase, state.iteration, state.max_iterations);
 
   const lock = await lockManager.readLock().catch(() => null);
 
@@ -362,46 +377,6 @@ function computeFinalizationNextStep(state: RunState): string | null {
       return null;
     default:
       return null;
-  }
-}
-
-/**
- * Compute the next step suggestion based on current phase.
- */
-function computeNextStep(phase: string, iteration: number, maxIterations: number): string {
-  if (isTerminal(phase as PhaseEnum)) {
-    const p = phase as PhaseEnum;
-    switch (p) {
-      case PhaseEnum.PASSED:
-        return 'Run completed successfully. Final Audit passed and code committed.';
-      case PhaseEnum.FAILED:
-        return `Run failed after ${iteration} iteration(s). Review errors and adjust configuration.`;
-      case PhaseEnum.BLOCKED:
-        return 'Run is blocked. Resolve the blocking issue and use `review-loop resume`.';
-      case PhaseEnum.CANCELLED:
-        return 'Run was cancelled.';
-      default:
-        return 'Run is in a terminal state.';
-    }
-  }
-
-  switch (phase) {
-    case 'INITIALIZING':
-      return 'Run is initializing. Use `review-loop start` to begin.';
-    case 'PLANNING':
-      return 'Planner is running. Wait for it to complete.';
-    case 'DEVELOPING':
-      return `Developer is running (iteration ${iteration}/${maxIterations}). Wait for it to complete.`;
-    case 'REWORKING':
-      return `Rework is in progress (iteration ${iteration}/${maxIterations}). Wait for it to complete.`;
-    case 'VERIFYING':
-      return `Verification is running (iteration ${iteration}/${maxIterations}). Wait for it to complete.`;
-    case 'AUDITING':
-      return `Auditor is running (iteration ${iteration}/${maxIterations}). Wait for it to complete.`;
-    case 'FINALIZING':
-      return '正在等待或执行最终审计/本地提交';
-    default:
-      return 'Unknown phase.';
   }
 }
 

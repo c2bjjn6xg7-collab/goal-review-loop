@@ -759,6 +759,7 @@ export async function runOrchestrator(params: {
         exit_code: plannerResult.result.exit_code ?? undefined,
         duration_ms: plannerResult.result.duration_ms ?? null,
         provider: config.agents.planner.provider ?? 'claude',
+        artifact_refs: [{ type: 'transcript', path: '.agent/transcripts/iteration-00-planner.md' }],
       });
     } finally {
       if (plannerPromptFile) plannerCleanupResult = await deletePromptFile(plannerPromptFile);
@@ -1357,6 +1358,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
           exit_code: developerResult.exit_code ?? undefined,
           duration_ms: developerResult.duration_ms ?? null,
           provider: config.agents.developer.provider ?? 'claude',
+          artifact_refs: [{ type: 'transcript', path: `.agent/transcripts/iteration-${String(iteration).padStart(2, '0')}-developer.md` }],
         });
       }
       await emitProgress({ projectRoot, stateStore, lastEvent: `Developer completed (iter ${iteration})`, registry: orchestratorRegistry });
@@ -1776,6 +1778,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         exit_code: auditorResult.exit_code ?? undefined,
         duration_ms: auditorResult.duration_ms ?? null,
         provider: config.agents.auditor.provider ?? 'codex',
+        artifact_refs: [{ type: 'transcript', path: `.agent/transcripts/iteration-${String(iteration).padStart(2, '0')}-auditor.md` }],
       });
     } finally {
       if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
@@ -1871,7 +1874,11 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       role: 'auditor',
       status: String(decision),
       artifact_refs: [{ type: 'audit-report', path: '.agent/audit-report.md' }],
-      payload: { diff_digest: diffDigest },
+      payload: {
+        diff_digest: diffDigest,
+        finding_count: auditValidation.errors.length,
+        ...(decision !== 'PASS' ? { rework_reason: '.agent/audit-report.md' } : {}),
+      },
     });
 
     if (decision === 'PASS') {
@@ -2452,7 +2459,7 @@ export async function runFinalization(params: {
       await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
 
       const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
-      await emitRunTerminal(eventBus, PhaseEnum.PASSED, `Finalization PASSED. Commit ${existingCommitSha.slice(0, 8)} already exists.`, { artifact_refs: artifactPaths.map((p) => ({ type: 'state', path: p })) });
+      await emitRunTerminal(eventBus, PhaseEnum.PASSED, `Finalization PASSED. Commit ${existingCommitSha.slice(0, 8)} already exists.`, { artifact_refs: [...artifactPaths.map((p) => ({ type: 'state' as const, path: p })), { type: 'final-audit' as const, path: '.agent/final-audit.md' }] });
       return makeResult(
         runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
         artifactPaths,
@@ -2680,6 +2687,7 @@ export async function runFinalization(params: {
       exit_code: finalAuditorResult.exit_code ?? undefined,
       duration_ms: finalAuditorResult.duration_ms ?? null,
       provider: config.agents.final_auditor.provider ?? 'codex',
+      artifact_refs: [{ type: 'transcript', path: `.agent/transcripts/iteration-${String(iteration).padStart(2, '0')}-final-auditor.md` }],
     });
   }
   await emitProgress({ projectRoot, stateStore, lastEvent: 'Final Auditor completed', registry: orchestratorRegistry });
@@ -2822,7 +2830,7 @@ export async function runFinalization(params: {
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS', 'commit skipped');
 
     const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
-    await emitRunTerminal(eventBus, PhaseEnum.PASSED, 'Finalization PASSED. Commit skipped.', { artifact_refs: artifactPaths.map((p) => ({ type: 'state', path: p })) });
+    await emitRunTerminal(eventBus, PhaseEnum.PASSED, 'Finalization PASSED. Commit skipped.', { artifact_refs: [...artifactPaths.map((p) => ({ type: 'state' as const, path: p })), { type: 'final-audit' as const, path: '.agent/final-audit.md' }] });
     return makeResult(
       runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
       artifactPaths,
@@ -3008,6 +3016,7 @@ export async function runFinalization(params: {
     artifact_refs: [
       { type: 'diff', path: '.agent/evidence/diff.patch' },
       ...artifactPaths.map((p) => ({ type: 'state' as const, path: p })),
+      { type: 'final-audit', path: '.agent/final-audit.md' },
     ],
     payload: { commit_sha: commitSha, tag_name: tagName, tag_created: tagCreated },
   });

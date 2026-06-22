@@ -18,6 +18,7 @@ import {
   type ArtifactRef,
 } from '../runtime/event-store.js';
 import { parseJsonlEvents, resolveArchiveByRunId } from './run-lister.js';
+import { computeNextAction } from '../runtime/next-action.js';
 
 export const MAX_LATEST_EVENTS = 20;
 
@@ -41,6 +42,7 @@ export async function resolveRunIdFromAgentDir(agentDir: string): Promise<string
 export interface DashboardSnapshot {
   run_id: string;
   current_phase: string;
+  next_action: string;
   latest_events: ReviewLoopEvent[];
   artifacts: ArtifactRef[];
 }
@@ -76,6 +78,25 @@ export class DashboardEventSource {
     this.agentDir = path.join(opts.projectRoot, '.agent');
     this.historyDir = path.join(this.agentDir, 'history');
     this.eventsPath = path.join(this.agentDir, EVENTS_FILENAME);
+  }
+
+  /**
+   * Read iteration/maxIterations from state.json for the next-action hint.
+   * Returns {0,0} when state.json is missing (archived/old runs), which is
+   * fine because those runs are terminal and the hint ignores iteration.
+   */
+  private readIterFromState(): { iteration: number; maxIterations: number } {
+    try {
+      const statePath = path.join(this.agentDir, 'state.json');
+      if (!fs.existsSync(statePath)) return { iteration: 0, maxIterations: 0 };
+      const st = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      return {
+        iteration: typeof st.iteration === 'number' ? st.iteration : 0,
+        maxIterations: typeof st.max_iterations === 'number' ? st.max_iterations : 0,
+      };
+    } catch {
+      return { iteration: 0, maxIterations: 0 };
+    }
   }
 
   /**
@@ -125,6 +146,7 @@ export class DashboardEventSource {
       return {
         run_id: runIdFromState ?? 'unknown',
         current_phase: 'unknown',
+        next_action: '',
         latest_events: [],
         artifacts: [],
       };
@@ -137,6 +159,7 @@ export class DashboardEventSource {
       return {
         run_id: runIdFromState ?? 'unknown',
         current_phase: 'unknown',
+        next_action: '',
         latest_events: [],
         artifacts: [],
       };
@@ -159,6 +182,7 @@ export class DashboardEventSource {
     return {
       run_id: runId,
       current_phase: currentPhase,
+      next_action: computeNextAction(currentPhase, this.readIterFromState().iteration, this.readIterFromState().maxIterations),
       latest_events: latest,
       artifacts,
     };
@@ -174,6 +198,7 @@ function buildSnapshot(runId: string, events: ReviewLoopEvent[]): DashboardSnaps
     return {
       run_id: runId,
       current_phase: 'unknown',
+      next_action: '',
       latest_events: [],
       artifacts: [],
     };
@@ -187,6 +212,7 @@ function buildSnapshot(runId: string, events: ReviewLoopEvent[]): DashboardSnaps
   return {
     run_id: runId,
     current_phase: currentPhase,
+    next_action: computeNextAction(currentPhase, 0, 0),
     latest_events: latest,
     artifacts,
   };

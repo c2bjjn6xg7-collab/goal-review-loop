@@ -44,6 +44,7 @@ const HTML = `<!DOCTYPE html>
   <h1>Review-Loop Dashboard</h1>
   <div>Run: <code id="run-id" hidden>…</code><select id="run-select"></select> <button id="cancel-btn" type="button" disabled>Cancel Run</button></div>
   <div>Phase: <span id="current-phase" class="pill">…</span></div>
+  <div>Next: <span id="next-action">…</span></div>
   <div class="muted">Updated: <span id="updated-at">never</span></div>
   <div id="cancel-error" role="alert"></div>
 </header>
@@ -68,6 +69,7 @@ const HTML = `<!DOCTYPE html>
   var runIdEl = document.getElementById('run-id');
   var runSelectEl = document.getElementById('run-select');
   var phaseEl = document.getElementById('current-phase');
+  var nextActionEl = document.getElementById('next-action');
   var updatedEl = document.getElementById('updated-at');
   var bodyEl = document.getElementById('events-body');
   var eventsEmpty = document.getElementById('events-empty');
@@ -118,6 +120,7 @@ const HTML = `<!DOCTYPE html>
   function render(snapshot) {
     setText(runIdEl, snapshot.run_id);
     setText(phaseEl, snapshot.current_phase);
+    setText(nextActionEl, snapshot.next_action);
     setText(updatedEl, new Date().toLocaleTimeString());
     renderCancelButton(snapshot.current_phase);
 

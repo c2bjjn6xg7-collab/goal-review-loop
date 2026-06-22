@@ -25,6 +25,7 @@ describe('DashboardEventSource', () => {
     const snap = await src.getSnapshot();
     expect(snap.run_id).toBe('unknown');
     expect(snap.current_phase).toBe('unknown');
+    expect(snap.next_action).toBe('');
     expect(snap.latest_events).toEqual([]);
     expect(snap.artifacts).toEqual([]);
   });
@@ -35,8 +36,21 @@ describe('DashboardEventSource', () => {
     const snap = await src.getSnapshot();
     expect(snap.run_id).toBe('run-x');
     expect(snap.current_phase).toBe('unknown');
+    expect(snap.next_action).toBe('');
     expect(snap.latest_events).toEqual([]);
     expect(snap.artifacts).toEqual([]);
+  });
+
+  it('populates next_action as a non-empty string when events exist', async () => {
+    const store = new EventStore(agentDir, 'run-1');
+    await store.append({ kind: 'run.started', phase: 'INITIALIZING', level: 'info', message: 'start' });
+    await store.append({ kind: 'phase.changed', phase: 'PLANNING', level: 'info', message: 'plan' });
+
+    const src = new DashboardEventSource({ projectRoot: tmpDir });
+    const snap = await src.getSnapshot();
+    expect(typeof snap.next_action).toBe('string');
+    expect(snap.next_action.length).toBeGreaterThan(0);
+    expect(snap.next_action).toBe('Planner is running. Wait for it to complete.');
   });
 
   it('returns sorted events with current_phase from last non-terminal event', async () => {
