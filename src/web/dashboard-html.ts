@@ -3,9 +3,16 @@
  *
  * Phase 9 R2C — Adds Cancel Run button that POSTs /api/cancel.
  *
- * The page polls `/api/events` every 2 seconds and renders the snapshot
- * using `textContent` only (no innerHTML interpolation of event fields)
- * so that user/run-supplied strings cannot inject HTML.
+ * Phase 9 R3 — Adds a `<select id="run-select">` historical run browser.
+ *   - The client fetches `/api/runs` on load and every 15 s.
+ *   - Selecting the active run keeps SSE + snapshot polling and shows the
+ *     cancel button. Selecting an archived run closes the EventSource,
+ *     stops the snapshot polling timer, fetches `/api/events?run_id=<id>`
+ *     exactly once, and hides the cancel button.
+ *
+ * The page polls `/api/events` every 2 seconds (active only) and renders
+ * the snapshot using `textContent` / `createTextNode` only so user/run-
+ * supplied strings cannot inject HTML.
  */
 
 const HTML = `<!DOCTYPE html>
@@ -26,6 +33,7 @@ const HTML = `<!DOCTYPE html>
   th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #ccc4; vertical-align: top; }
   .muted { color: #888; font-size: 0.8rem; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #run-select { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
   #cancel-btn { padding: 0.25rem 0.75rem; font-size: 0.85rem; }
   #cancel-btn[disabled] { opacity: 0.6; cursor: not-allowed; }
   #cancel-error { color: #b00; font-size: 0.8rem; }
@@ -34,7 +42,7 @@ const HTML = `<!DOCTYPE html>
 <body>
 <header>
   <h1>Review-Loop Dashboard</h1>
-  <div>Run: <code id="run-id">…</code> <button id="cancel-btn" type="button" disabled>Cancel Run</button></div>
+  <div>Run: <code id="run-id" hidden>…</code><select id="run-select"></select> <button id="cancel-btn" type="button" disabled>Cancel Run</button></div>
   <div>Phase: <span id="current-phase" class="pill">…</span></div>
   <div class="muted">Updated: <span id="updated-at">never</span></div>
   <div id="cancel-error" role="alert"></div>
@@ -58,6 +66,7 @@ const HTML = `<!DOCTYPE html>
 <script>
 (function () {
   var runIdEl = document.getElementById('run-id');
+  var runSelectEl = document.getElementById('run-select');
   var phaseEl = document.getElementById('current-phase');
   var updatedEl = document.getElementById('updated-at');
   var bodyEl = document.getElementById('events-body');
@@ -70,11 +79,23 @@ const HTML = `<!DOCTYPE html>
   var TERMINAL = { PASSED: 1, FAILED: 1, BLOCKED: 1, CANCELLED: 1 };
   var cancelInFlight = false;
 
+  // Tracks the currently selected run and whether it is the active run.
+  // null until /api/runs has answered at least once.
+  var activeRunId = null;
+  var selectedRunId = null;
+  var selectedIsActive = false;
+
   function setText(el, value) {
     el.textContent = value == null ? '' : String(value);
   }
 
   function renderCancelButton(phase) {
+    // Hide entirely when viewing an archived run.
+    if (!selectedIsActive) {
+      cancelBtn.hidden = true;
+      return;
+    }
+    cancelBtn.hidden = false;
     var isTerminal = phase == null || phase === 'unknown' || TERMINAL[phase] === 1;
     if (cancelInFlight) {
       cancelBtn.disabled = true;
@@ -161,7 +182,7 @@ const HTML = `<!DOCTYPE html>
 
   cancelBtn.addEventListener('click', onCancelClick);
 
-  function tick() {
+  function fetchActiveSnapshot() {
     fetch('/api/events', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(render)
@@ -170,8 +191,17 @@ const HTML = `<!DOCTYPE html>
       });
   }
 
-  // Mode flag ensures the SSE and polling paths are mutually exclusive.
+  function fetchArchivedSnapshot(runId) {
+    fetch('/api/events?run_id=' + encodeURIComponent(runId), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function () {
+        setText(updatedEl, 'fetch failed at ' + new Date().toLocaleTimeString());
+      });
+  }
+
   // 'idle' before start, 'sse' when EventSource is live, 'poll' otherwise.
+  // Active-run only: archived runs use neither SSE nor polling.
   var mode = 'idle';
   var pollTimer = null;
   var es = null;
@@ -181,7 +211,7 @@ const HTML = `<!DOCTYPE html>
     stopSse();
     mode = 'poll';
     if (pollTimer == null) {
-      pollTimer = setInterval(tick, 2000);
+      pollTimer = setInterval(fetchActiveSnapshot, 2000);
     }
   }
 
@@ -215,12 +245,12 @@ const HTML = `<!DOCTYPE html>
     stopPolling();
     es.addEventListener('hello', function () {
       setText(updatedEl, new Date().toLocaleTimeString());
-      tick();
+      fetchActiveSnapshot();
     });
     es.onmessage = function () {
       // SSE acts as a freshness signal; the JSON snapshot is the source of
       // truth and keeps artifacts/current_phase accurate.
-      tick();
+      fetchActiveSnapshot();
     };
     es.onerror = function () {
       stopSse();
@@ -229,8 +259,87 @@ const HTML = `<!DOCTYPE html>
     };
   }
 
-  tick();
-  startSse();
+  function switchToActive() {
+    selectedIsActive = true;
+    startSse();
+    fetchActiveSnapshot();
+  }
+
+  function switchToArchived(runId) {
+    selectedIsActive = false;
+    stopSse();
+    stopPolling();
+    mode = 'idle';
+    fetchArchivedSnapshot(runId);
+  }
+
+  function populateRunSelect(listing) {
+    var runs = Array.isArray(listing.runs) ? listing.runs : [];
+    activeRunId = typeof listing.active_run_id === 'string' ? listing.active_run_id : null;
+
+    // Preserve the current selection if it still exists in the new listing.
+    var previous = selectedRunId;
+
+    while (runSelectEl.firstChild) runSelectEl.removeChild(runSelectEl.firstChild);
+    var foundPrevious = false;
+    var defaultRunId = null;
+    for (var i = 0; i < runs.length; i++) {
+      var r = runs[i];
+      var opt = document.createElement('option');
+      opt.value = r.run_id;
+      var label = r.run_id + ' (' + r.friendly_time + ') [' + r.phase + ']';
+      opt.appendChild(document.createTextNode(label));
+      runSelectEl.appendChild(opt);
+      if (r.run_id === previous) foundPrevious = true;
+      if (r.is_active) defaultRunId = r.run_id;
+    }
+
+    // Default-select: prefer the active run, otherwise the most recent
+    // archive (last in the ascending-sorted list).
+    if (defaultRunId == null && runs.length > 0) {
+      defaultRunId = runs[runs.length - 1].run_id;
+    }
+
+    var nextSelection = foundPrevious ? previous : defaultRunId;
+    if (nextSelection != null) {
+      runSelectEl.value = nextSelection;
+    }
+
+    if (selectedRunId !== nextSelection) {
+      selectedRunId = nextSelection;
+      if (selectedRunId != null) {
+        if (selectedRunId === activeRunId) {
+          switchToActive();
+        } else {
+          switchToArchived(selectedRunId);
+        }
+      } else {
+        // No runs at all — show empty active snapshot.
+        selectedIsActive = true;
+        fetchActiveSnapshot();
+      }
+    }
+  }
+
+  function refreshRuns() {
+    fetch('/api/runs', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(populateRunSelect)
+      .catch(function () { /* ignore listing failures */ });
+  }
+
+  runSelectEl.addEventListener('change', function () {
+    var runId = runSelectEl.value;
+    selectedRunId = runId;
+    if (runId === activeRunId) {
+      switchToActive();
+    } else {
+      switchToArchived(runId);
+    }
+  });
+
+  refreshRuns();
+  setInterval(refreshRuns, 15000);
 })();
 </script>
 </body>
