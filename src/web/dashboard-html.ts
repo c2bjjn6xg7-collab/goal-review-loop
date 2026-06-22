@@ -15,6 +15,69 @@
  * supplied strings cannot inject HTML.
  */
 
+import type { ReviewLoopEvent } from '../runtime/event-store.js';
+
+/** Maximum number of live-output lines retained, FIFO. */
+const LIVE_OUTPUT_MAX_LINES = 500;
+
+export interface LiveOutputLine {
+  ts: string;
+  role: string;
+  text: string;
+}
+
+/**
+ * Pure helper: extract the last 500 `role.output` events from `events`,
+ * formatted as `{ ts, role, text }`. `text` prefers `payload.text` and
+ * falls back to `message`. Exposed for unit testing.
+ */
+export function getLiveOutputLines(events: ReviewLoopEvent[] | undefined | null): LiveOutputLine[] {
+  if (!Array.isArray(events)) return [];
+  const out: LiveOutputLine[] = [];
+  for (const ev of events) {
+    if (!ev || ev.kind !== 'role.output') continue;
+    const text =
+      ev.payload && typeof ev.payload.text === 'string'
+        ? ev.payload.text
+        : ev.message ?? '';
+    out.push({ ts: ev.ts, role: ev.role ?? '', text });
+  }
+  if (out.length > LIVE_OUTPUT_MAX_LINES) {
+    return out.slice(out.length - LIVE_OUTPUT_MAX_LINES);
+  }
+  return out;
+}
+
+/**
+ * Pure helper: returns `"Last heartbeat: Ns ago"` when `activeRole` has a
+ * `role.heartbeat` event with no newer `role.exited` for the same role.
+ * Returns `null` otherwise. Exposed for unit testing.
+ */
+export function getHeartbeatIndicator(
+  events: ReviewLoopEvent[] | undefined | null,
+  activeRole: string | undefined | null,
+  nowMs: number = Date.now(),
+): string | null {
+  if (!activeRole || !Array.isArray(events)) return null;
+  let lastHeartbeat: ReviewLoopEvent | undefined;
+  let exitedAfterHeartbeat = false;
+  for (const ev of events) {
+    if (!ev || ev.role !== activeRole) continue;
+    if (ev.kind === 'role.heartbeat') {
+      lastHeartbeat = ev;
+      exitedAfterHeartbeat = false;
+    } else if (ev.kind === 'role.exited' && lastHeartbeat) {
+      if (Date.parse(ev.ts) > Date.parse(lastHeartbeat.ts)) {
+        exitedAfterHeartbeat = true;
+      }
+    }
+  }
+  if (!lastHeartbeat || exitedAfterHeartbeat) return null;
+  const ageMs = nowMs - Date.parse(lastHeartbeat.ts);
+  const secs = Math.max(0, Math.floor(ageMs / 1000));
+  return `Last heartbeat: ${secs}s ago`;
+}
+
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -37,6 +100,9 @@ const HTML = `<!DOCTYPE html>
   #cancel-btn { padding: 0.25rem 0.75rem; font-size: 0.85rem; }
   #cancel-btn[disabled] { opacity: 0.6; cursor: not-allowed; }
   #cancel-error { color: #b00; font-size: 0.8rem; }
+  #live-output { max-height: 16rem; overflow: auto; padding: 0.5rem; background: #f6f6f6; border: 1px solid #ccc4; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; white-space: pre-wrap; }
+  #live-output div { white-space: pre-wrap; }
+  #heartbeat-indicator { font-size: 0.8rem; }
 </style>
 </head>
 <body>
@@ -44,6 +110,7 @@ const HTML = `<!DOCTYPE html>
   <h1>Review-Loop Dashboard</h1>
   <div>Run: <code id="run-id" hidden>…</code><select id="run-select"></select> <button id="cancel-btn" type="button" disabled>Cancel Run</button></div>
   <div>Phase: <span id="current-phase" class="pill">…</span></div>
+  <div>Active role: <span id="active-role">…</span> <span id="heartbeat-indicator" class="muted" hidden></span></div>
   <div>Next: <span id="next-action">…</span></div>
   <div class="muted">Updated: <span id="updated-at">never</span></div>
   <div id="cancel-error" role="alert"></div>
@@ -56,6 +123,11 @@ const HTML = `<!DOCTYPE html>
     <tbody id="events-body"></tbody>
   </table>
   <p id="events-empty" class="muted" hidden>No events yet.</p>
+</section>
+
+<section>
+  <h2>Live Output</h2>
+  <pre id="live-output" aria-live="polite"></pre>
 </section>
 
 <section>
@@ -77,6 +149,11 @@ const HTML = `<!DOCTYPE html>
   var artsEmpty = document.getElementById('artifacts-empty');
   var cancelBtn = document.getElementById('cancel-btn');
   var cancelErr = document.getElementById('cancel-error');
+  var liveOutEl = document.getElementById('live-output');
+  var activeRoleEl = document.getElementById('active-role');
+  var heartbeatEl = document.getElementById('heartbeat-indicator');
+
+  var LIVE_OUTPUT_MAX_LINES = 500;
 
   var TERMINAL = { PASSED: 1, FAILED: 1, BLOCKED: 1, CANCELLED: 1 };
   var cancelInFlight = false;
@@ -147,6 +224,83 @@ const HTML = `<!DOCTYPE html>
       var label = arts[j].label ? arts[j].label + ' — ' : '';
       li.appendChild(document.createTextNode('[' + arts[j].type + '] ' + label + arts[j].path));
       artsEl.appendChild(li);
+    }
+
+    renderActiveRole(events);
+    renderLiveOutput(events);
+  }
+
+  function renderActiveRole(events) {
+    var activeRole = null;
+    for (var i = events.length - 1; i >= 0; i--) {
+      var ev = events[i];
+      if (!ev) continue;
+      if (ev.kind === 'role.started' && ev.role) {
+        activeRole = ev.role;
+        break;
+      }
+    }
+    setText(activeRoleEl, activeRole == null ? '—' : activeRole);
+
+    var hb = computeHeartbeatIndicator(events, activeRole);
+    if (hb == null) {
+      heartbeatEl.hidden = true;
+      setText(heartbeatEl, '');
+    } else {
+      heartbeatEl.hidden = false;
+      setText(heartbeatEl, hb);
+    }
+  }
+
+  function computeHeartbeatIndicator(events, activeRole) {
+    if (!activeRole) return null;
+    var lastHeartbeat = null;
+    var exitedAfterHeartbeat = false;
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i];
+      if (!ev || ev.role !== activeRole) continue;
+      if (ev.kind === 'role.heartbeat') {
+        lastHeartbeat = ev;
+        exitedAfterHeartbeat = false;
+      } else if (ev.kind === 'role.exited' && lastHeartbeat) {
+        if (Date.parse(ev.ts) > Date.parse(lastHeartbeat.ts)) {
+          exitedAfterHeartbeat = true;
+        }
+      }
+    }
+    if (!lastHeartbeat || exitedAfterHeartbeat) return null;
+    var secs = Math.max(0, Math.floor((Date.now() - Date.parse(lastHeartbeat.ts)) / 1000));
+    return 'Last heartbeat: ' + secs + 's ago';
+  }
+
+  function renderLiveOutput(events) {
+    if (!liveOutEl) return;
+    // Detect whether the user is parked at the bottom BEFORE we mutate the
+    // panel; if so, we re-pin to the bottom after appending new lines.
+    var atBottom = liveOutEl.scrollTop + liveOutEl.clientHeight >= liveOutEl.scrollHeight - 32;
+
+    while (liveOutEl.firstChild) liveOutEl.removeChild(liveOutEl.firstChild);
+
+    var lines = [];
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i];
+      if (!ev || ev.kind !== 'role.output') continue;
+      var text = (ev.payload && typeof ev.payload.text === 'string') ? ev.payload.text : (ev.message || '');
+      lines.push({ ts: ev.ts, role: ev.role || '', text: text });
+    }
+    if (lines.length > LIVE_OUTPUT_MAX_LINES) {
+      lines = lines.slice(lines.length - LIVE_OUTPUT_MAX_LINES);
+    }
+
+    for (var k = 0; k < lines.length; k++) {
+      var div = document.createElement('div');
+      var line = '[' + lines[k].ts + '] ' + lines[k].role + ': ' + lines[k].text;
+      div.appendChild(document.createTextNode(line));
+      liveOutEl.appendChild(div);
+    }
+
+    if (atBottom) {
+      liveOutEl.scrollTop = liveOutEl.scrollHeight;
     }
   }
 

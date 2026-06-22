@@ -10,7 +10,8 @@ import { runProcess } from '../runtime/process-runner.js';
 import { computeDigest, recordArtifactDigests, verifyArtifactDigests, type Digest, type ArtifactDigestRecord } from '../runtime/digest.js';
 import { renderCommand, type CommandRenderValues } from './command-renderer.js';
 import { resolveProviderEnv } from '../providers/network-env.js';
-import type { AgentRunInput, AgentRunResult, ErrorCategory } from '../types.js';
+import type { AgentRunInput, AgentRunResult, ErrorCategory, Phase } from '../types.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 
 /** Pre-call artifact state for stale detection. */
 export interface PreCallArtifactState {
@@ -113,6 +114,19 @@ export function buildAgentLogPaths(
     stdoutPath: `${logBase}.stdout.log`,
     stderrPath: `${logBase}.stderr.log`,
   };
+}
+
+function roleToPhase(role: AgentRunInput['role']): Phase {
+  switch (role) {
+    case 'planner':
+      return 'PLANNING';
+    case 'developer':
+      return 'DEVELOPING';
+    case 'auditor':
+      return 'AUDITING';
+    case 'final-auditor':
+      return 'FINALIZING';
+  }
 }
 
 export async function runAgent(
@@ -267,19 +281,75 @@ export async function runAgent(
       deleteEnv = resolved.deleteEnv.length > 0 ? resolved.deleteEnv : undefined;
     }
 
-    const processResult = await runProcess(
-      {
-        argv,
-        cwd: resolvedRoot,
-        timeout_ms: input.timeout_seconds * 1000,
-        stdout_path: stdoutPath,
-        stderr_path: stderrPath,
-        signal: input.signal,
-        env: processEnv,
-        delete_env: deleteEnv,
-      },
-      resolvedRoot,
-    );
+    const eventBus: IEventBus | undefined = input.eventBus;
+    const rolePhase: Phase = roleToPhase(input.role);
+    // Test injection: allow overriding the heartbeat interval via env var.
+    // Production default is 30s; tests set AGENT_HEARTBEAT_INTERVAL_MS to a
+    // small value to avoid waiting 30s for a heartbeat event.
+    const heartbeatIntervalMs = Number.parseInt(
+      process.env.AGENT_HEARTBEAT_INTERVAL_MS ?? '',
+      10,
+    ) || 30_000;
+    const agentStartTime = Date.now();
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+    const onOutput = eventBus
+      ? (params: { stream: 'stdout' | 'stderr'; text: string }) => {
+          // R5-live: stdout-only. stderr is not emitted as role.output
+          // (it may contain secrets, raw error traces, or chain-of-thought).
+          if (params.stream !== 'stdout') return;
+          const message = params.text.slice(0, 120);
+          void eventBus.emit({
+            kind: 'role.output',
+            phase: rolePhase,
+            level: 'info',
+            message,
+            role: input.role,
+            payload: { text: params.text, stream: 'stdout' },
+          });
+        }
+      : undefined;
+
+    if (eventBus) {
+      heartbeatTimer = setInterval(() => {
+        const elapsedMs = Date.now() - agentStartTime;
+        const elapsedSec = Math.floor(elapsedMs / 1000);
+        void eventBus.emit({
+          kind: 'role.heartbeat',
+          phase: rolePhase,
+          level: 'debug',
+          message: `${input.role} still running (${elapsedSec}s)`,
+          role: input.role,
+          payload: { elapsed_ms: elapsedMs },
+        });
+      }, heartbeatIntervalMs);
+      if (typeof heartbeatTimer.unref === 'function') {
+        heartbeatTimer.unref();
+      }
+    }
+
+    let processResult;
+    try {
+      processResult = await runProcess(
+        {
+          argv,
+          cwd: resolvedRoot,
+          timeout_ms: input.timeout_seconds * 1000,
+          stdout_path: stdoutPath,
+          stderr_path: stderrPath,
+          signal: input.signal,
+          env: processEnv,
+          delete_env: deleteEnv,
+          onOutput,
+        },
+        resolvedRoot,
+      );
+    } finally {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = undefined;
+      }
+    }
 
     // Step 6: Check exit status
     if (processResult.status === 'timeout') {

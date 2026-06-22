@@ -1,171 +1,87 @@
 ---
 schema_version: 1
-run_id: "20260622115414-tpkvk3"
+run_id: "20260622140859-x6oc72"
 author_role: "planner"
 ---
 
-# Phase 9 Observability Gap Fill — R6 Integration Events + Task-Graph Worker Details
+# Phase 9 R5-Live — Real-Time Agent Output Streaming
 
 ## Requirement Understanding
 
-The user wants to close two observability gaps in the Phase 9 event stream for
-the task-graph (parallel wave) path:
+While a planner / developer / auditor / final-auditor agent runs (3–10 minutes typical), the review-loop event stream is silent. The operator sees `role.started` and then nothing until `role.exited`. The dashboard shows "Developer is running iteration 1/3" but cannot show *what* the developer is doing. Phase 9 R1–R4 already defined the event kinds `role.output` and `role.heartbeat` in `ReviewLoopEventKind` (`src/runtime/event-store.ts:27`) but emit points are zero.
 
-1. **Emit `integration.*` events.** `ReviewLoopEventKind` already defines
-   `integration.started`, `integration.completed`, and `integration.blocked`
-   (`src/runtime/event-store.ts:40-42`), but nothing emits them. They are dead
-   code. The task-graph integration phase runs inside
-   `src/orchestrator/task-graph-wave-loop.ts` (it calls `buildIntegrationPlan`
-   → `runIntegrationMerge` → `runIntegrationAudit` → `runIntegrationFinalization`).
-   We must emit:
-   - `integration.started` with payload `{ integration_branch, task_count }` when the integration phase begins.
-   - `integration.completed` with payload `{ integration_branch }` when the whole integration+audit+finalization succeeds.
-   - `integration.blocked` with payload `{ error }` at every blocked return point in the integration phase (excluded-tasks, merge-blocked, audit-blocked, finalization-blocked).
-   - All emits must be fail-soft (must not change scheduling state).
+R5-Live adds the emit points and the UI consumption:
 
-2. **Add worker details to `task.*` events.** `task-graph-wave-loop.ts` already
-   emits `task.started` (lines 151-159) and `task.completed`/`task.blocked`
-   (lines 186-195). The `task.completed` payload has `worker_branch` but is
-   missing `worktree_path`. The `task.started` event is missing `provider` and
-   `model`. We must:
-   - Add `provider` (and `model` when configured) to `task.started`, reading from `config.agents.developer` (mirroring the `role.started` pattern at `run-orchestrator.ts:1300`).
-   - Add `worktree_path` to the `task.completed` and `task.blocked` payloads. The data already exists as `RunTaskInWorktreeResult.worktreePath` (`task-graph-worktree-runner.ts:47`) and is returned to the wave-loop — no type change needed for that field.
+1. **Filter** — a pure `filterAgentOutput(raw)` strips chain-of-thought (`<thinking>`, `<antThinking>` blocks), raw tool-call JSON lines (`{"type":"tool_use"…` / `{"type":"tool_result"…`), and truncates to 500 chars. Hard constraint: spec line 96 — the UI must not expose raw chain-of-thought.
+2. **Plumb** — `runProcess` gains an optional `onOutput` callback that fires with filtered, throttled text. `runAgent` gains an optional `eventBus` and wires `onOutput` → `role.output` events, plus a 30 s `setInterval` → `role.heartbeat`. The orchestrator threads its existing `eventBus` into the four `build*Input` → `runAgent` call sites.
+3. **Render** — dashboard gets a Live Output `<pre>` panel (500-line FIFO, auto-scroll, XSS-safe). `status --watch` text mode shows the latest `role.output` preview and a heartbeat age indicator.
 
-### Explicit non-goals (from user)
-- Do NOT touch the serial path (`run-orchestrator.ts`) integration logic.
-- Do NOT change the event schema core fields (`integration.*` are already defined in `ReviewLoopEventKind`).
-- Do NOT change `review-loop.yaml`.
-- Do NOT do R11 next-action or R5/R12 artifact refs (handled elsewhere).
+Transcripts on disk remain complete and unfiltered — the filter is observer-only.
 
 ## Current Project Status
 
-### What exists
-- `src/runtime/event-store.ts` — `EventStore` (append-only JSONL) + `ReviewLoopEventKind` enum including `integration.started|completed|blocked` (lines 40-42). `EventDraft` supports `provider`, `model`, `task_id`, `wave_index`, `payload` (lines 93-108).
-- `src/runtime/event-bus.ts` — `IEventBus` interface + `EventBus` class with fail-soft `emit()` (lines 48-77) and `EventBus.createNull()` for tests (lines 92-99).
-- `src/orchestrator/task-graph-wave-loop.ts` — the wave-loop. Already has `eventBus: IEventBus` in params (line 68) and emits `wave.started|completed` (lines 130-137), `task.started` (lines 151-159), `task.completed|blocked` (lines 186-195). The integration phase spans lines 263-407 (plan → merge → audit → finalize).
-- `src/orchestrator/task-graph-worktree-runner.ts` — `RunTaskInWorktreeResult` already includes `worktreePath: string` (line 47). The wave-loop's `runTask` callback receives this result (line 161-174) but only reads `result.branch` and `result.error` when building the event payload (line 194).
-- `src/orchestrator/integration-runner.ts` / `integration-finalizer.ts` — the R1/R3 integration modules. They do NOT take `eventBus` (the user noted this). We will NOT thread `eventBus` through them — see Technical Approach.
-- `src/types.ts` — `AgentConfig` (lines 446-450) has `command`, `timeout_seconds`, `provider?`. No `model?` field.
-- `tests/integration/task-graph-parallel-wave.test.ts` — existing happy-path wave test using `fake-agent.mjs`. Pattern: create test repo, run orchestrator with `parallel: true`, assert on `.agent/events.jsonl` via `EventStore.readAll()`.
-- `tests/integration/orchestrator-events.test.ts` — existing event-stream assertion patterns (lines 92-118).
-
-### What's missing
-- No `integration.*` emits anywhere (dead code in the enum).
-- `task.started` has no `provider`/`model`.
-- `task.completed`/`task.blocked` payload has no `worktree_path`.
-- `AgentConfig` has no `model?` field (needed to source `model` for `task.started`).
+- Branch `main`, clean tree, base commit `c9952d41c71e03b0bd50e8a06184972ef675e4a3`.
+- `EventBus` / `EventStore` / `IEventBus` already exist (`src/runtime/event-bus.ts`, `src/runtime/event-store.ts`). `role.output` and `role.heartbeat` are already in `ReviewLoopEventKind` but never emitted.
+- `runProcess` (`src/runtime/process-runner.ts:269`) writes stdout/stderr through `StreamRedactor` to file via the `onData` closure at line 397. No callback surface today.
+- `runAgent` (`src/agents/agent-adapter.ts:118`) calls `runProcess` at line 270 with no event hook. Signature: `runAgent(input, projectRoot)`.
+- `AgentRunInput` (`src/types.ts:144`) has no `eventBus` field. Four `build*Input` helpers (`planner-adapter.ts:25`, `developer-adapter.ts:29`, `auditor-adapter.ts:31`, `final-auditor-adapter.ts:33`) construct it.
+- Orchestrator creates `eventBus` at `run-orchestrator.ts:249` (resume) and `:627` (fresh), then calls `runAgent` at lines `:751`, `:1328`, `:1770`, `:2672` without passing it.
+- Dashboard (`src/web/dashboard-html.ts`) polls `/api/events` on SSE signal and renders `snapshot.latest_events` as a table. No live-output panel. XSS-safe (`textContent` / `createTextNode` only).
+- `renderTextSummary` (`src/cli/status.ts:183`) prints run / phase / active role / latest 6 events / artifacts. No `Output:` preview line, no heartbeat age.
+- Tests use `vitest`. Existing `tests/unit/dashboard-html.test.ts` asserts structural anchors and XSS safety — the new panel must keep those assertions green.
 
 ## Technical Approach
 
-### Decision: emit `integration.*` from the wave-loop, not from runner/finalizer
+**Filtering.** A single pure function `filterAgentOutput(raw: string): string` in a new `src/runtime/output-filter.ts`. Implementation: (1) regex-strip `<thinking>[\s\S]*?</thinking>` and `<antThinking>[\s\S]*?</antThinking>` non-greedily across newlines; (2) split on `\n`, drop lines whose trimmed leading token starts with `{"type":"tool_use"` or `{"type":"tool_result"`, rejoin with `\n`; (3) if the result length > 500, slice to 500 and append `…`; (4) return `""` when empty. Pure, synchronous, no I/O — trivially testable.
 
-The user's hint ("integration-runner.ts 和 integration-finalizer.ts 目前可能没有 eventBus 参数——需要传入") is conditional. After grepping the integration phase boundaries, the wave-loop is the single orchestrator of the integration phase and already holds `eventBus`. It sees every blocked/passed return point:
+**Throttled callback in process-runner.** Add `onOutput?: (p: { stream: 'stdout' | 'stderr'; text: string }) => void` to `ProcessRunnerInput`. Inside `onData` (line 397), after the existing file-write block, when `input.onOutput` is set: decode the sanitized `Buffer` to UTF-8, run `filterAgentOutput`, and if non-empty push into a per-stream accumulator. A `setInterval(500)` (created lazily on first chunk, cleared in `cleanup`) flushes the accumulator by calling `onOutput`. If the accumulator exceeds 2000 chars before the tick, flush immediately. The redactor-stripped bytes are what we decode, so secrets already redacted in the file are also redacted in events. `runProcessRaw` is not modified (it has no redactor and is used for non-agent subprocesses).
 
-| Blocked point | Location in wave-loop | Emit |
-| --- | --- | --- |
-| Integration phase start | After `buildIntegrationPlan` (line 268), before excluded-tasks check | `integration.started` |
-| Excluded-tasks block | Lines 269-320 (early return) | `integration.blocked` |
-| Merge blocked | Lines 330-370 (early return) | `integration.blocked` |
-| Audit blocked | `mapIntegrationAuditResult` lines 452-499 | `integration.blocked` |
-| Finalization blocked | `mapIntegrationAuditResult` lines 521-560 | `integration.blocked` |
-| Finalization passed | `mapIntegrationAuditResult` end (lines 562-587) | `integration.completed` |
+**eventBus on AgentRunInput.** Add `eventBus?: IEventBus` to `AgentRunInput` (`src/types.ts:144`) and to each of the four `build*Input` param shapes. `runAgent` reads `input.eventBus`. When present:
+- Pass an `onOutput` callback to `runProcess` that emits `role.output` (`level: 'info'`, `message: text.slice(0, 120)`, `payload: { text, stream }`). The emit is fire-and-forget (fail-soft — `EventBus.emit` already swallows persistence errors).
+- Before awaiting `runProcess`, start `setInterval(30_000)` that emits `role.heartbeat` (`level: 'debug'`, `message: '${role} still running (${elapsed}s)'`, `payload: { elapsed_ms }`).
+- In a `finally` after `runProcess` returns (or throws), `clearInterval` both the heartbeat interval and any throttle timer still pending inside `runProcess` (the timer is owned by `runProcess` and cleared in its own `cleanup`; `runAgent` only needs to clear its own heartbeat interval).
 
-Threading `eventBus` into `integration-runner.ts` and `integration-finalizer.ts` would expand the blast radius (3 module signatures + their callers + their unit tests) for no observability gain — the wave-loop already has the branch/error context at each return point. **We emit from the wave-loop.** This keeps the change atomic and the blast radius small.
+The `phase` and `provider` fields for the emit come from existing context: `runAgent` knows `input.role` but not the phase or provider. Two options: (a) add `phase` and `provider` optional fields to `AgentRunInput` and have each `build*Input` set them, or (b) have `runAgent` derive phase from role (`planner` → `PLANNING`, `developer` → `DEVELOPING`, `auditor` → `AUDITING`, `final-auditor` → `FINALIZING`) and leave `provider` unset. Option (b) is less invasive and matches how `role.started` events already set phase explicitly at the orchestrator call site. The orchestrator already emits `role.started` with the correct phase and provider right before calling `runAgent` (lines `:731`, `:1295`, `:1750`, and the final-auditor equivalent), so the `role.output` events just need to carry the same `role` — downstream consumers can join on role + recency. Go with option (b): `runAgent` derives phase from role, `provider` is omitted on `role.output` / `role.heartbeat` (the preceding `role.started` carries it).
 
-### `integration.started` emit point
+**Orchestrator threading.** Four call sites: pass `eventBus` into `buildPlannerInput({ …, eventBus })` etc. Each `build*Input` forwards it to the constructed `AgentRunInput`. No other orchestrator changes.
 
-Emit immediately after `buildIntegrationPlan` succeeds (around line 268), before the excluded-tasks check. At that point we know:
-- `integration_branch` = `integrationPlan.integration_branch` (always `integration/{run_id}`).
-- `task_count` = `integrationPlan.tasks.length` (selected/non-excluded tasks).
+**Dashboard panel.** Add `<section><h2>Live Output</h2><pre id="live-output" aria-live="polite"></pre></section>` after the events table section. In `render(snapshot)`, filter `snapshot.latest_events` for `kind === 'role.output'`, slice the last 500, and for each append a child `<div>` with `[ts] role: text` via `createTextNode`. Track `liveOutputEl.scrollTop + liveOutputEl.clientHeight < liveOutputEl.scrollHeight - 32` before the append; if false (i.e., user is at the bottom), set `scrollTop = scrollHeight` after the append. For `role.heartbeat`, find the most recent one in `latest_events`; if it exists and no `role.exited` for the same role is newer, render `Last heartbeat: Ns ago` next to the active role in the header. The `N` is `Math.round((Date.now() - new Date(ev.ts).getTime()) / 1000)`. XSS safety is preserved because we only ever call `createTextNode` / `textContent`.
 
-If excluded_tasks > 0, we still emit `integration.started` then immediately `integration.blocked` — that reflects reality.
+**status.ts.** In `renderTextSummary`, after the `Active:` line, scan `recent` (last 6 events) for the most recent `role.output`; if found, print `Output: <message or payload.text sliced to 120>`. For heartbeat: if the most recent `role.heartbeat` is newer than the most recent `role.exited` for the same role, append `Heartbeat: Ns ago` to the `Active:` line. No JSON-mode changes.
 
-### `integration.completed` emit point
-
-Emit at the end of `mapIntegrationAuditResult` when `finalization.status === 'passed'`, right before the final `return` (around line 571). Payload: `{ integration_branch: integrationAuditResult.integration_branch }`.
-
-### `integration.blocked` emit points
-
-At each of the 4 blocked return points listed above. Payload: `{ integration_branch, error: <message> }` where `<message>` is the existing error message string used in `makeResult`/`makeBlockedResult` at that point.
-
-### Fail-soft pattern
-
-All emits use the existing `void eventBus.emit({...}).catch(() => { /* fail-soft */ })` pattern (mirroring lines 131-137). Emit failures must not change scheduling state — `eventBus.emit` already swallows persistence errors internally (`event-bus.ts:52-64`), but we add `.catch()` at the call site too for defense-in-depth.
-
-### `task.started` provider/model
-
-At lines 151-159, add:
-```ts
-provider: config.agents.developer.provider ?? 'claude',
-model: config.agents.developer.model,  // undefined if not configured → omitted from JSON
-```
-This mirrors `role.started` at `run-orchestrator.ts:1300`. Requires adding `model?: string` to `AgentConfig` in `src/types.ts:446-450`.
-
-### `task.completed`/`task.blocked` worktree_path
-
-At lines 186-195, change the payload to include `worktree_path: result.worktreePath`. The `result` variable (line 161) is `RunTaskInWorktreeResult` which has `worktreePath: string` (line 47 of worktree-runner). No type change needed.
-
-### Tests
-
-1. **Happy-path integration event test** — new test file `tests/integration/task-graph-integration-events.test.ts` (or extend `task-graph-parallel-wave.test.ts`). Runs a 3-task parallel wave with `fake-agent` 'task-success'. Asserts via `EventStore.readAll()`:
-   - `integration.started` exists with `payload.integration_branch === 'integration/{run_id}'` and `payload.task_count === 3`.
-   - `integration.completed` exists with `payload.integration_branch === 'integration/{run_id}'`.
-   - `integration.started` seq < `integration.completed` seq.
-   - `task.started` events (3) each have `provider` field (string).
-   - `task.completed` events (3) each have `payload.worktree_path` (non-empty string).
-   - `run.completed` is the last event.
-
-2. **Task-fail / no-spurious-integration-events test** — runs a task-graph where one task fails. Asserts:
-   - No `integration.*` events emitted (integration phase never reached).
-   - `task.blocked` event has `payload.worktree_path`.
-
-3. **`integration.blocked` stretch goal** — a cherry-pick conflict scenario is complex to fixture (fake-agent behavior is per-role, not per-task). The emit code is symmetric to `integration.completed` and will be covered by code review. If a conflict fixture is straightforward, add it; otherwise note as follow-up.
-
-### Build/test
-- TypeScript build: `npm run build` (or `tsc --noEmit`).
-- Tests: `npm test` (vitest). The new test file is picked up automatically.
+**Integration test.** A fake-agent Node script writes `<thinking>secret</thinking>\nEditing src/foo.ts\n{"type":"tool_use","name":"edit"}\n` to stdout over ~1.5 s (with small sleeps to exercise the throttle), then exits 0. Spawn via `runAgent` with a real `EventBus` pointed at a temp `.agent` dir. After exit, read `.agent/events.jsonl`, parse each line, assert: ≥1 `role.output` exists; its `payload.text` contains `Editing src/foo.ts`; no event payload or message contains the substring `secret`; no event payload or message contains `tool_use`; ≥1 `role.heartbeat` exists (use a 100 ms interval via an injected `heartbeatIntervalMs` option on `AgentRunInput`, or use vitest fake timers — the latter is cleaner because it avoids adding a production option solely for tests). The on-disk `stdout_path` file still contains `<thinking>secret</thinking>` and the JSON line (filter is observer-only).
 
 ## Work Breakdown
 
-### Task 1: Emit `integration.*` events in wave-loop + integration event test
-- Modify `src/orchestrator/task-graph-wave-loop.ts`:
-  - After `buildIntegrationPlan` (line 268): emit `integration.started` with `{ integration_branch, task_count }`.
-  - At the 4 blocked return points (excluded-tasks, merge-blocked, audit-blocked, finalization-blocked): emit `integration.blocked` with `{ integration_branch, error }` (fail-soft).
-  - At the finalization-passed return (end of `mapIntegrationAuditResult`): emit `integration.completed` with `{ integration_branch }` (fail-soft).
-- Add test in `tests/integration/task-graph-integration-events.test.ts`:
-  - Happy path: assert `integration.started` + `integration.completed` present with correct payload.
-  - Task-fail path: assert no `integration.*` events.
+Three tasks. Per `docs/superpowers/agent-task-planning-guidelines.md`, the runtime + adapter + orchestrator chain is one atomic task — splitting it would leave the repo in a non-compiling state between tasks because `eventBus` flows through `AgentRunInput` → `build*Input` → `runAgent` → `runProcess` and the orchestrator call sites.
 
-### Task 2: Add `provider`/`model` to `task.started` + `worktree_path` to `task.completed`/`task.blocked`
-- Modify `src/types.ts`: add `model?: string` to `AgentConfig` (line 446-450).
-- Modify `src/orchestrator/task-graph-wave-loop.ts`:
-  - `task.started` emit (lines 151-159): add `provider: config.agents.developer.provider ?? 'claude'` and `model: config.agents.developer.model`.
-  - `task.completed`/`task.blocked` emit (lines 186-195): add `worktree_path: result.worktreePath` to payload.
-- Add/extend test to assert `provider` on `task.started` and `worktree_path` on `task.completed`/`task.blocked`.
+### Task 1 — `output-filter.ts` + unit tests (low risk, low difficulty)
 
-### Task 3: Full-suite verification
-- Run `npm test` to ensure no regressions across all existing tests (especially `task-graph-parallel-wave.test.ts`, `orchestrator-events.test.ts`, `integration-runner.test.ts`, `integration-finalizer.test.ts`).
+- **Scope**: `src/runtime/output-filter.ts` (NEW), `tests/unit/output-filter.test.ts` (NEW).
+- **Verify**: `npm test -- tests/unit/output-filter.test.ts` passes; `npm run typecheck` passes.
+- **Independently buildable**: yes. No other source file imports the filter yet.
+
+### Task 2 — Runtime + adapter + orchestrator wiring + integration test (high risk, high difficulty, atomic)
+
+- **Scope**: `src/runtime/process-runner.ts`, `src/types.ts`, `src/agents/agent-adapter.ts`, `src/agents/planner-adapter.ts`, `src/agents/developer-adapter.ts`, `src/agents/auditor-adapter.ts`, `src/agents/final-auditor-adapter.ts`, `src/orchestrator/run-orchestrator.ts`, `tests/unit/process-runner-output.test.ts` (NEW), `tests/integration/agent-output-events.test.ts` (NEW).
+- **Verify**: `npm test` passes (incl. pre-existing tests); `npm run typecheck` passes.
+- **Depends on**: task-1 (imports `filterAgentOutput`).
+- **Why atomic**: `eventBus` is added to `AgentRunInput`, consumed by `runAgent`, set by all four `build*Input`, and passed by the orchestrator. Any subset leaves either a type error (`build*Input` references a field that doesn't exist) or a dead code path (field exists, never populated). The integration test exercises the whole chain end-to-end.
+
+### Task 3 — Dashboard Live Output panel + status text preview + unit test (medium risk, low difficulty)
+
+- **Scope**: `src/web/dashboard-html.ts`, `src/cli/status.ts`, `tests/unit/dashboard-html.test.ts`.
+- **Verify**: `npm test -- tests/unit/dashboard-html.test.ts` passes; `npm run typecheck` passes.
+- **Depends on**: nothing hard. The panel reads `role.output` events from `snapshot.latest_events`; even with zero such events the dashboard renders normally. Can be developed in parallel with task-2.
+- **Why split**: the dashboard and status CLI are pure consumers of the event kind string. They compile and test independently of the runtime wiring. Keeping them in a separate task keeps each Developer context short.
 
 ## Risks
 
-1. **`integration.blocked` test coverage.** A dedicated cherry-pick-conflict test is complex to fixture (fake-agent behavior is per-role). The emit code is symmetric to `integration.completed` and will be covered by the happy-path test (for `started`/`completed`) plus code review. Risk: low — the emit logic is a 3-line `void eventBus.emit(...).catch(() => {})` at each blocked return, identical to the existing `wave.*` emit pattern.
-
-2. **`task_count` semantics.** The user said "task_count" without specifying total vs selected. We'll use `integrationPlan.tasks.length` (selected count). If the reviewer wants total, it's a 1-character change. Risk: low.
-
-3. **`model` field on `AgentConfig`.** Adding `model?: string` is backward-compatible (optional). Existing configs without `model` continue to work; the `task.started` event will omit `model` (undefined). Risk: low.
-
-4. **Event ordering in wave mode.** Concurrent workers emit `task.*` events in parallel. `EventStore` already serializes appends via `appendChain` (lines 119-180 of event-store.ts) so seq values are monotonic. `integration.*` events are emitted from the single wave-loop coroutine after all workers finish — no concurrency. Risk: low.
-
-5. **Fail-soft invariant.** The user requires `integration.*` emits to not affect scheduling. The `eventBus.emit` already swallows persistence errors (`event-bus.ts:52-64`). We add `.catch(() => {})` at each call site for defense-in-depth. Risk: low.
-
-6. **Not threading `eventBus` into `integration-runner.ts`/`integration-finalizer.ts`.** The user's hint suggested this might be needed. We deliberately don't, because the wave-loop is the integration-phase orchestrator and already has `eventBus`. If a future requirement asks for finer-grained events inside R1/R3 (e.g., per-cherry-pick events), we'd thread it then. Risk: low — documented as a design choice.
-
-```ReviewLoopRequest
-type: risk_note
-origin_agent: planner
-priority: medium
-message: integration.blocked emit is not covered by a dedicated integration test; relies on code symmetry with integration.completed and the existing integration-runner.test.ts conflict test.
-target: planner
-question: Should we add a dedicated cherry-pick-conflict integration test that asserts integration.blocked is emitted at the wave-loop level, or accept code-symmetry coverage for this round?
-blocking: false
-```
+1. **Thinking-block regex across chunk boundaries.** `filterAgentOutput` is called per-chunk inside `onData`. A `<thinking>` block split across two `onData` chunks would not be matched by the per-chunk regex. **Mitigation**: the throttle in `runProcess` accumulates chunks for 500 ms before flushing, so `filterAgentOutput` runs on the *accumulated* buffer, not on each raw chunk. This dramatically reduces (but does not eliminate) the split-block risk. A truly robust solution would carry a `pending` buffer in the filter itself and only emit text once any open `<thinking>` is closed. **Recommendation**: make `filterAgentOutput` stateless per the spec (pure function), but document in code that callers should pass accumulated buffers, not raw chunks. The integration test writes the whole thinking block in one `process.stdout.write` call to avoid flakiness. If a split-block leak is observed in dogfooding, follow-up task adds stateful filtering.
+2. **Throttle timer lifecycle.** The 500 ms `setInterval` inside `runProcess` must be `clearInterval`-ed in *every* exit path: success, failure, timeout, cancel, child error, cleanup. The existing `cleanup` closure is the right place. Forgetting one path leaks a timer that fires after the process is gone, calling `onOutput` with stale data. **Mitigation**: clear the timer at the top of `cleanup` (which is already idempotent via `cleanupDone`).
+3. **`role.output` event volume.** Even at 1 event / 500 ms / role, a 10-minute developer run emits 1200 events. `events.jsonl` grows fast. **Mitigation**: spec accepts this (events are observability-only and archived per run). Operator can truncate archived runs. Follow-up: consider a "summary" mode that drops `role.output` from the persisted stream after N minutes.
+4. **Heartbeat interval leak on forced kill.** If the orchestrator's `AbortSignal` fires and `runProcess` resolves as `CANCELLED`, the `finally` in `runAgent` must still `clearInterval` the heartbeat. **Mitigation**: wrap the `runProcess` await in `try { … } finally { clearInterval(heartbeatTimer); }`. Verified by a unit test path that cancels mid-run.
+5. **Dashboard XSS via role.output text.** Agent stdout may contain `<script>` or other HTML. **Mitigation**: the panel uses `createTextNode` exclusively. The existing `dashboard-html.test.ts` assertion `expect(html).not.toContain('innerHTML')` guards regression. Add a new assertion that the live-output render path uses `createTextNode`.
+6. **SSE snapshot staleness.** The dashboard pulls a fresh snapshot on SSE signal, but `latest_events` may be capped (e.g., last 50). If `role.output` events flood the stream, the panel may miss older lines. **Mitigation**: the panel is a FIFO of the last 500 *role.output* lines, not the last 500 events. If `latest_events` itself is capped below 500, the panel shows whatever is available. Follow-up: raise the `latest_events` cap or add a dedicated `latest_output` field to the snapshot. Out of scope for R5-Live.
+7. **Fake-agent test flakiness on CI.** The integration test uses real `setInterval` and `setTimeout` for the throttle. Under load, a 500 ms tick may fire at 600 ms and the test's assertion "exactly 1 event per 500 ms" becomes flaky. **Mitigation**: assert *at least 1* `role.output` event and *at most* `ceil(duration_ms / 500) + 1`, not exact counts. Use vitest fake timers for the heartbeat assertion (deterministic).
+8. **`runProcessRaw` divergence.** `runProcessRaw` (line 538) duplicates much of `runProcess` but is not modified. If a future task adds `onOutput` to `runProcessRaw`, the throttle logic must be duplicated or extracted. **Mitigation**: leave a `// TODO: extract throttle when runProcessRaw needs onOutput` comment is *not* added (per the no-comments rule). Instead, the throttle helper is a private function inside `process-runner.ts` that both could call later. For R5-Live, only `runProcess` uses it.

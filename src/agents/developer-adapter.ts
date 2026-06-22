@@ -19,6 +19,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { parseHandoff } from '../artifacts/artifact-schemas.js';
 import { computeDigest, type Digest } from '../runtime/digest.js';
 import type { AgentRunInput, HandoffFrontMatter, HandoffStatus } from '../types.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 
 /** Developer expected artifacts (relative to project root). */
 const DEVELOPER_ARTIFACTS = ['.agent/developer-handoff.md'];
@@ -37,6 +38,7 @@ export function buildDeveloperInput(params: {
   prompt: string;
   prompt_file?: string;
   signal?: AbortSignal;
+  eventBus?: IEventBus;
 }): AgentRunInput {
   return {
     role: 'developer',
@@ -50,6 +52,7 @@ export function buildDeveloperInput(params: {
     timeout_seconds: params.timeout_seconds,
     command_template: params.command_template,
     signal: params.signal,
+    eventBus: params.eventBus,
   };
 }
 
