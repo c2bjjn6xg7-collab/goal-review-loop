@@ -148,6 +148,7 @@ export async function runTaskGraphWaveLoop(
         taskStatus: 'running',
         lastEvent: `Wave ${context.waveIndex + 1} batch ${context.batchIndex + 1}: starting ${task.id}`,
       });
+      const developerAgent = config.agents.developer;
       await eventBus.emit({
         kind: 'task.started',
         phase: 'DEVELOPING',
@@ -155,7 +156,12 @@ export async function runTaskGraphWaveLoop(
         message: `Wave ${context.waveIndex + 1}: starting ${task.id}`,
         task_id: task.id,
         wave_index: context.waveIndex,
-        payload: { task_index: taskIndex, batch_index: context.batchIndex },
+        provider: developerAgent.provider ?? 'claude',
+        model: developerAgent.model,
+        payload: {
+          task_index: taskIndex,
+          batch_index: context.batchIndex,
+        },
       });
 
       const result = await runTaskInWorktree({
@@ -191,7 +197,11 @@ export async function runTaskGraphWaveLoop(
         task_id: task.id,
         wave_index: context.waveIndex,
         status,
-        payload: { worker_branch: result.branch ?? null, error: result.error ?? null },
+        payload: {
+          worker_branch: result.branch ?? null,
+          error: result.error ?? null,
+          worktree_path: result.worktreePath,
+        },
       });
       await appendLog(
         artifactStore,
@@ -266,6 +276,17 @@ export async function runTaskGraphWaveLoop(
     baseCommit,
     taskGraph,
   });
+  const integrationBranch = integrationPlan.integration_branch;
+  void eventBus.emit({
+    kind: 'integration.started',
+    phase: 'DEVELOPING',
+    level: 'info',
+    message: `Integration phase started for ${integrationBranch}`,
+    payload: {
+      integration_branch: integrationBranch,
+      task_count: integrationPlan.tasks.length,
+    },
+  }).catch(() => { /* fail-soft */ });
   if (integrationPlan.excluded_tasks.length > 0) {
     const integrationArtifacts = await writeIntegrationPlanEvidence({
       projectRoot,
@@ -296,6 +317,18 @@ export async function runTaskGraphWaveLoop(
       lastEvent: 'Integration planning BLOCKED by excluded task-run result(s)',
       registry: orchestratorRegistry,
     });
+    void eventBus.emit({
+      kind: 'integration.blocked',
+      phase: 'DEVELOPING',
+      level: 'warn',
+      message: 'Integration blocked: excluded task-run result(s)',
+      payload: {
+        integration_branch: integrationBranch,
+        error: 'excluded task-run result(s)',
+        reason: 'excluded_tasks',
+        excluded_task_count: integrationPlan.excluded_tasks.length,
+      },
+    }).catch(() => { /* fail-soft */ });
     return makeResult(
       runId,
       PhaseEnum.BLOCKED,
@@ -346,6 +379,17 @@ export async function runTaskGraphWaveLoop(
       registry: orchestratorRegistry,
     });
     const message = integrationResult.error_message ?? 'Phase 8E R1 integration merge BLOCKED';
+    void eventBus.emit({
+      kind: 'integration.blocked',
+      phase: 'DEVELOPING',
+      level: 'warn',
+      message: `Integration merge blocked: ${message}`,
+      payload: {
+        integration_branch: integrationResult.integration_branch,
+        error: message,
+        reason: 'merge_blocked',
+      },
+    }).catch(() => { /* fail-soft */ });
     return makeResult(
       runId,
       PhaseEnum.BLOCKED,
@@ -402,6 +446,7 @@ export async function runTaskGraphWaveLoop(
       noCommit,
       tag,
       iteration: tasks.length + 2,
+      eventBus,
     })),
   );
 }
@@ -422,6 +467,7 @@ async function mapIntegrationAuditResult(params: {
   noCommit: boolean;
   tag: boolean;
   iteration: number;
+  eventBus: IEventBus;
 }): Promise<Parameters<typeof makeResult>> {
   const {
     projectRoot,
@@ -439,6 +485,7 @@ async function mapIntegrationAuditResult(params: {
     noCommit,
     tag,
     iteration,
+    eventBus,
   } = params;
   registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
   const artifactPaths = uniquePaths([
@@ -475,6 +522,17 @@ async function mapIntegrationAuditResult(params: {
       registry: orchestratorRegistry,
       finalAuditDecision: integrationAuditResult.audit_decision,
     });
+    void eventBus.emit({
+      kind: 'integration.blocked',
+      phase: 'FINALIZING',
+      level: 'warn',
+      message: `Integration audit blocked: ${message}`,
+      payload: {
+        integration_branch: integrationAuditResult.integration_branch,
+        error: message,
+        reason: 'audit_blocked',
+      },
+    }).catch(() => { /* fail-soft */ });
     return [
       runId,
       PhaseEnum.BLOCKED,
@@ -536,6 +594,17 @@ async function mapIntegrationAuditResult(params: {
       registry: orchestratorRegistry,
       finalAuditDecision: 'PASS',
     });
+    void eventBus.emit({
+      kind: 'integration.blocked',
+      phase: 'FINALIZING',
+      level: 'warn',
+      message: `Integration finalization blocked: ${message}`,
+      payload: {
+        integration_branch: integrationAuditResult.integration_branch,
+        error: message,
+        reason: 'finalization_blocked',
+      },
+    }).catch(() => { /* fail-soft */ });
     return [
       runId,
       PhaseEnum.BLOCKED,
@@ -567,6 +636,16 @@ async function mapIntegrationAuditResult(params: {
     commitSha: finalization.final_commit_sha,
     finalAuditDecision: 'PASS',
   });
+
+  void eventBus.emit({
+    kind: 'integration.completed',
+    phase: 'FINALIZING',
+    level: 'info',
+    message: `Integration completed on ${integrationAuditResult.integration_branch}`,
+    payload: {
+      integration_branch: integrationAuditResult.integration_branch,
+    },
+  }).catch(() => { /* fail-soft */ });
 
   return [
     runId,
