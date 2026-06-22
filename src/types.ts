@@ -447,6 +447,7 @@ export interface AgentConfig {
   command: string[];
   timeout_seconds: number;
   provider?: string;
+  model?: string;
 }
 
 /**
