@@ -920,13 +920,15 @@ function buildFinalAuditContext(params: {
 async function snapshotBusinessDigests(
   projectRoot: string,
   changedFiles: string[],
-): Promise<Map<string, Digest>> {
-  const digests = new Map<string, Digest>();
+): Promise<Map<string, Digest | null>> {
+  const digests = new Map<string, Digest | null>();
   for (const filePath of changedFiles) {
     if (filePath.startsWith('.agent/')) continue;
     const fullPath = path.join(projectRoot, filePath);
     if (existsSync(fullPath)) {
       digests.set(filePath, await computeFileDigest(fullPath));
+    } else {
+      digests.set(filePath, null);
     }
   }
   return digests;
@@ -936,11 +938,17 @@ async function findFinalAuditBusinessViolations(params: {
   projectRoot: string;
   baseCommit: string;
   iteration: number;
-  preFinalAuditBusinessDigests: Map<string, Digest>;
+  preFinalAuditBusinessDigests: Map<string, Digest | null>;
 }): Promise<string[]> {
   const violations: string[] = [];
   for (const [filePath, preDigest] of params.preFinalAuditBusinessDigests) {
     const fullPath = path.join(params.projectRoot, filePath);
+    if (preDigest === null) {
+      if (existsSync(fullPath)) {
+        violations.push(`${filePath} (recreated by final auditor)`);
+      }
+      continue;
+    }
     if (!existsSync(fullPath)) {
       violations.push(`${filePath} (deleted by final auditor)`);
       continue;

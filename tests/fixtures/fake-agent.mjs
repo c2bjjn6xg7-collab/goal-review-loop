@@ -707,6 +707,11 @@ try {
         case 'exit-error':
           process.exit(1);
           break;
+        case 'provider-quota':
+          // Simulate a provider-side quota exhaustion failure.
+          console.error('Error: You have run out of credits. Billing limit reached. Please upgrade your plan.');
+          process.exit(1);
+          break;
         default:
           writeCompletedHandoff();
       }

@@ -135,6 +135,7 @@ export async function validateAuditorOutput(
   const orchestratorManagedFiles = new Set([
     join(projectRoot, '.agent', 'progress.json'),
     join(projectRoot, '.agent', 'progress.md'),
+    join(projectRoot, '.agent', 'events.jsonl'),
   ]);
 
   function isOrchestratorManaged(filePath: string): boolean {

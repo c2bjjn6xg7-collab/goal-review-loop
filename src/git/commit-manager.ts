@@ -120,6 +120,53 @@ export const VERSIONED_ARTIFACT_PATHS = [
   '.agent/final-audit.md',
 ];
 
+const VERSIONED_ARTIFACT_SET = new Set<string>(VERSIONED_ARTIFACT_PATHS);
+
+/**
+ * Phase 8E R3: versioned `.agent` artifacts that the integration finalizer may
+ * force-add into the final project commit. `.agent/**` is ignored by
+ * `.gitignore`, so these artifacts only enter the commit through `git add -f`.
+ * `.agent/task-runs/**` is intentionally NOT listed.
+ */
+export const INTEGRATION_VERSIONED_ARTIFACT_PATHS = [
+  '.agent/GOAL.md',
+  '.agent/plan.md',
+  '.agent/task-graph.json',
+  '.agent/task-results.json',
+  '.agent/final-audit.md',
+  '.agent/integration/integration-plan.json',
+  '.agent/integration/cherry-pick-log.jsonl',
+  '.agent/integration/integrated-diff-metadata.json',
+  '.agent/integration/changed-files.json',
+  '.agent/integration/untracked-files.json',
+  '.agent/integration/diff-metadata.json',
+  '.agent/integration/scope-report.json',
+  '.agent/integration/verification-manifest.json',
+  '.agent/integration/final-audit-context.json',
+] as const;
+
+/**
+ * Phase 8E R3: optional versioned `.agent` artifacts that may be force-added
+ * when present (e.g. only written when integration had conflicts or excluded
+ * tasks). Filtered by existence before staging.
+ */
+export const OPTIONAL_INTEGRATION_VERSIONED_ARTIFACT_PATHS = [
+  '.agent/integration/conflict-report.md',
+  '.agent/integration/excluded-tasks.md',
+] as const;
+
+const INTEGRATION_ALLOWLIST = new Set<string>([
+  ...INTEGRATION_VERSIONED_ARTIFACT_PATHS,
+  ...OPTIONAL_INTEGRATION_VERSIONED_ARTIFACT_PATHS,
+]);
+
+/**
+ * Whether a path is an allowlisted Phase 8E R3 versioned `.agent` artifact.
+ */
+export function isIntegrationVersionedArtifact(filePath: string): boolean {
+  return INTEGRATION_ALLOWLIST.has(filePath);
+}
+
 /**
  * Check if a path is a local-only artifact.
  */
@@ -146,7 +193,24 @@ export async function stageFiles(
 
   // Stage each file individually for precise control
   for (const filePath of paths) {
-    const result = await runGit(['add', '--', filePath], projectRoot);
+    if (isLocalOnlyPath(filePath)) {
+      return {
+        success: false,
+        error: `Refusing to stage local-only runtime artifact: ${filePath}`,
+      };
+    }
+
+    if (filePath.startsWith('.agent/') && !VERSIONED_ARTIFACT_SET.has(filePath)) {
+      return {
+        success: false,
+        error: `Refusing to stage non-versioned .agent path: ${filePath}`,
+      };
+    }
+
+    const args = VERSIONED_ARTIFACT_SET.has(filePath)
+      ? ['add', '-f', '--', filePath]
+      : ['add', '--', filePath];
+    const result = await runGit(args, projectRoot);
     if (result.exit_code !== 0) {
       return {
         success: false,
@@ -156,6 +220,93 @@ export async function stageFiles(
   }
 
   return { success: true };
+}
+
+/**
+ * A single staged path with its force mode. Phase 8E R3 finalization uses this
+ * to stage business files with plain `git add` and allowlisted ignored `.agent`
+ * artifacts with `git add -f`.
+ */
+export interface StageEntry {
+  path: string;
+  /**
+   * When true, the path is staged with `git add -f`. Force mode is permitted
+   * ONLY for allowlisted Phase 8E R3 versioned `.agent` artifacts; requesting
+   * force for any other path is rejected before git is invoked.
+   */
+  force: boolean;
+}
+
+/**
+ * Stage files with precise pathspecs and controlled force-add.
+ *
+ * Rules (Phase 8E R3 §8.3):
+ * - `git add -A` / `git add .` are NEVER used; each path is staged individually.
+ * - Business files (non-`.agent`) stage with `git add -- <path>`.
+ * - Allowlisted ignored `.agent` artifacts stage with `git add -f -- <path>`.
+ * - Non-allowlisted `.agent` paths (including `.agent/task-runs/**` and
+ *   `.agent/state.json`) are rejected before git is invoked.
+ * - Local-only runtime artifacts (e.g. `node_modules/**`, `dist/**`) are rejected.
+ * - `force: true` is rejected for any path that is not an allowlisted `.agent`
+ *   artifact.
+ *
+ * Callers MUST verify the final staged set with `findStagedSetViolations()`.
+ */
+export async function stageFilesControlled(
+  projectRoot: string,
+  entries: StageEntry[],
+): Promise<{ success: boolean; error?: string }> {
+  if (entries.length === 0) {
+    return { success: true };
+  }
+
+  for (const entry of entries) {
+    const validationError = validateControlledStageEntry(entry);
+    if (validationError) {
+      return { success: false, error: validationError };
+    }
+  }
+
+  for (const entry of entries) {
+    const filePath = entry.path;
+    const isAllowlistedArtifact = isIntegrationVersionedArtifact(filePath);
+    // Allowlisted `.agent` artifacts are gitignored, so they always require -f.
+    const useForce = entry.force || isAllowlistedArtifact;
+    const args = useForce
+      ? ['add', '-f', '--', filePath]
+      : ['add', '--', filePath];
+
+    const result = await runGit(args, projectRoot);
+    if (result.exit_code !== 0) {
+      return {
+        success: false,
+        error: `git add failed for ${filePath}: ${result.stderr}`,
+      };
+    }
+  }
+
+  return { success: true };
+}
+
+function validateControlledStageEntry(entry: StageEntry): string | null {
+  const filePath = entry.path;
+
+  if (isLocalOnlyPath(filePath)) {
+    return `Refusing to stage local-only runtime artifact: ${filePath}`;
+  }
+
+  const isAgentPath = filePath.startsWith('.agent/');
+  const isAllowlistedArtifact = isIntegrationVersionedArtifact(filePath);
+
+  if (isAgentPath && !isAllowlistedArtifact) {
+    return `Refusing to stage non-allowlisted .agent path: ${filePath}`;
+  }
+
+  if (entry.force && !isAllowlistedArtifact) {
+    return `Force-add is only permitted for allowlisted .agent artifacts: ${filePath}`;
+  }
+
+  return null;
 }
 
 /**

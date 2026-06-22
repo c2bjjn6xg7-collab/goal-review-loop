@@ -9,6 +9,7 @@ import {
 } from '../scheduler/wave-executor.js';
 import { orderedTasks, initialTaskAttempts, initialTaskStatuses } from '../scheduler/task-graph.js';
 import { runTaskInWorktree } from './task-graph-worktree-runner.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 import {
   loadTaskResults,
   upsertTaskResult,
@@ -32,7 +33,8 @@ import {
   runIntegrationMerge,
   writeIntegrationPlanEvidence,
 } from './integration-runner.js';
-import { integrationAuditSkipReason, runIntegrationAudit } from './integration-audit.js';
+import { runIntegrationAudit } from './integration-audit.js';
+import { runIntegrationFinalization } from './integration-finalizer.js';
 import {
   Phase as PhaseEnum,
   TaskStatus,
@@ -61,6 +63,9 @@ export interface TaskGraphWaveLoopParams {
   maxIterations: number;
   maxParallelWorkers: number;
   combinedSignal: AbortSignal;
+  noCommit: boolean;
+  tag: boolean;
+  eventBus: IEventBus;
 }
 
 export async function runTaskGraphWaveLoop(
@@ -83,6 +88,9 @@ export async function runTaskGraphWaveLoop(
     maxIterations,
     maxParallelWorkers,
     combinedSignal,
+    noCommit,
+    tag,
+    eventBus,
   } = params;
 
   const tasks = orderedTasks(taskGraph);
@@ -113,6 +121,21 @@ export async function runTaskGraphWaveLoop(
     tasks,
     trackedFiles,
     maxParallelWorkers,
+    onEvent: (event) => {
+      // The runner (runTask below) emits task.started/completed/blocked with
+      // richer data (worker_branch, error, batch_index). To avoid double
+      // emission of task events, this bridge only forwards wave-level
+      // lifecycle events. Task-level events come from the runner.
+      if (event.type !== 'wave-start' && event.type !== 'wave-finish') return;
+      const kind = event.type === 'wave-start' ? 'wave.started' : 'wave.completed';
+      void eventBus.emit({
+        kind,
+        phase: 'DEVELOPING',
+        level: 'info',
+        message: `wave ${event.waveIndex + 1} ${event.type === 'wave-start' ? 'started' : 'completed'}`,
+        wave_index: event.waveIndex,
+      }).catch(() => { /* fail-soft */ });
+    },
     runTask: async (task, context): Promise<WaveTaskRunnerResult> => {
       const taskIndex = taskIndexById.get(task.id) ?? 0;
       startedAtByTask.set(task.id, new Date().toISOString());
@@ -124,6 +147,15 @@ export async function runTaskGraphWaveLoop(
         taskIndex,
         taskStatus: 'running',
         lastEvent: `Wave ${context.waveIndex + 1} batch ${context.batchIndex + 1}: starting ${task.id}`,
+      });
+      await eventBus.emit({
+        kind: 'task.started',
+        phase: 'DEVELOPING',
+        level: 'info',
+        message: `Wave ${context.waveIndex + 1}: starting ${task.id}`,
+        task_id: task.id,
+        wave_index: context.waveIndex,
+        payload: { task_index: taskIndex, batch_index: context.batchIndex },
       });
 
       const result = await runTaskInWorktree({
@@ -150,6 +182,16 @@ export async function runTaskGraphWaveLoop(
         taskIndex,
         taskStatus: status === TaskStatus.PASSED ? 'passed' : 'failed',
         lastEvent: `Wave ${context.waveIndex + 1} batch ${context.batchIndex + 1}: ${task.id} ${status}`,
+      });
+      await eventBus.emit({
+        kind: status === TaskStatus.PASSED ? 'task.completed' : 'task.blocked',
+        phase: 'DEVELOPING',
+        level: status === TaskStatus.PASSED ? 'info' : 'warn',
+        message: `Wave ${context.waveIndex + 1}: ${task.id} ${status}`,
+        task_id: task.id,
+        wave_index: context.waveIndex,
+        status,
+        payload: { worker_branch: result.branch ?? null, error: result.error ?? null },
       });
       await appendLog(
         artifactStore,
@@ -348,12 +390,17 @@ export async function runTaskGraphWaveLoop(
       projectRoot,
       agentDir,
       runId,
+      baseCommit,
+      goalDigest,
       stateStore,
       artifactStore,
       orchestratorRegistry,
       taskResultsPath,
       integrationResult,
       integrationAuditResult,
+      config,
+      noCommit,
+      tag,
       iteration: tasks.length + 2,
     })),
   );
@@ -363,24 +410,34 @@ async function mapIntegrationAuditResult(params: {
   projectRoot: string;
   agentDir: string;
   runId: string;
+  baseCommit: string;
+  goalDigest: string;
   stateStore: StateStore;
   artifactStore: ArtifactStore;
   orchestratorRegistry: OrchestratorFileRegistry;
   taskResultsPath: string;
   integrationResult: Awaited<ReturnType<typeof runIntegrationMerge>>;
   integrationAuditResult: Awaited<ReturnType<typeof runIntegrationAudit>>;
+  config: ReviewLoopConfig;
+  noCommit: boolean;
+  tag: boolean;
   iteration: number;
 }): Promise<Parameters<typeof makeResult>> {
   const {
     projectRoot,
     agentDir,
     runId,
+    baseCommit,
+    goalDigest,
     stateStore,
     artifactStore,
     orchestratorRegistry,
     taskResultsPath,
     integrationResult,
     integrationAuditResult,
+    config,
+    noCommit,
+    tag,
     iteration,
   } = params;
   registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
@@ -441,31 +498,91 @@ async function mapIntegrationAuditResult(params: {
     ];
   }
 
-  await stateStore.transition(PhaseEnum.PASSED);
+  // R2 PASS → run Phase 8E R3 finalization (commit/tag). R3 owns the
+  // FINALIZING → PASSED/BLOCKED transition; the wave loop only maps the result.
+  const finalization = await runIntegrationFinalization({
+    projectRoot,
+    agentDir,
+    runId,
+    baseCommit,
+    goalDigest,
+    integrationBranch: integrationAuditResult.integration_branch,
+    iteration,
+    stateStore,
+    artifactStore,
+    orchestratorRegistry,
+    config,
+    tag,
+    noCommit,
+  });
+
+  registerDirectoryFiles(integrationArtifactDir(projectRoot), orchestratorRegistry);
+
+  if (finalization.status === 'blocked') {
+    const message = finalization.error_message ?? 'Phase 8E R3 finalization BLOCKED';
+    await appendLog(
+      artifactStore,
+      runId,
+      iteration,
+      'FINALIZING',
+      'integration finalization',
+      'BLOCKED',
+      message,
+    );
+    await emitProgress({
+      projectRoot,
+      stateStore,
+      lastEvent: 'Phase 8E R3 finalization BLOCKED',
+      registry: orchestratorRegistry,
+      finalAuditDecision: 'PASS',
+    });
+    return [
+      runId,
+      PhaseEnum.BLOCKED,
+      3,
+      integrationAuditResult.integration_branch,
+      'PASS',
+      uniquePaths([...artifactPaths, ...finalization.artifact_paths]),
+      'Resolve Phase 8E R3 finalization blocker, then resume',
+      message,
+      {
+        code: finalization.error_code ?? 'GIT_COMMIT_ERROR',
+        message,
+        resumable: true,
+        suggested_action: 'Review .agent/integration evidence and retry Phase 8E R3 finalization.',
+      },
+      finalization.final_commit_sha,
+      false,
+      finalization.tag_name,
+      finalization.tag_created,
+      null,
+    ];
+  }
+
   await emitProgress({
     projectRoot,
     stateStore,
-    lastEvent: `Phase 8E R2 integrated audit PASSED: ${integrationAuditResult.integration_branch}`,
+    lastEvent: `Phase 8E R3 finalization PASSED: ${integrationAuditResult.integration_branch}`,
     registry: orchestratorRegistry,
+    commitSha: finalization.final_commit_sha,
     finalAuditDecision: 'PASS',
   });
 
-  const skipReason = integrationAuditSkipReason();
   return [
     runId,
     PhaseEnum.PASSED,
     0,
     integrationAuditResult.integration_branch,
     'PASS',
-    artifactPaths,
-    'Run Phase 8E R3 final commit/tag slice when ready',
-    `Parallel wave task execution PASSED. Phase 8E R2 verified and Final Aggregate Audited integration branch ${integrationAuditResult.integration_branch}; final project commit/tag are deferred to R3.`,
+    uniquePaths([...artifactPaths, ...finalization.artifact_paths]),
+    `Phase 8E R3 finalized integration branch ${integrationAuditResult.integration_branch}`,
+    `Parallel wave task execution PASSED. Phase 8E R2 verified and Final Aggregate Audited; Phase 8E R3 created the final project commit ${finalization.final_commit_sha?.slice(0, 8) ?? ''} on ${integrationAuditResult.integration_branch}.`,
     null,
-    null,
-    true,
-    null,
-    false,
-    skipReason,
+    finalization.final_commit_sha,
+    finalization.commit_skipped,
+    finalization.tag_name,
+    finalization.tag_created,
+    finalization.skip_reason,
   ];
 }
 

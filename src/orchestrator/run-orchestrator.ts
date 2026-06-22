@@ -20,6 +20,10 @@ import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
 import { runTaskGraphLoop } from './task-graph-loop.js';
 import { runTaskGraphWaveLoop } from './task-graph-wave-loop.js';
+import {
+  R3_FINALIZATION_BLOCKED_MARKER,
+  runIntegrationFinalization,
+} from './integration-finalizer.js';
 import { resolveTaskGraphResumeDecision } from './task-graph-resume.js';
 import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
@@ -64,6 +68,10 @@ import { parseFinalAudit } from '../artifacts/artifact-schemas.js';
 import { buildProgressData, writeProgress, writeProgressMarkdown } from '../runtime/progress-writer.js';
 import { buildTranscriptEntry, writeTranscript } from '../runtime/transcript-writer.js';
 import { emitPermissionWarnings } from '../providers/permission-guard.js';
+import { EventBus } from '../runtime/event-bus.js';
+import type { IEventBus } from '../runtime/event-bus.js';
+import type { EventDraft } from '../runtime/event-store.js';
+import { classifyProviderFailure } from '../runtime/provider-failure.js';
 import { buildReworkInstructions, writeReworkInstructions, buildReworkFindingsFromScope, buildReworkFindingsFromVerification, buildReworkFindingsFromAudit } from './rework-instructions.js';
 import { validateCancelRequest } from '../artifacts/json-schemas.js';
 import type {
@@ -145,6 +153,10 @@ export async function runOrchestrator(params: {
   let lockManager: LockManager | null = null;
   let stateStore: StateStore | null = null;
   let runId = ''; // Declared at function scope so finally block can access it
+  // Phase 9 R1: observability event stream. Starts as a null bus; replaced
+  // with a real EventBus once runId is known (fresh run at line ~605, resume
+  // at line ~239). Emission is fail-soft and never affects scheduling.
+  let eventBus: IEventBus = EventBus.createNull();
 
   // F-402: Create AbortController for SIGTERM handling.
   // When SIGTERM is received, we write cancel-request.json and abort the signal,
@@ -233,11 +245,21 @@ export async function runOrchestrator(params: {
       // Acquire lock for the resumed run
       lockManager = new LockManager(agentDir);
       runId = resume.run_id;
+      // Phase 9 R1: resume continues the same durable event stream.
+      eventBus = new EventBus(agentDir, runId);
       try {
         await lockManager.acquire(runId);
       } catch (err) {
         return makeBlockedResult(runId, projectRoot, `Lock acquisition failed on resume: ${err instanceof Error ? err.message : String(err)}`, 'STATE_CONFLICT');
       }
+      await eventBus.emit({
+        kind: 'run.resumed',
+        phase: resume.phase,
+        level: 'info',
+        message: `Resuming from ${resume.phase} at iteration ${resume.iteration}`,
+        status: resume.phase,
+        payload: { resume_iteration: resume.iteration, resume_branch: resume.branch },
+      });
 
       // Load existing state
       stateStore = new StateStore(agentDir);
@@ -250,7 +272,7 @@ export async function runOrchestrator(params: {
           encoding: 'utf8',
         }).trim();
         if (currentBranch !== resume.branch) {
-          await transitionToBlocked(stateStore, `Resume branch mismatch: current=${currentBranch}, expected=${resume.branch}`);
+          await transitionToBlocked(stateStore, `Resume branch mismatch: current=${currentBranch}, expected=${resume.branch}`, eventBus);
           return makeBlockedResult(runId, projectRoot, `Current Git branch (${currentBranch}) does not match state.branch (${resume.branch})`, 'STATE_CONFLICT');
         }
       } catch {
@@ -261,14 +283,14 @@ export async function runOrchestrator(params: {
       try {
         execSync(`git cat-file -t ${resume.base_commit}`, { cwd: projectRoot, encoding: 'utf8', stdio: 'pipe' });
       } catch {
-        await transitionToBlocked(stateStore, `base_commit ${resume.base_commit} no longer exists`);
+        await transitionToBlocked(stateStore, `base_commit ${resume.base_commit} no longer exists`, eventBus);
         return makeBlockedResult(runId, projectRoot, `base_commit ${resume.base_commit} no longer exists`, 'STATE_CONFLICT');
       }
 
       // Check GOAL.md digest matches
       const goalPath = join(agentDir, 'GOAL.md');
       if (!existsSync(goalPath)) {
-        await transitionToBlocked(stateStore, 'GOAL.md missing — cannot resume');
+        await transitionToBlocked(stateStore, 'GOAL.md missing — cannot resume', eventBus);
         return makeBlockedResult(runId, projectRoot, 'GOAL.md missing — cannot resume', 'ARTIFACT_ERROR');
       }
 
@@ -277,7 +299,7 @@ export async function runOrchestrator(params: {
           const goalContent = readFileSync(goalPath, 'utf8');
           const currentDigest = computeDigest(goalContent);
           if (currentDigest !== resume.goal_digest) {
-            await transitionToBlocked(stateStore, 'GOAL.md digest mismatch on resume');
+            await transitionToBlocked(stateStore, 'GOAL.md digest mismatch on resume', eventBus);
             return makeBlockedResult(runId, projectRoot, 'GOAL.md digest does not match state.goal_digest', 'STATE_CONFLICT');
           }
         } catch {
@@ -287,7 +309,7 @@ export async function runOrchestrator(params: {
 
       const goalValidation = validatePlannerOutput(projectRoot, runId);
       if (!goalValidation.valid) {
-        await transitionToBlocked(stateStore, `GOAL.md validation failed on resume: ${goalValidation.errors.join('; ')}`);
+        await transitionToBlocked(stateStore, `GOAL.md validation failed on resume: ${goalValidation.errors.join('; ')}`, eventBus);
         return makeBlockedResult(runId, projectRoot, `GOAL.md invalid on resume: ${goalValidation.errors.join('; ')}`, 'ARTIFACT_ERROR');
       }
 
@@ -311,7 +333,7 @@ export async function runOrchestrator(params: {
         registerDirectoryFiles(dir, orchestratorRegistry);
       }
       // Register key individual files
-      for (const f of ['state.json', 'run.lock', 'plan.md', 'GOAL.md', 'iteration-log.md', 'audit-report.md', 'rework-instructions.md', 'developer-handoff.md']) {
+      for (const f of ['state.json', 'run.lock', 'events.jsonl', 'plan.md', 'GOAL.md', 'iteration-log.md', 'audit-report.md', 'rework-instructions.md', 'developer-handoff.md']) {
         const fp = join(agentDir, f);
         if (existsSync(fp)) {
           try {
@@ -351,6 +373,157 @@ export async function runOrchestrator(params: {
           `${resumeDecision.kind} at index ${resumeDecision.taskIndex}${resumeDecision.taskId ? ` (${resumeDecision.taskId})` : ''}: ${resumeDecision.reason}`,
         );
         const resumeTaskIndex = resumeDecision.taskIndex;
+        const r2IntegrationBranch = readR2IntegrationBranch(projectRoot, runId);
+        const stateIntegrationBranch = tgState.branch === `integration/${runId}` ? tgState.branch : null;
+        const hasR3IntegrationBranch = Boolean(r2IntegrationBranch ?? stateIntegrationBranch);
+        const hasR3FinalizingResumeTarget = Boolean(
+          r2IntegrationBranch
+          ?? stateIntegrationBranch
+          ?? (parallelDecision.mode === 'wave' ? `integration/${runId}` : null),
+        );
+        const hasR3BlockedMarker =
+          typeof tgState.last_error === 'string'
+          && tgState.last_error.startsWith(R3_FINALIZATION_BLOCKED_MARKER);
+        const hasR3FinalCommitTagRetry = Boolean(tgState.final_commit_sha) && !tgState.tag_created;
+        const isR3BlockedResume =
+          resume.phase === PhaseEnum.BLOCKED
+          && resumeDecision.kind === 'all_tasks_complete'
+          && hasR3IntegrationBranch
+          && (hasR3BlockedMarker || hasR3FinalCommitTagRetry);
+        const isR3FinalizingResume =
+          resume.phase === PhaseEnum.FINALIZING
+          && resumeDecision.kind === 'all_tasks_complete'
+          && hasR3FinalizingResumeTarget;
+        if (isR3FinalizingResume || isR3BlockedResume) {
+          const finalizationIteration = resumeDecision.taskIndex + 1;
+          const integrationBranch = r2IntegrationBranch ?? stateIntegrationBranch;
+          if (integrationBranch) {
+            await appendLog(
+              artifactStore,
+              runId,
+              finalizationIteration,
+              'FINALIZING',
+              'task graph resume into R3 finalization',
+              'PASS',
+              `R2 integration evidence found — resuming Phase 8E R3 finalization on ${integrationBranch}`,
+            );
+            const finalization = await runIntegrationFinalization({
+              projectRoot,
+              agentDir,
+              runId,
+              baseCommit,
+              goalDigest,
+              integrationBranch,
+              iteration: finalizationIteration,
+              stateStore,
+              artifactStore,
+              orchestratorRegistry,
+              config,
+              tag: params.tag ?? config.git.create_tag,
+              noCommit: params.no_commit ?? !config.git.commit_on_pass,
+            });
+            registerDirectoryFiles(join(agentDir, 'integration'), orchestratorRegistry);
+            if (finalization.status === 'blocked') {
+              const message = finalization.error_message ?? 'Phase 8E R3 finalization BLOCKED';
+              return makeResult(
+                runId,
+                PhaseEnum.BLOCKED,
+                3,
+                integrationBranch,
+                'PASS',
+                finalization.artifact_paths,
+                'Resolve Phase 8E R3 finalization blocker, then resume',
+                message,
+                {
+                  code: finalization.error_code ?? 'GIT_COMMIT_ERROR',
+                  message,
+                  resumable: true,
+                  suggested_action: 'Review .agent/integration evidence and retry Phase 8E R3 finalization.',
+                },
+                finalization.final_commit_sha,
+                false,
+                finalization.tag_name,
+                finalization.tag_created,
+                null,
+              );
+            }
+            return makeResult(
+              runId,
+              PhaseEnum.PASSED,
+              0,
+              integrationBranch,
+              'PASS',
+              finalization.artifact_paths,
+              `Phase 8E R3 finalized integration branch ${integrationBranch}`,
+              finalization.final_commit_sha
+                ? `Phase 8E R3 finalization PASSED. Committed as ${finalization.final_commit_sha.slice(0, 8)}.`
+                : 'Phase 8E R3 finalization PASSED. Commit skipped.',
+              null,
+              finalization.final_commit_sha,
+              finalization.commit_skipped,
+              finalization.tag_name,
+              finalization.tag_created,
+              finalization.skip_reason,
+            );
+          }
+          if (parallelDecision.mode === 'wave' || stateIntegrationBranch) {
+            const message = 'R2 integration evidence missing or unreadable on Phase 8E R3 FINALIZING resume; refusing to rerun Final Aggregate Audit.';
+            await appendLog(
+              artifactStore,
+              runId,
+              finalizationIteration,
+              'FINALIZING',
+              'task graph resume into R3 finalization',
+              'FAIL',
+              message,
+            );
+            await transitionToBlocked(stateStore, message, eventBus);
+            return makeBlockedResult(
+              runId,
+              projectRoot,
+              message,
+              'STATE_CONFLICT',
+              currentBranch,
+            );
+          }
+        }
+        if (
+          resume.phase === PhaseEnum.BLOCKED
+          && tgState.final_commit_sha
+          && !tgState.tag_created
+          && resumeDecision.kind === 'all_tasks_complete'
+        ) {
+          const finalizationIteration = resumeDecision.taskIndex + 1;
+          await stateStore.forceTransitionForResume(PhaseEnum.FINALIZING);
+          await appendLog(
+            artifactStore,
+            runId,
+            finalizationIteration,
+            'FINALIZING',
+            'task graph tag retry',
+            'PASS',
+            'final commit exists and tag is incomplete — resuming serial finalization tag handling',
+          );
+          return await runFinalization({
+            projectRoot,
+            agentDir,
+            runId,
+            stateStore,
+            artifactStore,
+            config,
+            currentBranch,
+            baseCommit,
+            goalFm,
+            goalDigest,
+            diffDigest: tgState.audited_diff_digest ?? goalDigest,
+            iteration: finalizationIteration,
+            noCommit: params.no_commit ?? !config.git.commit_on_pass,
+            tag: params.tag ?? config.git.create_tag,
+            combinedSignal,
+            orchestratorRegistry,
+            eventBus,
+          });
+        }
         if (resume.phase === PhaseEnum.FINALIZING && resumeDecision.kind === 'all_tasks_complete') {
           const finalizationIteration = resumeDecision.taskIndex + 1;
           await appendLog(
@@ -379,6 +552,7 @@ export async function runOrchestrator(params: {
             tag: params.tag ?? config.git.create_tag,
             combinedSignal,
             orchestratorRegistry,
+            eventBus,
           });
         }
         // Phase 8B: a task-graph run may have BLOCKED on a failed task. BLOCKED has
@@ -406,6 +580,7 @@ export async function runOrchestrator(params: {
           noCommit: params.no_commit ?? !config.git.commit_on_pass,
           tag: params.tag ?? config.git.create_tag,
           resumeTaskIndex,
+          eventBus,
         });
       }
 
@@ -430,6 +605,7 @@ export async function runOrchestrator(params: {
         combinedSignal,
         noCommit: params.no_commit ?? !config.git.commit_on_pass,
         tag: params.tag ?? config.git.create_tag,
+        eventBus,
       });
     }
 
@@ -447,11 +623,20 @@ export async function runOrchestrator(params: {
     // 5. Acquire run lock
     lockManager = new LockManager(agentDir);
     runId = generateRunId();
+    // Phase 9 R1: create the durable event stream for this run.
+    eventBus = new EventBus(agentDir, runId);
     try {
       await lockManager.acquire(runId);
     } catch (err) {
       return makeBlockedResult(runId, projectRoot, `Lock acquisition failed: ${err instanceof Error ? err.message : String(err)}`, 'STATE_CONFLICT');
     }
+    await eventBus.emit({
+      kind: 'run.started',
+      phase: 'INITIALIZING',
+      level: 'info',
+      message: params.request ? `Run started: ${params.request.slice(0, 120)}` : 'Run started',
+      payload: { task_slug: params.task_slug, base_commit: baseCommit },
+    });
 
     // 6. Generate task_slug
     const taskSlug = params.task_slug || sanitizeSlug(params.request ?? 'resume');
@@ -481,6 +666,7 @@ export async function runOrchestrator(params: {
     const preRegistryFiles = [
       join(agentDir, 'state.json'),
       join(agentDir, 'run.lock'),
+      join(agentDir, 'events.jsonl'),
     ];
     for (const filePath of preRegistryFiles) {
       if (existsSync(filePath)) {
@@ -517,7 +703,7 @@ export async function runOrchestrator(params: {
       plannerPrompt = promptResult.prompt;
       plannerPromptFile = promptResult.prompt_file_path ?? undefined;
     } catch (err) {
-      await transitionToBlocked(stateStore, `Planner prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+      await transitionToBlocked(stateStore, `Planner prompt build failed: ${err instanceof Error ? err.message : String(err)}`, eventBus);
       return makeBlockedResult(runId, projectRoot, 'Planner prompt build failed', 'CONFIG_ERROR', originalBranch);
     }
 
@@ -532,6 +718,15 @@ export async function runOrchestrator(params: {
 
       // Phase 6 F-604: Emit progress at phase start
       await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Planner', registry: orchestratorRegistry });
+      await eventBus.emit({
+        kind: 'role.started',
+        phase: 'PLANNING',
+        level: 'info',
+        message: 'Planner starting',
+        role: 'planner',
+        provider: config.agents.planner.provider ?? 'claude',
+        artifact_refs: plannerPromptFile ? [{ type: 'prompt', path: plannerPromptFile }] : undefined,
+      });
 
       const plannerInput = buildPlannerInput({
         run_id: runId,
@@ -544,6 +739,17 @@ export async function runOrchestrator(params: {
       });
 
       plannerResult = { result: await runAgent(plannerInput, projectRoot), prePlannerSnapshot };
+      await eventBus.emit({
+        kind: 'role.exited',
+        phase: 'PLANNING',
+        level: plannerResult.result.status !== 'success' ? 'warn' : 'info',
+        message: `Planner exited (${plannerResult.result.status})`,
+        role: 'planner',
+        status: plannerResult.result.status,
+        exit_code: plannerResult.result.exit_code ?? undefined,
+        duration_ms: plannerResult.result.duration_ms ?? null,
+        provider: config.agents.planner.provider ?? 'claude',
+      });
     } finally {
       if (plannerPromptFile) plannerCleanupResult = await deletePromptFile(plannerPromptFile);
     }
@@ -556,7 +762,7 @@ export async function runOrchestrator(params: {
 
     // F-306R2: Prompt cleanup failure is a security boundary — must BLOCKED
     if (plannerCleanupResult && !plannerCleanupResult.success) {
-      await transitionToBlocked(stateStore, `Planner prompt cleanup failed: ${plannerCleanupResult.error}`);
+      await transitionToBlocked(stateStore, `Planner prompt cleanup failed: ${plannerCleanupResult.error}`, eventBus);
       return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${plannerCleanupResult.error}`, 'STATE_CONFLICT', originalBranch);
     }
 
@@ -572,7 +778,15 @@ export async function runOrchestrator(params: {
     }
 
     if (plannerResult.result.status !== 'success') {
-      await transitionToBlocked(stateStore, `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`);
+      await emitProviderFailureIfClassified({
+        eventBus,
+        stderrPath: plannerResult.result.stderr_path,
+        exitCode: plannerResult.result.exit_code,
+        provider: config.agents.planner.provider ?? 'claude',
+        role: 'planner',
+        phase: 'PLANNING',
+      });
+      await transitionToBlocked(stateStore, `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`, eventBus);
       await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'FAIL', plannerResult.result.error?.message);
       return makeResult(runId, PhaseEnum.BLOCKED, 3, originalBranch, null, [], 'Fix Planner configuration or check agent availability', `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`, plannerResult.result.error);
     }
@@ -580,7 +794,7 @@ export async function runOrchestrator(params: {
     // Validate Planner output
     const plannerValidation = validatePlannerOutput(projectRoot, runId);
     if (!plannerValidation.valid) {
-      await transitionToBlocked(stateStore, `Planner output validation failed: ${plannerValidation.errors.join('; ')}`);
+      await transitionToBlocked(stateStore, `Planner output validation failed: ${plannerValidation.errors.join('; ')}`, eventBus);
       await appendLog(artifactStore, runId, 0, 'PLANNING', 'GOAL validation', 'FAIL', plannerValidation.errors.join('; '));
       return makeBlockedResult(runId, projectRoot, `Planner output invalid: ${plannerValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', originalBranch);
     }
@@ -588,7 +802,7 @@ export async function runOrchestrator(params: {
     // Validate Planner workspace ownership — only plan.md and GOAL.md may change
     const plannerWorkspaceCheck = await validatePlannerWorkspaceOwnership(projectRoot, plannerResult.prePlannerSnapshot);
     if (!plannerWorkspaceCheck.valid) {
-      await transitionToBlocked(stateStore, `Planner workspace violation: ${plannerWorkspaceCheck.violations.join('; ')}`);
+      await transitionToBlocked(stateStore, `Planner workspace violation: ${plannerWorkspaceCheck.violations.join('; ')}`, eventBus);
       await appendLog(artifactStore, runId, 0, 'PLANNING', 'workspace ownership', 'FAIL', plannerWorkspaceCheck.violations.join('; '));
       return makeBlockedResult(runId, projectRoot, `Planner modified disallowed files: ${plannerWorkspaceCheck.violations.join('; ')}`, 'SCOPE_VIOLATION', originalBranch);
     }
@@ -653,7 +867,7 @@ export async function runOrchestrator(params: {
     );
 
     if (branchResult.status === 'error') {
-      await transitionToBlocked(stateStore, `Branch creation failed: ${branchResult.error?.message ?? 'unknown'}`);
+      await transitionToBlocked(stateStore, `Branch creation failed: ${branchResult.error?.message ?? 'unknown'}`, eventBus);
       return makeBlockedResult(runId, projectRoot, `Branch creation failed: ${branchResult.error?.message}`, 'STATE_CONFLICT', originalBranch);
     }
 
@@ -699,6 +913,9 @@ export async function runOrchestrator(params: {
           maxIterations: params.max_iterations ?? config.loop.max_iterations,
           maxParallelWorkers: parallelDecision.maxParallelWorkers,
           combinedSignal,
+          noCommit: params.no_commit ?? !config.git.commit_on_pass,
+          tag: params.tag ?? config.git.create_tag,
+          eventBus,
         });
       }
       return await runTaskGraphLoop({
@@ -720,6 +937,7 @@ export async function runOrchestrator(params: {
         noCommit: params.no_commit ?? !config.git.commit_on_pass,
         tag: params.tag ?? config.git.create_tag,
         resumeTaskIndex: undefined,
+        eventBus,
       });
     }
 
@@ -752,12 +970,13 @@ export async function runOrchestrator(params: {
       combinedSignal,
       noCommit: params.no_commit ?? !config.git.commit_on_pass,
       tag: params.tag ?? config.git.create_tag,
+      eventBus,
     });
 
   } catch (err) {
     if (stateStore) {
       try {
-        await transitionToBlocked(stateStore, `Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+        await transitionToBlocked(stateStore, `Unexpected error: ${err instanceof Error ? err.message : String(err)}`, eventBus);
       } catch { /* best effort */ }
     }
     return makeBlockedResult(
@@ -807,6 +1026,7 @@ interface IterationLoopParams {
   combinedSignal: AbortSignal;
   noCommit: boolean;
   tag: boolean;
+  eventBus: IEventBus;
 }
 
 /**
@@ -821,7 +1041,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     projectRoot, agentDir, runId, stateStore, artifactStore,
     orchestratorRegistry, config, currentBranch, baseCommit,
     goalFm, verificationCommands, goalDigest, maxIterations,
-    startIteration, resumePhase, combinedSignal,
+    startIteration, resumePhase, combinedSignal, eventBus,
   } = params;
 
   for (let iteration = startIteration; iteration <= maxIterations; iteration++) {
@@ -851,6 +1071,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         breakerState.phase, 'circuit breaker tripped', 'FAIL',
         `consecutive_failure_count=${count}/${max}`,
       );
+      await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Circuit breaker tripped: consecutive_failure_count=${count}/${max}`);
       return makeResult(
         runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
         'Consecutive failure limit reached',
@@ -886,7 +1107,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
         const idempotency = await artifactStore.verifyArchiveIdempotent(iteration - 1, preArchiveDigests);
         if (!idempotency.safe) {
-          await transitionToBlocked(stateStore, `Archive idempotency violation for iteration ${iteration - 1}: ${idempotency.reason}`);
+          await transitionToBlocked(stateStore, `Archive idempotency violation for iteration ${iteration - 1}: ${idempotency.reason}`, eventBus);
           return makeBlockedResult(
             runId, projectRoot,
             `Cannot safely archive iteration ${iteration - 1}: ${idempotency.reason}`,
@@ -1032,7 +1253,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
           developerPromptFile = promptResult.prompt_file_path ?? undefined;
         }
       } catch (err) {
-        await transitionToBlocked(stateStore, `Developer prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+        await transitionToBlocked(stateStore, `Developer prompt build failed: ${err instanceof Error ? err.message : String(err)}`, eventBus);
         return makeBlockedResult(runId, projectRoot, 'Developer prompt build failed', 'CONFIG_ERROR', currentBranch);
       }
 
@@ -1060,6 +1281,15 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         try {
           // Phase 6 F-604: Emit progress at phase start
           await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Developer (iter ${iteration}${developerAttempt > 0 ? ` retry ${developerAttempt}` : ''})`, registry: orchestratorRegistry });
+          await eventBus.emit({
+            kind: 'role.started',
+            phase: iteration === 1 ? 'DEVELOPING' : 'REWORKING',
+            level: 'info',
+            message: `Developer starting (iter ${iteration}${developerAttempt > 0 ? ` retry ${developerAttempt}` : ''})`,
+            role: 'developer',
+            provider: config.agents.developer.provider ?? 'claude',
+            artifact_refs: developerPromptFile ? [{ type: 'prompt', path: developerPromptFile }] : undefined,
+          });
 
           // Rebuild prompt file on retry (previous attempt's finally block deleted it)
           if (developerAttempt > 0) {
@@ -1100,18 +1330,29 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       }
 
       if (!developerResult) {
-        await transitionToBlocked(stateStore, 'Developer produced no result');
+        await transitionToBlocked(stateStore, 'Developer produced no result', eventBus);
         return makeBlockedResult(runId, projectRoot, 'Developer produced no result', 'AGENT_ERROR', currentBranch);
       }
 
       // Phase 6: Emit developer transcript and progress
       if (developerResult) {
         emitTranscript({ projectRoot, role: 'developer', iteration, runId, startedAt: new Date().toISOString(), result: developerResult, registry: orchestratorRegistry });
+        await eventBus.emit({
+          kind: 'role.exited',
+          phase: iteration === 1 ? 'DEVELOPING' : 'REWORKING',
+          level: developerResult.status !== 'success' ? 'warn' : 'info',
+          message: `Developer exited (${developerResult.status}, iter ${iteration})`,
+          role: 'developer',
+          status: developerResult.status,
+          exit_code: developerResult.exit_code ?? undefined,
+          duration_ms: developerResult.duration_ms ?? null,
+          provider: config.agents.developer.provider ?? 'claude',
+        });
       }
       await emitProgress({ projectRoot, stateStore, lastEvent: `Developer completed (iter ${iteration})`, registry: orchestratorRegistry });
 
       if (developerCleanupResult && !developerCleanupResult.success) {
-        await transitionToBlocked(stateStore, `Developer prompt cleanup failed: ${developerCleanupResult.error}`);
+        await transitionToBlocked(stateStore, `Developer prompt cleanup failed: ${developerCleanupResult.error}`, eventBus);
         return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${developerCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
       }
 
@@ -1127,7 +1368,15 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       }
 
       if (developerResult.status !== 'success') {
-        await transitionToBlocked(stateStore, `Developer failed: ${developerResult.error?.message ?? 'unknown'}`);
+        await emitProviderFailureIfClassified({
+          eventBus,
+          stderrPath: developerResult.stderr_path,
+          exitCode: developerResult.exit_code,
+          provider: config.agents.developer.provider ?? 'claude',
+          role: 'developer',
+          phase: iteration === 1 ? 'DEVELOPING' : 'REWORKING',
+        });
+        await transitionToBlocked(stateStore, `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, eventBus);
         await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'FAIL', developerResult.error?.message);
         return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Developer configuration or check agent availability', `Developer failed: ${developerResult.error?.message ?? 'unknown'}`, developerResult.error);
       }
@@ -1142,7 +1391,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (!registryVerification.valid) {
         const violationMsgs = registryVerification.violations.map(v => v.message).join('; ');
-        await transitionToBlocked(stateStore, `Developer tampered with system-protected paths: ${violationMsgs}`);
+        await transitionToBlocked(stateStore, `Developer tampered with system-protected paths: ${violationMsgs}`, eventBus);
         await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'system path integrity', 'FAIL', violationMsgs);
         return makeBlockedResult(
           runId, projectRoot,
@@ -1161,13 +1410,13 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       );
 
       if (!developerValidation.valid) {
-        await transitionToBlocked(stateStore, `Developer output validation failed: ${developerValidation.errors.join('; ')}`);
+        await transitionToBlocked(stateStore, `Developer output validation failed: ${developerValidation.errors.join('; ')}`, eventBus);
         await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'FAIL', developerValidation.errors.join('; '));
         return makeBlockedResult(runId, projectRoot, `Developer output invalid: ${developerValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', currentBranch);
       }
 
       if (developerValidation.isBlocked) {
-        await transitionToBlocked(stateStore, 'Developer reported BLOCKED');
+        await transitionToBlocked(stateStore, 'Developer reported BLOCKED', eventBus);
         await appendLog(artifactStore, runId, iteration, 'DEVELOPING', 'developer completed', 'BLOCKED', 'Developer reported BLOCKED');
         return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Resolve Developer BLOCKED issue and retry', 'Developer reported BLOCKED', null);
       }
@@ -1234,6 +1483,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Scope violation after ${maxIterations} iterations`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
           'Max iterations reached — scope violation persists',
@@ -1247,12 +1497,30 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
     await appendLog(artifactStore, runId, iteration, 'VERIFYING', 'scope result', 'PASS');
 
+    await eventBus.emit({
+      kind: 'verification.started',
+      phase: 'VERIFYING',
+      level: 'info',
+      message: `Verification starting (iter ${iteration})`,
+      payload: { command_ids: verificationCommands.map((c) => c.id) },
+    });
+    const verificationStartTs = Date.now();
     const verificationResult = await runVerification({
       commands: verificationCommands,
       projectRoot,
       runId,
       iteration,
       signal: combinedSignal,
+    });
+    await eventBus.emit({
+      kind: verificationResult.passed ? 'verification.completed' : 'verification.failed',
+      phase: 'VERIFYING',
+      level: verificationResult.passed ? 'info' : 'warn',
+      message: `Verification ${verificationResult.passed ? 'passed' : 'failed'} (iter ${iteration})`,
+      status: verificationResult.passed ? 'PASS' : 'FAIL',
+      duration_ms: Date.now() - verificationStartTs,
+      exit_code: verificationResult.passed ? 0 : 1,
+      artifact_refs: [{ type: 'verification-log', path: '.agent/verification/manifest.json' }],
     });
 
     // If verification was cancelled, transition to CANCELLED
@@ -1285,6 +1553,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Required verification failed after ${maxIterations} iterations: ${failedCmds.join(', ')}`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
           'Max iterations reached — required verification still fails',
@@ -1348,6 +1617,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Post-verification scope violation after ${maxIterations} iterations: ${deniedPaths}`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
           'Max iterations reached — post-verification scope violation persists',
@@ -1368,7 +1638,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       // Read the existing audit report to get the decision
       const auditReportPath = join(agentDir, 'audit-report.md');
       if (!existsSync(auditReportPath)) {
-        await transitionToBlocked(stateStore, 'Audit report not found on resume from FINALIZING');
+        await transitionToBlocked(stateStore, 'Audit report not found on resume from FINALIZING', eventBus);
         return makeBlockedResult(runId, projectRoot, 'Audit report not found on resume from FINALIZING', 'ARTIFACT_ERROR', currentBranch);
       }
       // The audit already passed, so proceed directly to finalization
@@ -1396,6 +1666,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         tag: params.tag ?? config.git.create_tag,
         combinedSignal,
         orchestratorRegistry,
+        eventBus,
       });
     }
 
@@ -1442,7 +1713,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       auditorPrompt = promptResult.prompt;
       auditorPromptFile = promptResult.prompt_file_path ?? undefined;
     } catch (err) {
-      await transitionToBlocked(stateStore, `Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+      await transitionToBlocked(stateStore, `Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`, eventBus);
       return makeBlockedResult(runId, projectRoot, 'Auditor prompt build failed', 'CONFIG_ERROR', currentBranch);
     }
 
@@ -1464,6 +1735,15 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     try {
       // Phase 6 F-604: Emit progress at phase start
       await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Auditor (iter ${iteration})`, registry: orchestratorRegistry });
+      await eventBus.emit({
+        kind: 'role.started',
+        phase: 'AUDITING',
+        level: 'info',
+        message: `Auditor starting (iter ${iteration})`,
+        role: 'auditor',
+        provider: config.agents.auditor.provider ?? 'codex',
+        artifact_refs: auditorPromptFile ? [{ type: 'prompt', path: auditorPromptFile }] : undefined,
+      });
       const auditorInput = buildAuditorInput({
         run_id: runId,
         iteration,
@@ -1476,6 +1756,17 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
       });
 
       auditorResult = await runAgent(auditorInput, projectRoot);
+      await eventBus.emit({
+        kind: 'role.exited',
+        phase: 'AUDITING',
+        level: auditorResult.status !== 'success' ? 'warn' : 'info',
+        message: `Auditor exited (${auditorResult.status}, iter ${iteration})`,
+        role: 'auditor',
+        status: auditorResult.status,
+        exit_code: auditorResult.exit_code ?? undefined,
+        duration_ms: auditorResult.duration_ms ?? null,
+        provider: config.agents.auditor.provider ?? 'codex',
+      });
     } finally {
       if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
     }
@@ -1487,7 +1778,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     await emitProgress({ projectRoot, stateStore, lastEvent: `Auditor completed (iter ${iteration})`, registry: orchestratorRegistry });
 
     if (auditorCleanupResult && !auditorCleanupResult.success) {
-      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`);
+      await transitionToBlocked(stateStore, `Auditor prompt cleanup failed: ${auditorCleanupResult.error}`, eventBus);
       return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${auditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
     }
 
@@ -1503,7 +1794,15 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     }
 
     if (auditorResult.status !== 'success') {
-      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`);
+      await emitProviderFailureIfClassified({
+        eventBus,
+        stderrPath: auditorResult.stderr_path,
+        exitCode: auditorResult.exit_code,
+        provider: config.agents.auditor.provider ?? 'codex',
+        role: 'auditor',
+        phase: 'AUDITING',
+      });
+      await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, eventBus);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditorResult.error?.message);
       return makeResult(runId, PhaseEnum.BLOCKED, 3, currentBranch, null, [], 'Fix Auditor configuration or check agent availability', `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, auditorResult.error);
     }
@@ -1536,6 +1835,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
         if (iteration >= maxIterations) {
           await stateStore.transition(PhaseEnum.FAILED);
+          await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Mechanical check failure after ${maxIterations} iterations: ${auditValidation.errors.join('; ')}`);
           return makeResult(
             runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
             'Max iterations reached — mechanical check overrides Auditor PASS',
@@ -1546,12 +1846,23 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
         continue;
       }
-      await transitionToBlocked(stateStore, `Auditor output validation failed: ${auditValidation.errors.join('; ')}`);
+      await transitionToBlocked(stateStore, `Auditor output validation failed: ${auditValidation.errors.join('; ')}`, eventBus);
       await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'FAIL', auditValidation.errors.join('; '));
       return makeBlockedResult(runId, projectRoot, `Auditor output invalid: ${auditValidation.errors.join('; ')}`, 'ARTIFACT_ERROR', currentBranch);
     }
 
     const decision = auditValidation.effectiveDecision ?? auditValidation.decision;
+
+    await eventBus.emit({
+      kind: 'audit.decision',
+      phase: 'AUDITING',
+      level: decision === 'PASS' ? 'info' : 'warn',
+      message: `Auditor decision: ${decision} (iter ${iteration})`,
+      role: 'auditor',
+      status: String(decision),
+      artifact_refs: [{ type: 'audit-report', path: '.agent/audit-report.md' }],
+      payload: { diff_digest: diffDigest },
+    });
 
     if (decision === 'PASS') {
       await stateStore.transition(PhaseEnum.FINALIZING);
@@ -1585,6 +1896,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         tag: params.tag ?? config.git.create_tag,
         combinedSignal,
         orchestratorRegistry,
+        eventBus,
       });
     }
 
@@ -1597,6 +1909,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
       if (iteration >= maxIterations) {
         await stateStore.transition(PhaseEnum.FAILED);
+        await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Auditor FAIL after ${maxIterations} iterations`);
         return makeResult(
           runId, PhaseEnum.FAILED, 2, currentBranch, 'FAIL', [],
           'Max iterations reached — Auditor still returns FAIL',
@@ -1609,7 +1922,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
     }
 
     // BLOCKED — no rework
-    await transitionToBlocked(stateStore, 'Auditor returned BLOCKED');
+    await transitionToBlocked(stateStore, 'Auditor returned BLOCKED', eventBus);
     await appendLog(artifactStore, runId, iteration, 'AUDITING', 'auditor completed', 'BLOCKED');
     return makeResult(
       runId, PhaseEnum.BLOCKED, 3, currentBranch, 'BLOCKED', [],
@@ -1621,6 +1934,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
 
   // If we exit the loop without returning, max iterations was reached
   await stateStore.transition(PhaseEnum.FAILED);
+  await emitRunTerminal(eventBus, PhaseEnum.FAILED, `Max iterations (${maxIterations}) reached without passing audit`);
   return makeResult(
     runId, PhaseEnum.FAILED, 2, currentBranch, null, [],
     `Max iterations (${maxIterations}) reached without passing audit`,
@@ -1890,10 +2204,19 @@ function sanitizeSlug(request: string): string {
   return `task-${hash.slice(0, 12)}`;
 }
 
-export async function transitionToBlocked(stateStore: StateStore, reason: string): Promise<void> {
+export async function transitionToBlocked(stateStore: StateStore, reason: string, eventBus?: IEventBus): Promise<void> {
   try {
     await stateStore.update(() => ({ last_error: reason }));
     await stateStore.transition(PhaseEnum.BLOCKED);
+    if (eventBus) {
+      await eventBus.emit({
+        kind: 'run.blocked',
+        phase: 'BLOCKED',
+        level: 'warn',
+        message: reason,
+        status: 'BLOCKED',
+      });
+    }
   } catch { /* best effort */ }
 }
 
@@ -1946,16 +2269,17 @@ export async function runFinalization(params: {
   tag: boolean;
   combinedSignal: AbortSignal;
   orchestratorRegistry: OrchestratorFileRegistry;
+  eventBus: IEventBus;
 }): Promise<OrchestratorResult> {
   const {
     projectRoot, agentDir, runId, stateStore, artifactStore, config,
     currentBranch, baseCommit, goalFm, goalDigest, iteration,
-    noCommit, tag, combinedSignal, orchestratorRegistry,
+    noCommit, tag, combinedSignal, orchestratorRegistry, eventBus,
   } = params;
 
   // §6.5: Reject git.push: true
   if (config.git.push) {
-    await transitionToBlocked(stateStore, 'git.push is not supported in Phase 5');
+    await transitionToBlocked(stateStore, 'git.push is not supported in Phase 5', eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       'git.push is not supported in Phase 5. Remove git.push: true from configuration.',
@@ -2118,6 +2442,7 @@ export async function runFinalization(params: {
       await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
 
       const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
+      await emitRunTerminal(eventBus, PhaseEnum.PASSED, `Finalization PASSED. Commit ${existingCommitSha.slice(0, 8)} already exists.`, { artifact_refs: artifactPaths.map((p) => ({ type: 'state', path: p })) });
       return makeResult(
         runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
         artifactPaths,
@@ -2146,7 +2471,7 @@ export async function runFinalization(params: {
 
   if (!finalScopeResult.passed) {
     const deniedPaths = finalScopeResult.report.denied.map(d => d.path).join(', ');
-    await transitionToBlocked(stateStore, `Pre-commit scope violation: ${deniedPaths}`);
+    await transitionToBlocked(stateStore, `Pre-commit scope violation: ${deniedPaths}`, eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       `Pre-commit scope violation: ${deniedPaths}`,
@@ -2165,7 +2490,7 @@ export async function runFinalization(params: {
       verificationManifestDigest = computeDigest(manifestContent);
 
       if (manifest.run_id !== runId) {
-        await transitionToBlocked(stateStore, `Verification manifest run_id "${manifest.run_id}" does not match current run "${runId}"`);
+        await transitionToBlocked(stateStore, `Verification manifest run_id "${manifest.run_id}" does not match current run "${runId}"`, eventBus);
         return makeBlockedResult(
           runId, projectRoot,
           `Verification manifest run_id mismatch: expected ${runId}, got ${manifest.run_id}`,
@@ -2174,7 +2499,7 @@ export async function runFinalization(params: {
         );
       }
       if (manifest.iteration !== iteration) {
-        await transitionToBlocked(stateStore, `Verification manifest iteration ${manifest.iteration} does not match current iteration ${iteration}`);
+        await transitionToBlocked(stateStore, `Verification manifest iteration ${manifest.iteration} does not match current iteration ${iteration}`, eventBus);
         return makeBlockedResult(
           runId, projectRoot,
           `Verification manifest iteration mismatch: expected ${iteration}, got ${manifest.iteration}`,
@@ -2183,7 +2508,7 @@ export async function runFinalization(params: {
         );
       }
       if (!manifest.passed) {
-        await transitionToBlocked(stateStore, 'Verification manifest shows not passed');
+        await transitionToBlocked(stateStore, 'Verification manifest shows not passed', eventBus);
         return makeBlockedResult(
           runId, projectRoot,
           'Verification manifest shows not passed — cannot commit',
@@ -2192,7 +2517,7 @@ export async function runFinalization(params: {
         );
       }
     } catch {
-      await transitionToBlocked(stateStore, 'Cannot parse verification manifest');
+      await transitionToBlocked(stateStore, 'Cannot parse verification manifest', eventBus);
       return makeBlockedResult(
         runId, projectRoot,
         'Cannot parse verification manifest for pre-commit check',
@@ -2201,7 +2526,7 @@ export async function runFinalization(params: {
       );
     }
   } else {
-    await transitionToBlocked(stateStore, 'Verification manifest not found');
+    await transitionToBlocked(stateStore, 'Verification manifest not found', eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       'Verification manifest not found — cannot verify pre-commit',
@@ -2222,7 +2547,7 @@ export async function runFinalization(params: {
   // §6.1 step 5: Check for tracked local-only artifacts
   const trackedLocalOnly = await findTrackedLocalOnlyArtifacts(projectRoot);
   if (trackedLocalOnly.length > 0) {
-    await transitionToBlocked(stateStore, `Local-only artifacts are tracked by git: ${trackedLocalOnly.join(', ')}`);
+    await transitionToBlocked(stateStore, `Local-only artifacts are tracked by git: ${trackedLocalOnly.join(', ')}`, eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       `Local-only artifacts are tracked by git: ${trackedLocalOnly.join(', ')}. Remove them from git tracking before committing.`,
@@ -2267,6 +2592,14 @@ export async function runFinalization(params: {
   // §6.1 step 7: Run Final Auditor
   // Phase 6 F-604: Emit progress at phase start
   await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Final Auditor', registry: orchestratorRegistry });
+  await eventBus.emit({
+    kind: 'role.started',
+    phase: 'FINALIZING',
+    level: 'info',
+    message: 'Final Auditor starting',
+    role: 'final-auditor',
+    provider: config.agents.final_auditor.provider ?? 'codex',
+  });
   let finalAuditorPrompt: string;
   let finalAuditorPromptFile: string | undefined;
   try {
@@ -2301,7 +2634,7 @@ export async function runFinalization(params: {
     finalAuditorPrompt = promptResult.prompt;
     finalAuditorPromptFile = promptResult.prompt_file_path ?? undefined;
   } catch (err) {
-    await transitionToBlocked(stateStore, `Final Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`);
+    await transitionToBlocked(stateStore, `Final Auditor prompt build failed: ${err instanceof Error ? err.message : String(err)}`, eventBus);
     return makeBlockedResult(runId, projectRoot, 'Final Auditor prompt build failed', 'CONFIG_ERROR', currentBranch);
   }
 
@@ -2327,11 +2660,22 @@ export async function runFinalization(params: {
   // Phase 6: Emit final-auditor transcript and progress
   if (finalAuditorResult) {
     emitTranscript({ projectRoot, role: 'final-auditor', iteration, runId, startedAt: new Date().toISOString(), result: finalAuditorResult, registry: orchestratorRegistry });
+    await eventBus.emit({
+      kind: 'role.exited',
+      phase: 'FINALIZING',
+      level: finalAuditorResult.status !== 'success' ? 'warn' : 'info',
+      message: `Final Auditor exited (${finalAuditorResult.status})`,
+      role: 'final-auditor',
+      status: finalAuditorResult.status,
+      exit_code: finalAuditorResult.exit_code ?? undefined,
+      duration_ms: finalAuditorResult.duration_ms ?? null,
+      provider: config.agents.final_auditor.provider ?? 'codex',
+    });
   }
   await emitProgress({ projectRoot, stateStore, lastEvent: 'Final Auditor completed', registry: orchestratorRegistry });
 
   if (finalAuditorCleanupResult && !finalAuditorCleanupResult.success) {
-    await transitionToBlocked(stateStore, `Final Auditor prompt cleanup failed: ${finalAuditorCleanupResult.error}`);
+    await transitionToBlocked(stateStore, `Final Auditor prompt cleanup failed: ${finalAuditorCleanupResult.error}`, eventBus);
     return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${finalAuditorCleanupResult.error}`, 'STATE_CONFLICT', currentBranch);
   }
 
@@ -2347,7 +2691,15 @@ export async function runFinalization(params: {
   }
 
   if (finalAuditorResult.status !== 'success') {
-    await transitionToBlocked(stateStore, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`);
+    await emitProviderFailureIfClassified({
+      eventBus,
+      stderrPath: finalAuditorResult.stderr_path,
+      exitCode: finalAuditorResult.exit_code,
+      provider: config.agents.final_auditor.provider ?? 'codex',
+      role: 'final-auditor',
+      phase: 'FINALIZING',
+    });
+    await transitionToBlocked(stateStore, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`, eventBus);
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final auditor completed', 'FAIL', finalAuditorResult.error?.message);
     return makeBlockedResult(runId, projectRoot, `Final Auditor failed: ${finalAuditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
   }
@@ -2367,7 +2719,7 @@ export async function runFinalization(params: {
     const errorCode = finalAuditValidation.decision === 'PASS'
       ? 'FINAL_AUDIT_SCHEMA_ERROR' as ErrorCategory
       : 'FINAL_AUDIT_FAILED' as ErrorCategory;
-    await transitionToBlocked(stateStore, `Final Audit validation failed: ${finalAuditValidation.errors.join('; ')}`);
+    await transitionToBlocked(stateStore, `Final Audit validation failed: ${finalAuditValidation.errors.join('; ')}`, eventBus);
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final audit validation', 'FAIL', finalAuditValidation.errors.join('; '));
     return makeBlockedResult(
       runId, projectRoot,
@@ -2380,7 +2732,7 @@ export async function runFinalization(params: {
   const finalAuditDecision = finalAuditValidation.effectiveDecision ?? finalAuditValidation.decision;
 
   if (finalAuditDecision !== 'PASS') {
-    await transitionToBlocked(stateStore, `Final Audit decision: ${finalAuditDecision}`);
+    await transitionToBlocked(stateStore, `Final Audit decision: ${finalAuditDecision}`, eventBus);
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final audit completed', finalAuditDecision === 'FAILED' ? 'FAIL' : 'BLOCKED');
     return makeBlockedResult(
       runId, projectRoot,
@@ -2435,7 +2787,7 @@ export async function runFinalization(params: {
   }
 
   if (finalAuditBusinessViolations.length > 0) {
-    await transitionToBlocked(stateStore, `Final Auditor modified business files: ${finalAuditBusinessViolations.join(', ')}`);
+    await transitionToBlocked(stateStore, `Final Auditor modified business files: ${finalAuditBusinessViolations.join(', ')}`, eventBus);
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'final auditor workspace', 'FAIL', `Modified: ${finalAuditBusinessViolations.join(', ')}`);
     return makeBlockedResult(
       runId, projectRoot,
@@ -2460,6 +2812,7 @@ export async function runFinalization(params: {
     await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS', 'commit skipped');
 
     const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
+    await emitRunTerminal(eventBus, PhaseEnum.PASSED, 'Finalization PASSED. Commit skipped.', { artifact_refs: artifactPaths.map((p) => ({ type: 'state', path: p })) });
     return makeResult(
       runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
       artifactPaths,
@@ -2482,7 +2835,7 @@ export async function runFinalization(params: {
   // §6.1 step 10: Stage files
   const stageResult = await stageFiles(projectRoot, allCommitFiles);
   if (!stageResult.success) {
-    await transitionToBlocked(stateStore, `Staging failed: ${stageResult.error}`);
+    await transitionToBlocked(stateStore, `Staging failed: ${stageResult.error}`, eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       `Staging failed: ${stageResult.error}`,
@@ -2496,7 +2849,7 @@ export async function runFinalization(params: {
   const violations = findStagedSetViolations(stagedFiles, allowedSet);
   if (violations.length > 0) {
     await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
-    await transitionToBlocked(stateStore, `Staged set violation: ${violations.join(', ')}`);
+    await transitionToBlocked(stateStore, `Staged set violation: ${violations.join(', ')}`, eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       `Staged set contains disallowed files: ${violations.join(', ')}`,
@@ -2517,7 +2870,7 @@ export async function runFinalization(params: {
     });
   } catch (err) {
     await runGit(['reset', 'HEAD', '--', '.'], projectRoot).catch(() => {});
-    await transitionToBlocked(stateStore, `Commit message template error: ${err instanceof Error ? err.message : String(err)}`);
+    await transitionToBlocked(stateStore, `Commit message template error: ${err instanceof Error ? err.message : String(err)}`, eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       `Commit message template error: ${err instanceof Error ? err.message : String(err)}`,
@@ -2528,7 +2881,7 @@ export async function runFinalization(params: {
 
   const commitResult = await createCommit(projectRoot, commitMessage);
   if (!commitResult.success) {
-    await transitionToBlocked(stateStore, `Commit failed: ${commitResult.error}`);
+    await transitionToBlocked(stateStore, `Commit failed: ${commitResult.error}`, eventBus);
     return makeBlockedResult(
       runId, projectRoot,
       `Commit failed: ${commitResult.error}`,
@@ -2641,6 +2994,13 @@ export async function runFinalization(params: {
   await appendLog(artifactStore, runId, iteration, 'FINALIZING', 'finalization completed', 'PASS');
 
   const artifactPaths = VERSIONED_ARTIFACT_PATHS.map(p => p);
+  await emitRunTerminal(eventBus, PhaseEnum.PASSED, `Finalization PASSED. Committed as ${commitSha.slice(0, 8)}.`, {
+    artifact_refs: [
+      { type: 'diff', path: '.agent/evidence/diff.patch' },
+      ...artifactPaths.map((p) => ({ type: 'state' as const, path: p })),
+    ],
+    payload: { commit_sha: commitSha, tag_name: tagName, tag_created: tagCreated },
+  });
   return makeResult(
     runId, PhaseEnum.PASSED, 0, currentBranch, 'PASS',
     artifactPaths,
@@ -2649,6 +3009,82 @@ export async function runFinalization(params: {
     null,
     commitSha, false, tagName, tagCreated,
   );
+}
+
+/**
+ * Phase 9 R1: classify an agent failure as a provider failure and emit a
+ * structured `provider.failure` event when the stderr matches a known
+ * provider signature (quota, rate-limit, overload, auth). Fail-soft and
+ * observability-only — never affects scheduling.
+ *
+ * Returns true if a provider.failure was emitted, false otherwise.
+ */
+export async function emitProviderFailureIfClassified(params: {
+  eventBus: IEventBus;
+  stderrPath?: string;
+  exitCode?: number | null;
+  provider?: string;
+  model?: string;
+  role: string;
+  phase: string;
+}): Promise<boolean> {
+  const { eventBus, stderrPath, exitCode, provider, model, role, phase } = params;
+  if (!stderrPath || !provider) return false;
+  try {
+    const classification = await classifyProviderFailure({
+      stderrPath,
+      provider,
+      exitCode,
+    });
+    if (!classification) return false;
+    await eventBus.emit({
+      kind: 'provider.failure',
+      phase,
+      level: 'error',
+      message: `${role} provider failure (${provider}): ${classification.classification}`,
+      role,
+      provider,
+      model,
+      artifact_refs: [{ type: 'stderr', path: stderrPath }],
+      payload: {
+        classification: classification.classification,
+        retry_recommended: classification.retry_recommended,
+        evidence: classification.evidence,
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Phase 9 R1: emit a terminal run event for observability. Fail-soft.
+ * Maps the orchestrator terminal phase to the matching event kind.
+ */
+export async function emitRunTerminal(
+  eventBus: IEventBus,
+  phase: Phase,
+  message: string,
+  extra?: Partial<EventDraft>,
+): Promise<void> {
+  const kind: EventDraft['kind'] =
+    phase === PhaseEnum.PASSED ? 'run.completed'
+    : phase === PhaseEnum.BLOCKED ? 'run.blocked'
+    : phase === PhaseEnum.FAILED ? 'run.failed'
+    : 'run.completed';
+  const level: EventDraft['level'] =
+    phase === PhaseEnum.PASSED ? 'info'
+    : phase === PhaseEnum.FAILED ? 'error'
+    : 'warn';
+  await eventBus.emit({
+    kind,
+    phase,
+    level,
+    message,
+    status: phase,
+    ...extra,
+  });
 }
 
 export function makeResult(
@@ -2709,6 +3145,23 @@ export function makeBlockedResult(
       suggested_action: 'Check configuration and try again',
     },
   );
+}
+
+function readR2IntegrationBranch(projectRoot: string, runId: string): string | null {
+  const metadataPath = join(projectRoot, '.agent', 'integration', 'integrated-diff-metadata.json');
+  if (!existsSync(metadataPath)) return null;
+
+  try {
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as {
+      run_id?: unknown;
+      integration_branch?: unknown;
+    };
+    if (metadata.run_id !== runId) return null;
+    if (typeof metadata.integration_branch !== 'string') return null;
+    return metadata.integration_branch;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Phase 4 Helper Functions ────────────────────────────────
