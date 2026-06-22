@@ -17,6 +17,7 @@ import process from 'node:process';
 import { AddressInfo } from 'node:net';
 import { DashboardEventSource, resolveRunIdFromAgentDir } from './event-source.js';
 import { renderDashboardHtml } from './dashboard-html.js';
+import { RunLister } from './run-lister.js';
 import { EventStore } from '../runtime/event-store.js';
 import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
@@ -48,6 +49,7 @@ interface ActiveSseConnection {
 
 export function createDashboardServer(opts: DashboardServerOptions): DashboardServer {
   const source = new DashboardEventSource({ projectRoot: opts.projectRoot });
+  const runLister = new RunLister({ projectRoot: opts.projectRoot });
   const html = renderDashboardHtml();
   const agentDir = path.join(opts.projectRoot, '.agent');
   const ssePollMs = opts.ssePollMs ?? DEFAULT_SSE_POLL_MS;
@@ -59,7 +61,9 @@ export function createDashboardServer(opts: DashboardServerOptions): DashboardSe
   const handler = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
     const method = req.method ?? 'GET';
     const url = req.url ?? '/';
-    const pathOnly = url.split('?')[0];
+    const queryIndex = url.indexOf('?');
+    const pathOnly = queryIndex >= 0 ? url.slice(0, queryIndex) : url;
+    const queryString = queryIndex >= 0 ? url.slice(queryIndex + 1) : '';
 
     if (pathOnly === '/api/cancel') {
       if (method !== 'POST') {
@@ -88,11 +92,56 @@ export function createDashboardServer(opts: DashboardServerOptions): DashboardSe
       return;
     }
 
-    if (pathOnly === '/api/events') {
+    if (pathOnly === '/api/runs') {
       try {
-        const snapshot = await source.getSnapshot();
+        const listing = await runLister.list();
+        sendJson(res, 200, listing);
+      } catch (err) {
+        sendJson(res, 500, {
+          error: 'runs_failed',
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+
+    if (pathOnly === '/api/events') {
+      const params = new URLSearchParams(queryString);
+      const rawRunId = params.get('run_id');
+      const runIdParam =
+        rawRunId !== null && rawRunId !== '' ? rawRunId : undefined;
+
+      // Reject malformed/path-traversal run_id values before any disk access.
+      if (runIdParam !== undefined && !/^[0-9]{14}-[a-z0-9]+$/.test(runIdParam)) {
+        sendJson(res, 400, { error: 'invalid_run_id', run_id: runIdParam });
+        return;
+      }
+
+      try {
+        let snapshot;
+        if (runIdParam === undefined) {
+          // No-param path: byte-for-byte unchanged from pre-R3.
+          snapshot = await source.getSnapshot();
+        } else {
+          const activeRunId = await resolveRunIdFromAgentDir(agentDir);
+          if (activeRunId !== null && runIdParam === activeRunId) {
+            // Matches active run: behave exactly as today.
+            snapshot = await source.getSnapshot();
+          } else {
+            snapshot = await source.getSnapshot({ runId: runIdParam });
+          }
+        }
         sendJson(res, 200, snapshot);
       } catch (err) {
+        const code = (err as { code?: string } | null)?.code;
+        if (code === 'ARCHIVE_NOT_FOUND') {
+          sendJson(res, 404, { error: 'run_not_found', run_id: runIdParam });
+          return;
+        }
+        if (code === 'INVALID_RUN_ID') {
+          sendJson(res, 400, { error: 'invalid_run_id', run_id: runIdParam });
+          return;
+        }
         sendJson(res, 500, {
           error: 'snapshot_failed',
           message: err instanceof Error ? err.message : String(err),

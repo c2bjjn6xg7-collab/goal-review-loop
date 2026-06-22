@@ -3,6 +3,11 @@
  *
  * Read-only adapter that turns the durable `events.jsonl` stream into a
  * compact snapshot for the dashboard HTTP API. Performs no writes.
+ *
+ * Phase 9 R3 — getSnapshot accepts an optional { runId } parameter. When
+ * runId differs from the active run, the snapshot is built from
+ * `.agent/history/events-<runId>.jsonl` using a parse-rules shim that
+ * mirrors EventStore.readAll() line semantics.
  */
 import path from 'node:path';
 import fs from 'fs-extra';
@@ -12,6 +17,7 @@ import {
   type ReviewLoopEvent,
   type ArtifactRef,
 } from '../runtime/event-store.js';
+import { parseJsonlEvents, resolveArchiveByRunId } from './run-lister.js';
 
 export const MAX_LATEST_EVENTS = 20;
 
@@ -43,12 +49,19 @@ export interface EventSourceOptions {
   projectRoot: string;
 }
 
+export interface GetSnapshotOptions {
+  runId?: string;
+}
+
 /**
  * Phases that mark the end of a run. When present, their `phase` value
  * is treated as the run's final phase regardless of later non-terminal
  * events appended during resume.
+ *
+ * Exported for reuse by RunLister so the dashboard's archive listing
+ * derives phase consistently with the active snapshot.
  */
-const TERMINAL_KINDS = new Set([
+export const TERMINAL_KINDS = new Set<string>([
   'run.completed',
   'run.blocked',
   'run.failed',
@@ -56,20 +69,58 @@ const TERMINAL_KINDS = new Set([
 
 export class DashboardEventSource {
   private readonly agentDir: string;
+  private readonly historyDir: string;
   private readonly eventsPath: string;
 
   constructor(opts: EventSourceOptions) {
     this.agentDir = path.join(opts.projectRoot, '.agent');
+    this.historyDir = path.join(this.agentDir, 'history');
     this.eventsPath = path.join(this.agentDir, EVENTS_FILENAME);
   }
 
   /**
    * Build a snapshot from the event stream. Gracefully degrades when
    * `.agent` or `events.jsonl` is missing.
+   *
+   * When `opts.runId` is supplied and differs from the active run, the
+   * snapshot is built from `.agent/history/events-<runId>.jsonl`. If the
+   * archive file is missing, throws an Error carrying
+   * code='ARCHIVE_NOT_FOUND' (server route translates to 404).
    */
-  async getSnapshot(): Promise<DashboardSnapshot> {
+  async getSnapshot(opts: GetSnapshotOptions = {}): Promise<DashboardSnapshot> {
     const runIdFromState = await this.readRunIdFromState();
+    const requestedRunId = opts.runId;
 
+    // Archive path: requested run_id differs from active.
+    if (requestedRunId && requestedRunId !== runIdFromState) {
+      // Validate runId format before any filesystem access to prevent
+      // path traversal. This is the defense-in-depth layer; the HTTP
+      // route also validates, but the exported API must be safe on its own.
+      if (!/^[0-9]{14}-[a-z0-9]+$/.test(requestedRunId)) {
+        const err = new Error(`Invalid run_id format: ${requestedRunId}`) as Error & {
+          code?: string;
+        };
+        err.code = 'INVALID_RUN_ID';
+        throw err;
+      }
+
+      // Resolve archive by scanning history and matching first-event run_id,
+      // not by assuming the filename encodes the run_id.
+      const archivePath = await resolveArchiveByRunId(this.historyDir, requestedRunId);
+      if (!archivePath) {
+        const err = new Error(`Archive not found: ${requestedRunId}`) as Error & {
+          code?: string;
+        };
+        err.code = 'ARCHIVE_NOT_FOUND';
+        throw err;
+      }
+      const events = await parseJsonlEvents(archivePath);
+      const archiveRunId = events.length > 0 ? events[0].run_id : requestedRunId;
+      return buildSnapshot(archiveRunId, events);
+    }
+
+    // Active path: existing behavior, byte-for-byte unchanged when no runId
+    // is supplied or runId matches the active run.
     if (!fs.existsSync(this.agentDir) || !fs.existsSync(this.eventsPath)) {
       return {
         run_id: runIdFromState ?? 'unknown',
@@ -116,6 +167,29 @@ export class DashboardEventSource {
   private async readRunIdFromState(): Promise<string | null> {
     return resolveRunIdFromAgentDir(this.agentDir);
   }
+}
+
+function buildSnapshot(runId: string, events: ReviewLoopEvent[]): DashboardSnapshot {
+  if (events.length === 0) {
+    return {
+      run_id: runId,
+      current_phase: 'unknown',
+      latest_events: [],
+      artifacts: [],
+    };
+  }
+  const sorted = [...events].sort((a, b) => a.seq - b.seq);
+  const last = sorted[sorted.length - 1];
+  const terminal = [...sorted].reverse().find((e) => TERMINAL_KINDS.has(e.kind));
+  const currentPhase = terminal ? terminal.phase : last.phase;
+  const latest = sorted.slice(-MAX_LATEST_EVENTS);
+  const artifacts = dedupeArtifacts(sorted);
+  return {
+    run_id: runId,
+    current_phase: currentPhase,
+    latest_events: latest,
+    artifacts,
+  };
 }
 
 function dedupeArtifacts(events: ReviewLoopEvent[]): ArtifactRef[] {

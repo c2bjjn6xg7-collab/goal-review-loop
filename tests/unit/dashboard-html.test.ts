@@ -51,4 +51,20 @@ describe('renderDashboardHtml', () => {
     expect(html).toContain("fetch('/api/cancel'");
     expect(html).toContain("method: 'POST'");
   });
+
+  it('renders a <select id="run-select"> for the historical run browser', () => {
+    expect(html).toContain('<select id="run-select"');
+  });
+
+  it('fetches /api/runs to populate the run selector', () => {
+    expect(html).toContain("fetch('/api/runs'");
+  });
+
+  it("fetches per-run snapshots via /api/events?run_id=", () => {
+    expect(html).toContain("'/api/events?run_id=' +");
+  });
+
+  it('refreshes the run list every 15 seconds', () => {
+    expect(html).toContain('15000');
+  });
 });
