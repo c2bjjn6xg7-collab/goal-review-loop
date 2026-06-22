@@ -14,6 +14,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { computeDigest, type Digest } from '../runtime/digest.js';
 import { parsePlan, parseGoal, normalizeGoalCommands } from '../artifacts/artifact-schemas.js';
 import type { AgentRunInput, GoalFrontMatter, VerificationCommand, TaskGraph } from '../types.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 import { loadTaskGraph, taskGraphExists } from '../scheduler/task-graph.js';
 
 /** Planner expected artifacts (relative to project root). */
@@ -30,6 +31,7 @@ export function buildPlannerInput(params: {
   prompt: string;
   prompt_file?: string;
   signal?: AbortSignal;
+  eventBus?: IEventBus;
 }): AgentRunInput {
   return {
     role: 'planner',
@@ -42,6 +44,7 @@ export function buildPlannerInput(params: {
     timeout_seconds: params.timeout_seconds,
     command_template: params.command_template,
     signal: params.signal,
+    eventBus: params.eventBus,
   };
 }
 

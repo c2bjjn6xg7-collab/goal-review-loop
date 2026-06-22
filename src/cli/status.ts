@@ -200,7 +200,12 @@ function renderTextSummary(events: ReviewLoopEvent[], json: boolean, opts?: { it
   console.log(`Next: ${computeNextAction(phase, iteration, maxIterations)}`);
   if (lastRoleStarted?.role) {
     const providerInfo = lastRoleStarted.provider ? `  Provider: ${lastRoleStarted.provider}` : '';
-    console.log(`Active: ${lastRoleStarted.role}${providerInfo}`);
+    const heartbeat = computeHeartbeatSuffix(events, lastRoleStarted.role);
+    console.log(`Active: ${lastRoleStarted.role}${providerInfo}${heartbeat}`);
+  }
+  const outputPreview = computeOutputPreview(recent);
+  if (outputPreview != null) {
+    console.log(`Output: ${outputPreview}`);
   }
   console.log('Latest:');
   for (const ev of recent) {
@@ -219,6 +224,47 @@ function renderTextSummary(events: ReviewLoopEvent[], json: boolean, opts?: { it
     console.log('Artifacts:');
     for (const p of refs) console.log(`  ${p}`);
   }
+}
+
+/**
+ * Returns `  Heartbeat: Ns ago` when the most recent `role.heartbeat` for
+ * `role` is newer than the most recent `role.exited` for the same role.
+ * Returns an empty string otherwise.
+ */
+function computeHeartbeatSuffix(events: ReviewLoopEvent[], role: string | undefined): string {
+  if (!role) return '';
+  let lastHeartbeatTs: number | null = null;
+  let lastExitedTs: number | null = null;
+  for (const ev of events) {
+    if (ev.role !== role) continue;
+    if (ev.kind === 'role.heartbeat') {
+      lastHeartbeatTs = Date.parse(ev.ts);
+    } else if (ev.kind === 'role.exited') {
+      lastExitedTs = Date.parse(ev.ts);
+    }
+  }
+  if (lastHeartbeatTs == null) return '';
+  if (lastExitedTs != null && lastExitedTs > lastHeartbeatTs) return '';
+  const secs = Math.max(0, Math.floor((Date.now() - lastHeartbeatTs) / 1000));
+  return `  Heartbeat: ${secs}s ago`;
+}
+
+/**
+ * Scans `recent` for the most recent `role.output` event and returns a
+ * 120-char preview of its `payload.text` (falling back to `message`).
+ * Returns `null` when no `role.output` event is present.
+ */
+function computeOutputPreview(recent: ReviewLoopEvent[]): string | null {
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const ev = recent[i];
+    if (ev.kind !== 'role.output') continue;
+    const text =
+      ev.payload && typeof ev.payload.text === 'string'
+        ? ev.payload.text
+        : ev.message;
+    return text.slice(0, 120);
+  }
+  return null;
 }
 
 /**

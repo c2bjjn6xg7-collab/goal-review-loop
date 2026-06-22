@@ -18,6 +18,7 @@ import { parseAuditReport } from '../artifacts/artifact-schemas.js';
 import { createHash } from 'node:crypto';
 import type { AgentRunInput, AuditReportFrontMatter, AuditDecision } from '../types.js';
 import type { Digest } from '../runtime/digest.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 
 /** Auditor expected artifacts (relative to project root). */
 const AUDITOR_ARTIFACTS = ['.agent/audit-report.md'];
@@ -39,6 +40,7 @@ export function buildAuditorInput(params: {
   prompt: string;
   prompt_file?: string;
   signal?: AbortSignal;
+  eventBus?: IEventBus;
 }): AgentRunInput {
   return {
     role: 'auditor',
@@ -52,6 +54,7 @@ export function buildAuditorInput(params: {
     timeout_seconds: params.timeout_seconds,
     command_template: params.command_template,
     signal: params.signal,
+    eventBus: params.eventBus,
   };
 }
 

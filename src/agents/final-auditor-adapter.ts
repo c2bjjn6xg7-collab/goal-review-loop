@@ -18,6 +18,7 @@ import type {
   FinalAuditFrontMatter,
   FinalAuditDecision,
 } from '../types.js';
+import type { IEventBus } from '../runtime/event-bus.js';
 
 /** Final Auditor expected artifacts (relative to project root). */
 const FINAL_AUDITOR_ARTIFACTS = ['.agent/final-audit.md'];
@@ -39,6 +40,7 @@ export function buildFinalAuditorInput(params: {
   prompt: string;
   prompt_file?: string;
   signal?: AbortSignal;
+  eventBus?: IEventBus;
 }): AgentRunInput {
   return {
     role: 'final-auditor',
@@ -51,6 +53,7 @@ export function buildFinalAuditorInput(params: {
     timeout_seconds: params.timeout_seconds,
     command_template: params.command_template,
     signal: params.signal,
+    eventBus: params.eventBus,
   };
 }
 

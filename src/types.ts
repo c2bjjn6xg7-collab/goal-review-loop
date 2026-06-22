@@ -161,6 +161,12 @@ export interface AgentRunInput {
   signal?: AbortSignal;
   /** Phase 8F: Per-provider network/proxy configuration for this agent run. */
   network?: ProviderNetworkConfig;
+  /**
+   * Phase 9 R5: optional event bus for streaming live agent output and
+   * heartbeats. When present, runAgent wires an onOutput callback into
+   * runProcess and emits role.output / role.heartbeat events.
+   */
+  eventBus?: import('./runtime/event-bus.js').IEventBus;
 }
 
 /**
@@ -708,6 +714,13 @@ export interface ProcessRunnerInput {
   signal?: AbortSignal;
   kill_grace_seconds?: number;
   max_log_bytes?: number;
+  /**
+   * Phase 9 R5: optional observer callback invoked after each sanitized
+   * stdout/stderr chunk is written to disk. The text is filtered through
+   * filterAgentOutput (thinking blocks + tool JSON lines stripped) and
+   * coalesced via a 500ms / 2000-char throttle before delivery.
+   */
+  onOutput?: (params: { stream: 'stdout' | 'stderr'; text: string }) => void;
 }
 
 export interface ProcessRunnerResult {

@@ -3,6 +3,7 @@ import { StringDecoder } from 'string_decoder';
 import fs from 'fs-extra';
 import path from 'path';
 import { ProcessStatus, type ProcessRunnerInput, type ProcessRunnerResult } from '../types.js';
+import { filterAgentOutput } from './output-filter.js';
 
 const SENSITIVE_KEY_PATTERN = /token|api_key|secret|password|authorization/i;
 const REDACTED = '***REDACTED***';
@@ -345,10 +346,90 @@ export async function runProcess(input: ProcessRunnerInput, projectRoot?: string
   const stdoutRedactor = new StreamRedactor(sensitiveValues);
   const stderrRedactor = new StreamRedactor(sensitiveValues);
 
+  // Phase 9 R5: onOutput throttle state. Per-stream accumulators flushed at
+  // most once per 500ms, or immediately when accumulated text exceeds 2000
+  // chars. The interval is cleared in cleanup.
+  const onOutput = input.onOutput;
+  const OUTPUT_FLUSH_INTERVAL_MS = 500;
+  const OUTPUT_FLUSH_THRESHOLD_CHARS = 2000;
+  const stdoutAccum: string[] = [];
+  const stderrAccum: string[] = [];
+  let stdoutPendingLen = 0;
+  let stderrPendingLen = 0;
+  let outputFlushTimer: ReturnType<typeof setInterval> | undefined;
+
+  const flushOutput = (stream: 'stdout' | 'stderr') => {
+    if (stream === 'stdout') {
+      if (stdoutPendingLen === 0) return;
+      const raw = stdoutAccum.join('');
+      stdoutAccum.length = 0;
+      stdoutPendingLen = 0;
+      // Filter at flush time so thinking blocks split across chunks are
+      // caught as a whole.
+      const text = filterAgentOutput(raw);
+      if (text.length > 0) {
+        try {
+          onOutput!({ stream, text });
+        } catch {
+          // observer failures must not break the run
+        }
+      }
+    } else {
+      if (stderrPendingLen === 0) return;
+      const text = stderrAccum.join('');
+      stderrAccum.length = 0;
+      stderrPendingLen = 0;
+      if (text.length > 0) {
+        try {
+          onOutput!({ stream, text });
+        } catch {
+          // observer failures must not break the run
+        }
+      }
+    }
+  };
+
+  const flushAllOutput = () => {
+    if (!onOutput) return;
+    flushOutput('stdout');
+    flushOutput('stderr');
+  };
+
+  if (onOutput) {
+    outputFlushTimer = setInterval(flushAllOutput, OUTPUT_FLUSH_INTERVAL_MS);
+    // Allow the process to exit even if the timer is still referenced.
+    if (typeof outputFlushTimer.unref === 'function') {
+      outputFlushTimer.unref();
+    }
+  }
+
+  const accumulateOutput = (stream: 'stdout' | 'stderr', text: string) => {
+    if (!onOutput || text.length === 0) return;
+    if (stream === 'stdout') {
+      stdoutAccum.push(text);
+      stdoutPendingLen += text.length;
+      if (stdoutPendingLen >= OUTPUT_FLUSH_THRESHOLD_CHARS) {
+        flushOutput('stdout');
+      }
+    } else {
+      stderrAccum.push(text);
+      stderrPendingLen += text.length;
+      if (stderrPendingLen >= OUTPUT_FLUSH_THRESHOLD_CHARS) {
+        flushOutput('stderr');
+      }
+    }
+  };
+
   let cleanupDone = false;
   const cleanup = async (): Promise<void> => {
     if (cleanupDone) return;
     cleanupDone = true;
+
+    if (outputFlushTimer) {
+      clearInterval(outputFlushTimer);
+      outputFlushTimer = undefined;
+    }
+    flushAllOutput();
 
     const stdoutFlush = stdoutRedactor.flush();
     if (stdoutFlush.length > 0) {
@@ -422,6 +503,15 @@ export async function runProcess(input: ProcessRunnerInput, projectRoot?: string
       stream.write(marker);
       if (isStdout) stdoutTruncated = true;
       else stderrTruncated = true;
+    }
+
+    if (onOutput) {
+      const decoded = sanitized.toString('utf8');
+      // Accumulate raw text; filter at flush time so thinking blocks split
+      // across chunks are caught as a whole.
+      if (decoded.length > 0) {
+        accumulateOutput(isStdout ? 'stdout' : 'stderr', decoded);
+      }
     }
   };
 

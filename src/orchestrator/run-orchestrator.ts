@@ -746,6 +746,7 @@ export async function runOrchestrator(params: {
         prompt: plannerPrompt,
         prompt_file: plannerPromptFile,
         signal: combinedSignal,
+        eventBus,
       });
 
       plannerResult = { result: await runAgent(plannerInput, projectRoot), prePlannerSnapshot };
@@ -1323,6 +1324,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
             prompt: developerPrompt,
             prompt_file: developerPromptFile,
             signal: combinedSignal,
+            eventBus,
           });
 
           developerResult = await runAgent(developerInput, projectRoot);
@@ -1765,6 +1767,7 @@ async function runIterationLoop(params: IterationLoopParams): Promise<Orchestrat
         prompt: auditorPrompt,
         prompt_file: auditorPromptFile,
         signal: combinedSignal,
+        eventBus,
       });
 
       auditorResult = await runAgent(auditorInput, projectRoot);
@@ -2667,6 +2670,7 @@ export async function runFinalization(params: {
       prompt: finalAuditorPrompt,
       prompt_file: finalAuditorPromptFile,
       signal: combinedSignal,
+      eventBus,
     });
 
     finalAuditorResult = await runAgent(finalAuditorInput, projectRoot);
