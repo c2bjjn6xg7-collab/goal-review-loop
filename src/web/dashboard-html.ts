@@ -1,6 +1,8 @@
 /**
  * Phase 9 R2A — Inline HTML page for the read-only dashboard.
  *
+ * Phase 9 R2C — Adds Cancel Run button that POSTs /api/cancel.
+ *
  * The page polls `/api/events` every 2 seconds and renders the snapshot
  * using `textContent` only (no innerHTML interpolation of event fields)
  * so that user/run-supplied strings cannot inject HTML.
@@ -24,14 +26,18 @@ const HTML = `<!DOCTYPE html>
   th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #ccc4; vertical-align: top; }
   .muted { color: #888; font-size: 0.8rem; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #cancel-btn { padding: 0.25rem 0.75rem; font-size: 0.85rem; }
+  #cancel-btn[disabled] { opacity: 0.6; cursor: not-allowed; }
+  #cancel-error { color: #b00; font-size: 0.8rem; }
 </style>
 </head>
 <body>
 <header>
   <h1>Review-Loop Dashboard</h1>
-  <div>Run: <code id="run-id">…</code></div>
+  <div>Run: <code id="run-id">…</code> <button id="cancel-btn" type="button" disabled>Cancel Run</button></div>
   <div>Phase: <span id="current-phase" class="pill">…</span></div>
   <div class="muted">Updated: <span id="updated-at">never</span></div>
+  <div id="cancel-error" role="alert"></div>
 </header>
 
 <section>
@@ -58,15 +64,41 @@ const HTML = `<!DOCTYPE html>
   var eventsEmpty = document.getElementById('events-empty');
   var artsEl = document.getElementById('artifacts-list');
   var artsEmpty = document.getElementById('artifacts-empty');
+  var cancelBtn = document.getElementById('cancel-btn');
+  var cancelErr = document.getElementById('cancel-error');
+
+  var TERMINAL = { PASSED: 1, FAILED: 1, BLOCKED: 1, CANCELLED: 1 };
+  var cancelInFlight = false;
 
   function setText(el, value) {
     el.textContent = value == null ? '' : String(value);
+  }
+
+  function renderCancelButton(phase) {
+    var isTerminal = phase == null || phase === 'unknown' || TERMINAL[phase] === 1;
+    if (cancelInFlight) {
+      cancelBtn.disabled = true;
+      setText(cancelBtn, 'Cancelling…');
+      if (isTerminal) {
+        cancelInFlight = false;
+        setText(cancelBtn, 'Run ended');
+      }
+      return;
+    }
+    if (isTerminal) {
+      cancelBtn.disabled = true;
+      setText(cancelBtn, 'Run ended');
+    } else {
+      cancelBtn.disabled = false;
+      setText(cancelBtn, 'Cancel Run');
+    }
   }
 
   function render(snapshot) {
     setText(runIdEl, snapshot.run_id);
     setText(phaseEl, snapshot.current_phase);
     setText(updatedEl, new Date().toLocaleTimeString());
+    renderCancelButton(snapshot.current_phase);
 
     while (bodyEl.firstChild) bodyEl.removeChild(bodyEl.firstChild);
     var events = Array.isArray(snapshot.latest_events) ? snapshot.latest_events : [];
@@ -93,6 +125,41 @@ const HTML = `<!DOCTYPE html>
       artsEl.appendChild(li);
     }
   }
+
+  function onCancelClick() {
+    if (cancelInFlight || cancelBtn.disabled) return;
+    cancelInFlight = true;
+    setText(cancelErr, '');
+    cancelBtn.disabled = true;
+    setText(cancelBtn, 'Cancelling…');
+    fetch('/api/cancel', { method: 'POST', cache: 'no-store' })
+      .then(function (r) {
+        if (r.status >= 200 && r.status < 300) {
+          return null;
+        }
+        return r.text().then(function (txt) {
+          var message = 'cancel failed (HTTP ' + r.status + ')';
+          try {
+            var parsed = JSON.parse(txt);
+            if (parsed && typeof parsed.message === 'string') {
+              message = parsed.message;
+            }
+          } catch (e) {
+            if (txt) message = txt;
+          }
+          throw new Error(message);
+        });
+      })
+      .catch(function (err) {
+        cancelInFlight = false;
+        setText(cancelErr, err && err.message ? err.message : 'cancel failed');
+        // Re-enable so the user can retry; tick() will reconcile if state changed.
+        cancelBtn.disabled = false;
+        setText(cancelBtn, 'Cancel Run');
+      });
+  }
+
+  cancelBtn.addEventListener('click', onCancelClick);
 
   function tick() {
     fetch('/api/events', { cache: 'no-store' })

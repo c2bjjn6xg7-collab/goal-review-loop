@@ -3,19 +3,25 @@
  * Phase 9 R2B — Adds SSE push channel at `GET /api/events/stream`.
  *
  * Routes:
- *   GET /                    -> inline HTML page
- *   GET /api/events          -> JSON snapshot built from events.jsonl
- *   GET /api/events/stream   -> text/event-stream push of new events
- *   *                        -> 404 / 405 JSON
+ *   GET  /                  -> inline HTML page
+ *   GET  /api/events        -> JSON snapshot built from events.jsonl
+ *   GET  /api/events/stream -> text/event-stream push of new events
+ *   POST /api/cancel        -> writes .agent/cancel-request.json and SIGTERMs PID
+ *   *                       -> 404 / 405 JSON
  *
- * Bound to 127.0.0.1 only; never writes to .agent.
+ * Bound to 127.0.0.1 only.
  */
 import http from 'node:http';
 import path from 'node:path';
+import process from 'node:process';
 import { AddressInfo } from 'node:net';
 import { DashboardEventSource, resolveRunIdFromAgentDir } from './event-source.js';
 import { renderDashboardHtml } from './dashboard-html.js';
 import { EventStore } from '../runtime/event-store.js';
+import { StateStore } from '../orchestrator/state-store.js';
+import { LockManager } from '../runtime/lock-manager.js';
+import { atomicWriteJSON } from '../runtime/atomic-file.js';
+import type { CancelRequest } from '../types.js';
 
 export interface DashboardServerOptions {
   projectRoot: string;
@@ -34,6 +40,7 @@ export interface DashboardServer {
 const HOST = '127.0.0.1';
 const DEFAULT_SSE_POLL_MS = 500;
 const DEFAULT_SSE_HEARTBEAT_MS = 15_000;
+const TERMINAL_PHASES = new Set(['PASSED', 'FAILED', 'BLOCKED', 'CANCELLED']);
 
 interface ActiveSseConnection {
   cleanup(): void;
@@ -53,6 +60,15 @@ export function createDashboardServer(opts: DashboardServerOptions): DashboardSe
     const method = req.method ?? 'GET';
     const url = req.url ?? '/';
     const pathOnly = url.split('?')[0];
+
+    if (pathOnly === '/api/cancel') {
+      if (method !== 'POST') {
+        sendJson(res, 405, { error: 'method_not_allowed', message: `Method ${method} not allowed` });
+        return;
+      }
+      await handleCancel(res, agentDir);
+      return;
+    }
 
     if (method !== 'GET') {
       sendJson(res, 405, { error: 'method_not_allowed', message: `Method ${method} not allowed` });
@@ -241,6 +257,79 @@ export function createDashboardServer(opts: DashboardServerOptions): DashboardSe
       return listeningPort;
     },
   };
+}
+
+async function handleCancel(res: http.ServerResponse, agentDir: string): Promise<void> {
+  const stateStore = new StateStore(agentDir);
+
+  if (!(await stateStore.exists())) {
+    sendJson(res, 409, {
+      error: 'no_active_run',
+      message: 'state.json not found; no active run to cancel.',
+    });
+    return;
+  }
+
+  let state;
+  try {
+    state = await stateStore.read();
+  } catch (err) {
+    sendJson(res, 409, {
+      error: 'state_unreadable',
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  if (TERMINAL_PHASES.has(state.phase)) {
+    sendJson(res, 409, {
+      error: 'run_terminal',
+      message: `Run ${state.run_id} is already in terminal phase: ${state.phase}.`,
+      phase: state.phase,
+    });
+    return;
+  }
+
+  const requestedAt = new Date().toISOString();
+  const cancelRequest: CancelRequest = {
+    schema_version: 1,
+    run_id: state.run_id,
+    requested_at: requestedAt,
+    requested_by: `dashboard:${process.pid}`,
+  };
+
+  const cancelPath = path.join(agentDir, 'cancel-request.json');
+  try {
+    await atomicWriteJSON(cancelPath, cancelRequest);
+  } catch (err) {
+    sendJson(res, 500, {
+      error: 'write_failed',
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  // Best-effort SIGTERM to orchestrator PID via existing LockManager.
+  try {
+    const lockManager = new LockManager(agentDir);
+    const lock = await lockManager.readLock();
+    if (lock && lock.pid > 0 && lockManager.isProcessAlive(lock.pid)) {
+      try {
+        process.kill(lock.pid, 'SIGTERM');
+      } catch {
+        // Cancel-request file is the durable signal; swallow signal errors.
+      }
+    }
+  } catch {
+    // Reading the lock should never block the 200 response.
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    message: 'cancel requested',
+    run_id: state.run_id,
+    requested_at: requestedAt,
+  });
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
