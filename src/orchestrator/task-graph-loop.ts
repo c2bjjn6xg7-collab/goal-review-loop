@@ -53,6 +53,7 @@ import { Phase as PhaseEnum } from '../types.js';
 import type { StateStore } from './state-store.js';
 import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { OrchestratorResult, OrchestratorFileRegistry } from './run-orchestrator.js';
+import { emitProviderFailureIfClassified } from './run-orchestrator.js';
 import type { IEventBus } from '../runtime/event-bus.js';
 import {
   checkCancelRequest,
@@ -692,6 +693,14 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
   await stateStore.transition(PhaseEnum.AUDITING);
   await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor start', 'PASS');
   await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Auditor (integration)', registry: orchestratorRegistry });
+  await eventBus.emit({
+    kind: 'role.started',
+    phase: 'AUDITING',
+    level: 'info',
+    message: 'Integration Auditor starting',
+    role: 'auditor',
+    provider: config.agents.auditor.provider ?? 'codex',
+  });
 
   {
     let auditorPromptFile: string | undefined;
@@ -743,6 +752,17 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
 
     if (auditorResult) {
       emitTranscript({ projectRoot, role: 'auditor', iteration: auditIteration, runId, startedAt: new Date().toISOString(), result: auditorResult, registry: orchestratorRegistry });
+      await eventBus.emit({
+        kind: 'role.exited',
+        phase: 'AUDITING',
+        level: auditorResult.status !== 'success' ? 'warn' : 'info',
+        message: `Integration Auditor exited (${auditorResult.status})`,
+        role: 'auditor',
+        status: auditorResult.status,
+        exit_code: auditorResult.exit_code ?? undefined,
+        duration_ms: auditorResult.duration_ms ?? undefined,
+        provider: config.agents.auditor.provider ?? 'codex',
+      });
     }
     registerAgentLogs(auditorResult, orchestratorRegistry);
 
@@ -755,6 +775,14 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
       return makeResult(runId, PhaseEnum.CANCELLED, 4, currentBranch, null, [], 'Run cancelled', 'Auditor cancelled', auditorResult.error);
     }
     if (auditorResult.status !== 'success') {
+      await emitProviderFailureIfClassified({
+        eventBus,
+        stderrPath: auditorResult.stderr_path,
+        exitCode: auditorResult.exit_code,
+        provider: config.agents.auditor.provider ?? 'codex',
+        role: 'auditor',
+        phase: 'AUDITING',
+      });
       await transitionToBlocked(stateStore, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, eventBus);
       return makeBlockedResult(runId, projectRoot, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
     }
@@ -764,6 +792,16 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     if (existsSync(auditReportPath)) {
       orchestratorRegistry.register(auditReportPath, computeDigest(readFileSync(auditReportPath, 'utf8')));
     }
+    await eventBus.emit({
+      kind: 'audit.decision',
+      phase: 'AUDITING',
+      level: 'info',
+      message: `Integration Auditor decision: PASS (iter ${auditIteration})`,
+      role: 'auditor',
+      status: 'PASS',
+      artifact_refs: [{ type: 'audit-report', path: '.agent/audit-report.md' }],
+      payload: { integration_audit: true, diff_digest: diffDigest },
+    });
     await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor completed', 'PASS');
   }
 
