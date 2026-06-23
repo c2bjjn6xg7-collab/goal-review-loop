@@ -35,7 +35,7 @@ function buildCommand(role: Role, provider: string, model?: string): { command: 
         [
           'P=$(cat "$1")',
           heartbeatLine,
-          `npx opencode-ai run ${modelFlag} --dangerously-skip-permissions --no-replay "$P"`,
+          `~/.opencode/bin/opencode run ${modelFlag} --dangerously-skip-permissions --no-replay -- "$P"`,
           'status=$?',
           'kill "$heartbeat_pid" 2>/dev/null || true',
           'wait "$heartbeat_pid" 2>/dev/null || true',

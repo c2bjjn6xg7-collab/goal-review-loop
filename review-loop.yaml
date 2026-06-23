@@ -15,7 +15,7 @@ agents:
          ) &
         heartbeat_pid=$!
         trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM
-        ~/.opencode/bin/opencode run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay "$P"
+        ~/.opencode/bin/opencode run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay -- "$P"
         status=$?
         kill "$heartbeat_pid" 2>/dev/null || true
         wait "$heartbeat_pid" 2>/dev/null || true
