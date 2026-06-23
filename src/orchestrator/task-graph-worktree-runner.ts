@@ -17,6 +17,8 @@ import {
   OrchestratorFileRegistry,
   registerDirectoryFiles,
 } from './run-orchestrator.js';
+import type { IEventBus } from '../runtime/event-bus.js';
+import { EventStore } from '../runtime/event-store.js';
 import {
   Phase as PhaseEnum,
   TaskStatus,
@@ -39,6 +41,7 @@ export interface RunTaskInWorktreeParams {
   taskTotal?: number;
   combinedSignal?: AbortSignal;
   slug?: string;
+  mainEventBus?: IEventBus;
 }
 
 export interface RunTaskInWorktreeResult {
@@ -199,6 +202,12 @@ export async function runTaskInWorktree(
   }
 
   await updateWorkerTaskStatus(workerStateStore, params.task.id, status);
+
+  // Forward worktree role-level events to the main EventBus so the dashboard
+  // can see developer/auditor activity inside wave-mode tasks.
+  if (params.mainEventBus) {
+    await forwardWorktreeEvents(params.mainEventBus, workerAgentDir, params.runId, params.task.id);
+  }
 
   const resultPath = await writeTaskRunResult(projectRoot, {
     schema_version: 1,
@@ -481,4 +490,42 @@ function resetWorktreeToBase(worktreePath: string, baseCommit: string): void {
   execSync('git checkout -- .', { cwd: worktreePath, stdio: 'pipe' });
   execSync('git clean -fd', { cwd: worktreePath, stdio: 'pipe' });
   execSync(`git reset --hard ${baseCommit}`, { cwd: worktreePath, stdio: 'pipe' });
+}
+
+const FORWARDABLE_KINDS = new Set([
+  'role.started', 'role.exited', 'role.heartbeat',
+  'role.output', 'audit.decision', 'provider.failure',
+]);
+
+async function forwardWorktreeEvents(
+  mainEventBus: IEventBus,
+  workerAgentDir: string,
+  runId: string,
+  taskId: string,
+): Promise<void> {
+  try {
+    const store = new EventStore(workerAgentDir, runId);
+    const events = await store.readAll();
+    // Cap to last 100 role events to avoid flooding the main stream.
+    const roleEvents = events.filter((e) => FORWARDABLE_KINDS.has(e.kind)).slice(-100);
+    for (const ev of roleEvents) {
+      await mainEventBus.emit({
+        kind: ev.kind,
+        phase: ev.phase,
+        level: ev.level,
+        message: `[${taskId}] ${ev.message}`,
+        role: ev.role,
+        task_id: taskId,
+        provider: ev.provider,
+        model: ev.model,
+        status: ev.status,
+        duration_ms: ev.duration_ms,
+        exit_code: ev.exit_code,
+        artifact_refs: ev.artifact_refs,
+        payload: ev.payload,
+      });
+    }
+  } catch {
+    // Fail-soft: forwarding failures must not block the run.
+  }
 }

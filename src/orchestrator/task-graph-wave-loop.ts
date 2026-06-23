@@ -177,6 +177,7 @@ export async function runTaskGraphWaveLoop(
         taskTotal: tasks.length,
         combinedSignal,
         slug: task.title,
+        mainEventBus: eventBus,
       });
 
       const status = toTaskStatus(result.status);
