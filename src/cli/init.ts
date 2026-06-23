@@ -23,9 +23,13 @@ export function initCommand(): Command {
         console.log('✓ Goal Review Loop initialized successfully.');
         console.log();
         console.log('Next steps:');
-        console.log('  1. Review and commit review-loop.yaml and .gitignore changes');
-        console.log('  2. Ensure working tree is clean');
-        console.log('  3. Run: review-loop start --request <your-requirement>');
+        console.log('  1. Configure your AI agents (default uses codex for planner/auditor):');
+        console.log('     review-loop config agents                          # view current config');
+        console.log('     review-loop config agents --set planner=opencode/ownplan/deepseekv4pro');
+        console.log('     review-loop config agents --set developer=claude');
+        console.log('  2. Review and commit review-loop.yaml and .gitignore changes');
+        console.log('  3. Ensure working tree is clean');
+        console.log('  4. Run: review-loop start --request "your task" --parallel');
       } catch (err) {
         console.error(`✗ Init failed: ${(err as Error).message}`);
         process.exit(1);
