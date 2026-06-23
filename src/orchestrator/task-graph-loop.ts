@@ -119,6 +119,7 @@ export interface RunTaskGraphTaskSerialParams {
   goalPath: string;
   handoffPath: string;
   goalSuccessCriteria: string[];
+  mainEventBus?: IEventBus;
 }
 
 /**
@@ -176,6 +177,7 @@ export async function runTaskGraphTaskSerial(
     goalPath,
     handoffPath,
     goalSuccessCriteria,
+    mainEventBus,
   } = params;
   const taskIndexDisplay = taskIndex + 1;
 
@@ -298,6 +300,7 @@ export async function runTaskGraphTaskSerial(
         prompt_file: developerPromptFile,
         // Per-attempt signal: aborted by user cancel OR idle-watchdog trip.
         signal: attemptAbortController.signal,
+        eventBus: mainEventBus,
       });
 
       idleWatchdog.start();
@@ -744,6 +747,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
         prompt: promptResult.prompt,
         prompt_file: auditorPromptFile,
         signal: combinedSignal,
+        eventBus: eventBus,
       });
       auditorResult = await runAgent(auditorInput, projectRoot);
     } finally {
