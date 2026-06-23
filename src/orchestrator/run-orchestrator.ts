@@ -720,7 +720,7 @@ export async function runOrchestrator(params: {
     // F-306R1 fix: Wrap Planner execution in try/finally to guarantee prompt cleanup
     // even on unexpected exceptions (e.g. recordArtifactDigests throws on directory path).
     // F-306R2 fix: Check cleanup result — prompt deletion failure must BLOCKED.
-    let plannerResult;
+    let plannerResult: { result: import('../types.js').AgentRunResult; prePlannerSnapshot: Awaited<ReturnType<typeof snapshotWorkspaceBeforePlanner>> } | undefined;
     let plannerCleanupResult: PromptCleanupResult | undefined;
     try {
       // Snapshot workspace before Planner to detect unauthorized changes
@@ -749,16 +749,41 @@ export async function runOrchestrator(params: {
         eventBus,
       });
 
-      plannerResult = { result: await runAgent(plannerInput, projectRoot), prePlannerSnapshot };
+      // Planner retry loop: mirrors Developer retry (max_agent_retries).
+      // Useful when the planner model (e.g. opencode/deepseek) stalls on
+      // large prompts — a retry often succeeds.
+      const maxPlannerRetries = config.loop.max_agent_retries ?? 0;
+      for (let plannerAttempt = 0; plannerAttempt <= maxPlannerRetries; plannerAttempt++) {
+        if (plannerAttempt > 0) {
+          await appendLog(artifactStore, runId, 0, 'PLANNING', `planner retry ${plannerAttempt}`, 'FAIL', `Planner failed, retrying (attempt ${plannerAttempt + 1})`);
+          await emitProgress({ projectRoot, stateStore, lastEvent: `Starting Planner (retry ${plannerAttempt})`, registry: orchestratorRegistry });
+        }
+        const pr = await runAgent(plannerInput, projectRoot);
+        if (pr.status === 'success') {
+          plannerResult = { result: pr, prePlannerSnapshot };
+          break;
+        }
+        // Store last result even if failed (for transcript/emit below)
+        plannerResult = { result: pr, prePlannerSnapshot };
+        // Retry only on AGENT_ERROR (process crash / stall), not on cancel
+        if (pr.status === 'cancelled' || plannerAttempt >= maxPlannerRetries) {
+          break;
+        }
+        if (pr.error?.code !== 'AGENT_ERROR') {
+          break;
+        }
+        // Loop continues to next retry
+      }
+
       await eventBus.emit({
         kind: 'role.exited',
         phase: 'PLANNING',
-        level: plannerResult.result.status !== 'success' ? 'warn' : 'info',
-        message: `Planner exited (${plannerResult.result.status})`,
+        level: plannerResult!.result.status !== 'success' ? 'warn' : 'info',
+        message: `Planner exited (${plannerResult!.result.status})`,
         role: 'planner',
-        status: plannerResult.result.status,
-        exit_code: plannerResult.result.exit_code ?? undefined,
-        duration_ms: plannerResult.result.duration_ms ?? null,
+        status: plannerResult!.result.status,
+        exit_code: plannerResult!.result.exit_code ?? undefined,
+        duration_ms: plannerResult!.result.duration_ms ?? null,
         provider: config.agents.planner.provider ?? 'claude',
         artifact_refs: [{ type: 'transcript', path: '.agent/transcripts/iteration-00-planner.md' }],
       });
@@ -767,8 +792,8 @@ export async function runOrchestrator(params: {
     }
 
     // Phase 6: Emit planner transcript and progress
-    if (plannerResult.result) {
-      emitTranscript({ projectRoot, role: 'planner', iteration: 0, runId, startedAt: new Date().toISOString(), result: plannerResult.result, registry: orchestratorRegistry });
+    if (plannerResult!.result) {
+      emitTranscript({ projectRoot, role: 'planner', iteration: 0, runId, startedAt: new Date().toISOString(), result: plannerResult!.result, registry: orchestratorRegistry });
     }
     await emitProgress({ projectRoot, stateStore, lastEvent: 'Planner completed', registry: orchestratorRegistry });
 
@@ -778,29 +803,29 @@ export async function runOrchestrator(params: {
       return makeBlockedResult(runId, projectRoot, `Prompt cleanup failed: ${plannerCleanupResult.error}`, 'STATE_CONFLICT', originalBranch);
     }
 
-    if (plannerResult.result.status === 'cancelled') {
+    if (plannerResult!.result.status === 'cancelled') {
       await stateStore.transition(PhaseEnum.CANCELLED);
-      await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'CANCELLED', plannerResult.result.error?.message);
+      await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'CANCELLED', plannerResult!.result.error?.message);
       return makeResult(
         runId, PhaseEnum.CANCELLED, 4, originalBranch, null, [],
         'Run cancelled by user request',
-        `Planner cancelled: ${plannerResult.result.error?.message ?? 'unknown'}`,
-        plannerResult.result.error,
+        `Planner cancelled: ${plannerResult!.result.error?.message ?? 'unknown'}`,
+        plannerResult!.result.error,
       );
     }
 
-    if (plannerResult.result.status !== 'success') {
+    if (plannerResult!.result.status !== 'success') {
       await emitProviderFailureIfClassified({
         eventBus,
-        stderrPath: plannerResult.result.stderr_path,
-        exitCode: plannerResult.result.exit_code,
+        stderrPath: plannerResult!.result.stderr_path,
+        exitCode: plannerResult!.result.exit_code,
         provider: config.agents.planner.provider ?? 'claude',
         role: 'planner',
         phase: 'PLANNING',
       });
-      await transitionToBlocked(stateStore, `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`, eventBus);
-      await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'FAIL', plannerResult.result.error?.message);
-      return makeResult(runId, PhaseEnum.BLOCKED, 3, originalBranch, null, [], 'Fix Planner configuration or check agent availability', `Planner failed: ${plannerResult.result.error?.message ?? 'unknown'}`, plannerResult.result.error);
+      await transitionToBlocked(stateStore, `Planner failed: ${plannerResult!.result.error?.message ?? 'unknown'}`, eventBus);
+      await appendLog(artifactStore, runId, 0, 'PLANNING', 'planner completed', 'FAIL', plannerResult!.result.error?.message);
+      return makeResult(runId, PhaseEnum.BLOCKED, 3, originalBranch, null, [], 'Fix Planner configuration or check agent availability', `Planner failed: ${plannerResult!.result.error?.message ?? 'unknown'}`, plannerResult!.result.error);
     }
 
     // Validate Planner output
@@ -812,7 +837,7 @@ export async function runOrchestrator(params: {
     }
 
     // Validate Planner workspace ownership — only plan.md and GOAL.md may change
-    const plannerWorkspaceCheck = await validatePlannerWorkspaceOwnership(projectRoot, plannerResult.prePlannerSnapshot);
+    const plannerWorkspaceCheck = await validatePlannerWorkspaceOwnership(projectRoot, plannerResult!.prePlannerSnapshot);
     if (!plannerWorkspaceCheck.valid) {
       await transitionToBlocked(stateStore, `Planner workspace violation: ${plannerWorkspaceCheck.violations.join('; ')}`, eventBus);
       await appendLog(artifactStore, runId, 0, 'PLANNING', 'workspace ownership', 'FAIL', plannerWorkspaceCheck.violations.join('; '));
@@ -830,13 +855,13 @@ export async function runOrchestrator(params: {
 
     // F-307R2: Register Planner agent log files in the orchestrator registry.
     // These are created by the Process Runner infrastructure, not by the Planner agent itself.
-    if (plannerResult.result.stdout_path && existsSync(plannerResult.result.stdout_path)) {
-      const stdoutDigest = computeDigest(readFileSync(plannerResult.result.stdout_path, 'utf8'));
-      orchestratorRegistry.register(plannerResult.result.stdout_path, stdoutDigest);
+    if (plannerResult!.result.stdout_path && existsSync(plannerResult!.result.stdout_path)) {
+      const stdoutDigest = computeDigest(readFileSync(plannerResult!.result.stdout_path, 'utf8'));
+      orchestratorRegistry.register(plannerResult!.result.stdout_path, stdoutDigest);
     }
-    if (plannerResult.result.stderr_path && existsSync(plannerResult.result.stderr_path)) {
-      const stderrDigest = computeDigest(readFileSync(plannerResult.result.stderr_path, 'utf8'));
-      orchestratorRegistry.register(plannerResult.result.stderr_path, stderrDigest);
+    if (plannerResult!.result.stderr_path && existsSync(plannerResult!.result.stderr_path)) {
+      const stderrDigest = computeDigest(readFileSync(plannerResult!.result.stderr_path, 'utf8'));
+      orchestratorRegistry.register(plannerResult!.result.stderr_path, stderrDigest);
     }
 
     // F-307R2: Register Planner-produced artifacts (plan.md, GOAL.md) and iteration-log.md.
