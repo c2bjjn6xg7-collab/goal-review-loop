@@ -20,7 +20,7 @@ interface RootReviewLoopConfig {
 }
 
 describe('root review-loop.yaml', () => {
-  it('uses Claude for Planner to reduce Codex usage', () => {
+  it('has a valid Planner agent command', () => {
     const rawConfig = readFileSync('review-loop.yaml', 'utf8');
     const config = yaml.load(rawConfig) as RootReviewLoopConfig;
     const command = config.agents?.planner?.command;
@@ -28,10 +28,10 @@ describe('root review-loop.yaml', () => {
     expect(Array.isArray(command)).toBe(true);
 
     const shellCommand = (command as string[]).join('\n');
-    expect(shellCommand).toContain('claude -p');
+    // Planner must have a heartbeat wrapper and clean exit handling.
+    // Provider (claude/opencode/codex) is configurable via 'config agents'.
     expect(shellCommand).toContain('REVIEW_LOOP_PLANNER_HEARTBEAT_SECONDS');
-    expect(shellCommand).toContain('[review-loop heartbeat] claude planner still running');
-    expect(shellCommand).toContain('env -u HTTP_PROXY');
+    expect(shellCommand).toContain('[review-loop heartbeat]');
     expect(shellCommand).toContain('kill "$heartbeat_pid"');
     expect(shellCommand).toContain('exit "$status"');
     expect(shellCommand).not.toContain('codex exec');

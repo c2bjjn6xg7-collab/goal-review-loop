@@ -11,6 +11,8 @@ import { createCancelCommand } from './cancel.js';
 import { createProvidersCommand } from './providers.js';
 import { createFollowupsCommand } from './followups.js';
 import { createDashboardCommand } from './dashboard.js';
+import { createConfigCommand } from './config.js';
+import { createCleanCommand } from './clean.js';
 
 export function createCLI(): Command {
   const program = new Command();
@@ -28,6 +30,8 @@ export function createCLI(): Command {
   program.addCommand(createProvidersCommand());
   program.addCommand(createFollowupsCommand());
   program.addCommand(createDashboardCommand());
+  program.addCommand(createConfigCommand());
+  program.addCommand(createCleanCommand());
 
   return program;
 }

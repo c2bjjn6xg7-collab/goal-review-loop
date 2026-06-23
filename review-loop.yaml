@@ -1,19 +1,18 @@
 version: 1
-
 agents:
   planner:
     command:
-      - "sh"
-      - "-c"
-      - |
+      - sh
+      - '-c'
+      - |-
         P=$(cat "$1")
         heartbeat_interval="${REVIEW_LOOP_PLANNER_HEARTBEAT_SECONDS:-30}"
         (
           while :; do
             sleep "$heartbeat_interval"
-            printf '[review-loop heartbeat] opencode planner still running (%ss idle heartbeat)\n' "$heartbeat_interval" >&2
+            printf '[review-loop heartbeat] planner still running (%%ss idle heartbeat)\n' "$heartbeat_interval" >&2
           done
-        ) &
+         ) &
         heartbeat_pid=$!
         trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM
         npx opencode-ai run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay "$P"
@@ -21,14 +20,14 @@ agents:
         kill "$heartbeat_pid" 2>/dev/null || true
         wait "$heartbeat_pid" 2>/dev/null || true
         exit "$status"
-      - "opencode-planner"
-      - "{prompt_file}"
+      - opencode-planner
+      - '{prompt_file}'
     timeout_seconds: 1800
     provider: opencode
   developer:
     command:
-      - "sh"
-      - "-c"
+      - sh
+      - '-c'
       - |
         P=$(cat "$1")
         heartbeat_interval="${REVIEW_LOOP_DEVELOPER_HEARTBEAT_SECONDS:-30}"
@@ -46,16 +45,25 @@ agents:
         kill "$heartbeat_pid" 2>/dev/null || true
         wait "$heartbeat_pid" 2>/dev/null || true
         exit "$status"
-      - "claude-developer"
-      - "{prompt_file}"
+      - claude-developer
+      - '{prompt_file}'
     timeout_seconds: 3600
   auditor:
-    command: ["codex", "exec", "-s", "workspace-write", "{prompt_file}"]
+    command:
+      - codex
+      - exec
+      - '-s'
+      - workspace-write
+      - '{prompt_file}'
     timeout_seconds: 1800
   final_auditor:
-    command: ["codex", "exec", "-s", "workspace-write", "{prompt_file}"]
+    command:
+      - codex
+      - exec
+      - '-s'
+      - workspace-write
+      - '{prompt_file}'
     timeout_seconds: 1800
-
 providers:
   claude:
     enabled: true
@@ -65,27 +73,23 @@ providers:
     enabled: true
     network:
       proxy_mode: inherit
-
 loop:
   max_iterations: 3
   archive_history: true
   stop_on_infrastructure_error: true
-
 parallel:
   enabled: true
   max_parallel_workers: 2
-
 git:
   require_repository: true
   require_head: true
   require_clean_worktree: true
-  branch_template: "agent/{run_id}-{task_slug}"
+  branch_template: agent/{run_id}-{task_slug}
   commit_on_pass: true
-  commit_template: "feat(agent): complete {task_slug} [{run_id}]"
+  commit_template: 'feat(agent): complete {task_slug} [{run_id}]'
   create_tag: false
-  tag_template: "agent-{run_id}-pass"
+  tag_template: agent-{run_id}-pass
   push: false
-
 runtime:
   kill_grace_seconds: 10
   max_log_bytes: 10485760
