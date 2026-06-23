@@ -108,6 +108,22 @@ These bugs were invisible in unit/integration tests and only surfaced when revie
 
 **Root cause:** Developer (claude) followed the payload pattern for task events, but the schema and serial `role.started` events use event-level `provider`/`model` fields.
 
+### 9. opencode planner failures — two distinct root causes (R6)
+
+**Symptom A:** Planner ran for 9-16 minutes (heartbeat persisting) then exit 1 with opencode `--help` output in stderr. stdout empty.
+
+**Root cause A:** review-loop used `npx opencode-ai` which resolves to the npm package `opencode-ai` — this package only ships a Windows launcher script (`opencode.exe`, a 479-byte ASCII text file), not a macOS binary. The real opencode binary is at `~/.opencode/bin/opencode` (native Mach-O arm64), installed by opencode's own installer, not via npm.
+
+**Fix A:** Changed planner command from `npx opencode-ai run` to `~/.opencode/bin/opencode run`. Uninstalled the npm package (`npm uninstall -g opencode-ai`).
+
+**Symptom B:** Planner immediately printed `--help` and exit 1 (0 heartbeat, instant failure).
+
+**Root cause B:** opencode's `run` command uses yargs for argument parsing. The planner prompt (10KB markdown) contains `---` separators and `--flag-like` text. Without a `--` separator before the prompt argument, yargs parsed these as CLI flags, failed, and printed help.
+
+**Fix B:** Added `--` before `"$P"` in the command: `opencode run --model ... --no-replay -- "$P"`. The `--` tells yargs everything after is positional, not flags.
+
+**Lesson:** When integrating any CLI agent that uses yargs (opencode, and potentially others), always add `--` before the prompt argument to prevent the prompt content from being parsed as CLI flags. This is now enforced in `src/cli/config.ts` `buildCommand()` for the opencode provider.
+
 ## The value of dual auditors
 
 Phase 9's dogfood runs revealed a clear division of labor between the two auditor passes:
@@ -152,6 +168,24 @@ The UI and any future transport (SSE, JSON-RPC) read events; they do not own sch
 ### 7. Concurrent appends must be serialized
 
 `EventStore.append()` uses an in-process promise-chain mutex. Any new code that appends events concurrently (e.g., wave-mode `Promise.all`) is safe under this mutex. Do not bypass it with direct `fs.appendFile` calls.
+
+### 8. CLI agent commands must use `--` before prompt arguments
+
+Any CLI agent that uses yargs for argument parsing (opencode, and potentially others) will misinterpret `--foo` patterns inside the prompt text as CLI flags. This causes immediate help output + exit 1. Always add `--` before the prompt argument in agent command templates:
+
+```
+# WRONG — prompt content parsed as flags:
+opencode run --model X --no-replay "$P"
+
+# RIGHT — -- tells yargs everything after is positional:
+opencode run --model X --no-replay -- "$P"
+```
+
+This is enforced in `src/cli/config.ts` `buildCommand()` for the opencode provider. If adding a new CLI agent provider, apply the same pattern.
+
+### 9. Use the correct binary path, not npx
+
+opencode's native binary is at `~/.opencode/bin/opencode` (installed by opencode's own installer). Do NOT use `npx opencode-ai` — the npm package ships only a Windows launcher, not a macOS binary. The `claude` and `codex` CLIs are installed globally and work via `npx` or direct path. Always verify the binary exists with `which` or `file` before adding it to an agent command template.
 
 ## What's next: R9 JSON-RPC (deferred)
 
