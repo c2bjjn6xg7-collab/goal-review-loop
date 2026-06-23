@@ -204,6 +204,70 @@ export class LockManager {
   }
 
   /**
+   * Acquire the lock, automatically recovering a stale lock if one exists.
+   *
+   * Recovery is performed when the existing lock is held by:
+   *   - a dead PID (any age), or
+   *   - a live PID whose lock age has exceeded `staleSeconds`.
+   *
+   * If the existing lock is held by a live process with a fresh (non-expired)
+   * lock, this throws `LockManagerError` — that is a real concurrency conflict
+   * and must not be silently displaced.
+   *
+   * When no lock exists, this behaves identically to `acquire()`.
+   *
+   * Known limitation — stale-lock recovery TOCTOU window: see the note on
+   * `acquire()`. The same race applies here between staleness detection and
+   * re-acquisition.
+   */
+  async acquireOrRecover(runId: string, staleSeconds = 86400): Promise<void> {
+    // Fast path: no existing lock — normal acquire succeeds.
+    try {
+      await this.acquire(runId, staleSeconds);
+      return;
+    } catch (err) {
+      if (!(err instanceof LockManagerError)) throw err;
+      // Lock exists or contention occurred — fall through to inspect.
+    }
+
+    const existing = await this.readLock();
+    if (!existing) {
+      // Lock disappeared between the failed acquire and readLock — retry once.
+      await this.acquire(runId, staleSeconds);
+      return;
+    }
+
+    // Malformed/corrupted lock — do NOT silently overwrite.
+    if (existing.pid <= 0) {
+      throw new LockManagerError(
+        `Lock file exists but is malformed. Manual intervention required. Delete ${this.lockPath} after verifying no other run is active.`,
+      );
+    }
+
+    const alive = this.isProcessAlive(existing.pid);
+    const lockAge = Date.now() - new Date(existing.created_at).getTime();
+    const expired = lockAge >= staleSeconds * 1000;
+
+    // Real conflict: live process holding a fresh lock.
+    if (alive && !expired) {
+      throw new LockManagerError(
+        `Another run is active: run_id=${existing.run_id}, pid=${existing.pid}, hostname=${existing.hostname}. Cannot start a new run.`,
+      );
+    }
+
+    // Stale lock — dead PID (any age) or live PID past stale threshold.
+    // Remove it and retry the atomic acquire.
+    try {
+      await fs.unlink(this.lockPath);
+    } catch (err) {
+      if ((err as {code?: string}).code !== 'ENOENT') {
+        throw new LockManagerError(`Failed to remove stale lock: ${err}`);
+      }
+    }
+    await this.acquire(runId, staleSeconds);
+  }
+
+  /**
    * Release the lock. runId is REQUIRED — ownership is always verified.
    *
    * Rules:
