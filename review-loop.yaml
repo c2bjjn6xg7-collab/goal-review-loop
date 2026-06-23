@@ -15,14 +15,14 @@ agents:
          ) &
         heartbeat_pid=$!
         trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT INT TERM
-        npx opencode-ai run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay "$P"
+        ~/.opencode/bin/opencode run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay "$P"
         status=$?
         kill "$heartbeat_pid" 2>/dev/null || true
         wait "$heartbeat_pid" 2>/dev/null || true
         exit "$status"
       - opencode-planner
       - '{prompt_file}'
-    timeout_seconds: 1800
+    timeout_seconds: 3600
     provider: opencode
   developer:
     command:
