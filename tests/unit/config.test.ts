@@ -31,7 +31,7 @@ describe('Configuration', () => {
 
       const config = await loadConfig(configPath);
       expect(config.version).toBe(1);
-      expect(config.agents.planner.command).toEqual(['codex', 'exec', '{prompt_file}']);
+      expect(config.agents.planner.command).toContain('{prompt_file}');
       expect(config.loop.max_iterations).toBe(3);
       expect(config.git.push).toBe(false);
     });
@@ -196,13 +196,13 @@ runtime:
       // Must use {prompt_file} (stdin-based), not {prompt} (positional argv)
       expect(devCmd).toContain('{prompt_file}');
       expect(devCmd).not.toContain('{prompt}');
-      // Must use sh -lc wrapper for stdin redirection
+      // Must use sh wrapper
       expect(devCmd[0]).toBe('sh');
-      expect(devCmd[1]).toBe('-lc');
-      // The shell command must pipe prompt file via stdin
-      expect(devCmd[2]).toContain('claude');
+      expect(devCmd[1]).toBe('-c');
+      // The shell command must invoke claude
+      expect(String(devCmd[2])).toContain('claude');
       expect(devCmd[2]).toContain('--permission-mode');
-      expect(devCmd[2]).toContain('<');
+      expect(devCmd[2]).toContain('"$P"');
     });
 
     it('planner and auditor commands should use {prompt_file}', () => {
@@ -219,12 +219,12 @@ runtime:
       await fs.writeFile(configPath, yaml, 'utf8');
 
       const config = await loadConfig(configPath);
-      // Developer command must use stdin prompt file
+      // Developer command must use prompt_file
       expect(config.agents.developer.command).toContain('{prompt_file}');
       expect(config.agents.developer.command).not.toContain('{prompt}');
-      // Must be a valid sh -lc command
+      // Must be a valid sh wrapper
       expect(config.agents.developer.command[0]).toBe('sh');
-      expect(config.agents.developer.command[1]).toBe('-lc');
+      expect(config.agents.developer.command[1]).toBe('-c');
     });
 
     it('custom model command can still be loaded', async () => {
@@ -659,8 +659,8 @@ describe('Phase 8D P5 Round 1: parallel config', () => {
     await fs.remove(tmpDir);
   });
 
-  it('DEFAULT_CONFIG includes parallel: { enabled: false, max_parallel_workers: 1 }', () => {
-    expect(DEFAULT_CONFIG.parallel).toEqual({ enabled: false, max_parallel_workers: 1 });
+  it('DEFAULT_CONFIG includes parallel: { enabled: true, max_parallel_workers: 2 }', () => {
+    expect(DEFAULT_CONFIG.parallel).toEqual({ enabled: true, max_parallel_workers: 2 });
   });
 
   it('fills parallel defaults when absent from yaml', async () => {

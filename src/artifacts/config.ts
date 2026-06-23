@@ -201,11 +201,22 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
   version: 1,
   agents: {
     planner: {
-      command: ['codex', 'exec', '{prompt_file}'],
-      timeout_seconds: 1800,
+      command: [
+        'sh', '-c',
+        'P=$(cat "$1")\nheartbeat_interval="${REVIEW_LOOP_PLANNER_HEARTBEAT_SECONDS:-30}"\n(\n  while :; do\n    sleep "$heartbeat_interval"\n    printf \'[review-loop heartbeat] planner still running (%ss idle heartbeat)\\n\' "$heartbeat_interval" >&2\n  done\n) &\nheartbeat_pid=$!\ntrap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM\n~/.opencode/bin/opencode run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay -- "$P"\nstatus=$?\nkill "$heartbeat_pid" 2>/dev/null || true\nwait "$heartbeat_pid" 2>/dev/null || true\nexit "$status"',
+        'opencode-planner',
+        '{prompt_file}',
+      ],
+      timeout_seconds: 3600,
+      provider: 'opencode',
     },
     developer: {
-      command: ['sh', '-lc', 'exec claude -p --permission-mode acceptEdits < "$1"', 'claude-developer', '{prompt_file}'],
+      command: [
+        'sh', '-c',
+        'P=$(cat "$1")\nheartbeat_interval="${REVIEW_LOOP_DEVELOPER_HEARTBEAT_SECONDS:-30}"\n(\n  while :; do\n    sleep "$heartbeat_interval"\n    printf \'[review-loop heartbeat] developer still running (%ss idle heartbeat)\\n\' "$heartbeat_interval" >&2\n  done\n) &\nheartbeat_pid=$!\ntrap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM\nenv -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \\\n  claude -p --permission-mode bypassPermissions --max-turns 160 -- "$P"\nstatus=$?\nkill "$heartbeat_pid" 2>/dev/null || true\nwait "$heartbeat_pid" 2>/dev/null || true\nexit "$status"',
+        'claude-developer',
+        '{prompt_file}',
+      ],
       timeout_seconds: 3600,
     },
     auditor: {
@@ -249,8 +260,8 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
     allowed_types_per_role: DEFAULT_FEEDBACK_ALLOWED_TYPES,
   },
   parallel: {
-    enabled: false,
-    max_parallel_workers: 1,
+    enabled: true,
+    max_parallel_workers: 2,
   },
 };
 
@@ -331,13 +342,16 @@ export async function loadConfig(configPath: string): Promise<ReviewLoopConfig> 
     // Phase 10: validate allowed_types_per_role values are legal FeedbackType subset
     validateFeedbackTypes(config);
 
-    // Phase 8D P5 Round 1: fill parallel defaults when absent. The schema
-    // requires both leaf fields when `parallel` is provided, so we don't
-    // patch a partial object here — only the entire default block.
+    // Phase 8D P5 Round 1: fill parallel defaults when absent.
+    // When parallel is not specified in the yaml, default to disabled
+    // (serial mode). This is safer for test compatibility and for users
+    // who haven't opted in to wave mode. DEFAULT_CONFIG.parallel may be
+    // enabled for the init template, but loading an existing config
+    // without a parallel section should not auto-enable it.
     if (!config.parallel) {
       config.parallel = {
-        enabled: DEFAULT_CONFIG.parallel!.enabled,
-        max_parallel_workers: DEFAULT_CONFIG.parallel!.max_parallel_workers,
+        enabled: false,
+        max_parallel_workers: 1,
       };
     }
 
