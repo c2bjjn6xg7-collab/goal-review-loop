@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs-extra';
 import path from 'node:path';
 import os from 'node:os';
-import { RunLister } from '../../src/web/run-lister.js';
+import { RunLister, deriveDisplayTitle } from '../../src/web/run-lister.js';
 import { EventStore } from '../../src/runtime/event-store.js';
 
 describe('RunLister', () => {
@@ -281,5 +281,150 @@ describe('RunLister', () => {
     lister.clearCache();
     const third = await lister.list();
     expect(third.runs).toHaveLength(2);
+  });
+
+  describe('deriveDisplayTitle', () => {
+    it('returns run_id when events array is empty', () => {
+      expect(deriveDisplayTitle([], 'run-123')).toBe('run-123');
+    });
+
+    it('prefers run.started message with Run started: prefix stripped', () => {
+      const events = [
+        { kind: 'run.started', message: 'Run started: fix login bug', payload: {} },
+        { kind: 'phase.changed', message: 'b', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('fix login bug');
+    });
+
+    it('is case-insensitive when stripping Run started: prefix', () => {
+      const events = [
+        { kind: 'run.started', message: 'RUN STARTED: uppercase prefix', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('uppercase prefix');
+    });
+
+    it('falls back to payload.goal', () => {
+      const events = [
+        { kind: 'run.started', message: 'Run started:', payload: { goal: 'Deploy to prod' } },
+        { kind: 'phase.changed', message: '', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('Deploy to prod');
+    });
+
+    it('falls back to payload.task when goal is absent', () => {
+      const events = [
+        { kind: 'run.started', message: '', payload: { task: 'Refactor auth' } },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('Refactor auth');
+    });
+
+    it('prefers payload.goal over payload.task', () => {
+      const events = [
+        { kind: 'run.started', message: '', payload: { goal: 'Goal A', task: 'Task B' } },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('Goal A');
+    });
+
+    it('falls back to first non-empty message', () => {
+      const events = [
+        { kind: 'run.started', message: '', payload: {} },
+        { kind: 'phase.changed', message: 'Phase changed message', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('Phase changed message');
+    });
+
+    it('falls back to run_id when no useful content exists', () => {
+      const events = [
+        { kind: 'run.started', message: '', payload: {} },
+        { kind: 'phase.changed', message: '   ', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('run-123');
+    });
+
+    it('trims and collapses multiple spaces', () => {
+      const events = [
+        { kind: 'run.started', message: '  too    many   spaces  ', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('too many spaces');
+    });
+
+    it('strips leading markdown headings', () => {
+      const events = [
+        { kind: 'run.started', message: '### Section header', payload: {} },
+      ] as any[];
+      expect(deriveDisplayTitle(events, 'run-123')).toBe('Section header');
+    });
+
+    it('caps title at ~48 characters with ellipsis', () => {
+      const longTitle = 'a'.repeat(60);
+      const events = [
+        { kind: 'run.started', message: longTitle, payload: {} },
+      ] as any[];
+      const result = deriveDisplayTitle(events, 'run-123');
+      expect(result.length).toBe(48); // 47 chars + '…'
+      expect(result).toBe('a'.repeat(47) + '…');
+    });
+  });
+
+  describe('RunSummary display_title integration', () => {
+    it('includes display_title for active run from run.started message', async () => {
+      const store = new EventStore(agentDir, 'run-active');
+      await store.append({
+        kind: 'run.started',
+        phase: 'INITIALIZING',
+        level: 'info',
+        message: 'Run started: implement feature X',
+      });
+      await store.append({
+        kind: 'phase.changed',
+        phase: 'PLANNING',
+        level: 'info',
+        message: 'b',
+      });
+
+      const lister = new RunLister({ projectRoot: tmpDir });
+      const out = await lister.list();
+      expect(out.runs).toHaveLength(1);
+      expect(out.runs[0].display_title).toBe('implement feature X');
+    });
+
+    it('includes display_title for archive from payload.goal fallback', async () => {
+      await fs.ensureDir(historyDir);
+      const lines = [
+        JSON.stringify({
+          schema_version: 1,
+          run_id: '20260101000000-goal',
+          seq: 1,
+          event_id: 'id-1',
+          ts: '2026-01-01T00:00:00.000Z',
+          kind: 'run.started',
+          phase: 'INITIALIZING',
+          level: 'info',
+          message: 'Run started:',
+          payload: { goal: 'Archive goal title' },
+        }),
+        JSON.stringify({
+          schema_version: 1,
+          run_id: '20260101000000-goal',
+          seq: 2,
+          event_id: 'id-2',
+          ts: '2026-01-01T00:01:00.000Z',
+          kind: 'run.completed',
+          phase: 'PASSED',
+          level: 'info',
+          message: 'x',
+        }),
+      ].join('\n') + '\n';
+      await fs.writeFile(
+        path.join(historyDir, 'events-20260101000000-goal.jsonl'),
+        lines,
+      );
+
+      const lister = new RunLister({ projectRoot: tmpDir });
+      const out = await lister.list();
+      expect(out.runs).toHaveLength(1);
+      expect(out.runs[0].display_title).toBe('Archive goal title');
+      expect(out.runs[0].source).toBe('history');
+    });
   });
 });
