@@ -23,6 +23,7 @@ export interface RunSummary {
   is_active: boolean;
   source: 'history' | 'active';
   friendly_time: string;
+  display_title?: string;
 }
 
 export interface RunListing {
@@ -93,6 +94,55 @@ export async function resolveArchiveByRunId(
   return null;
 }
 
+export function deriveDisplayTitle(events: ReviewLoopEvent[], runId: string): string {
+  if (events.length === 0) return runId;
+
+  // 1. Prefer first run.started event message (strip 'Run started:' prefix)
+  const startedEvent = events.find((e) => e.kind === 'run.started');
+  if (startedEvent && startedEvent.message) {
+    const stripped = startedEvent.message.replace(/^Run started:\s*/i, '').trim();
+    if (stripped) {
+      return normalizeTitle(stripped);
+    }
+  }
+
+  // 2. Fallback to payload.goal or payload.task
+  for (const event of events) {
+    if (event.payload) {
+      const goal = event.payload.goal;
+      const task = event.payload.task;
+      if (typeof goal === 'string' && goal.trim()) {
+        return normalizeTitle(goal);
+      }
+      if (typeof task === 'string' && task.trim()) {
+        return normalizeTitle(task);
+      }
+    }
+  }
+
+  // 3. Fallback to first non-empty message
+  const firstMessage = events.find((e) => e.message && e.message.trim());
+  if (firstMessage) {
+    return normalizeTitle(firstMessage.message);
+  }
+
+  // 4. Final fallback to run_id
+  return runId;
+}
+
+function normalizeTitle(raw: string): string {
+  let title = raw.trim();
+  // Collapse multiple spaces
+  title = title.replace(/\s+/g, ' ');
+  // Strip leading markdown headings (e.g. "# Title", "## Title")
+  title = title.replace(/^(#{1,6})\s+/, '');
+  // Cap at ~48 display characters
+  if (title.length > 48) {
+    title = title.slice(0, 47) + '…';
+  }
+  return title;
+}
+
 function buildFriendlyTime(isoTs: string): string {
   const d = new Date(isoTs);
   const month = d.getMonth() + 1; // 1-12, no leading zero
@@ -153,6 +203,7 @@ export class RunLister {
             is_active: false,
             source: 'history',
             friendly_time: buildFriendlyTime(startedAt),
+            display_title: deriveDisplayTitle(events, runId),
           });
         } catch (err) {
           console.warn(`RunLister: skipping malformed archive ${file}`, err);
@@ -187,6 +238,7 @@ export class RunLister {
               is_active: true,
               source: 'active',
               friendly_time: buildFriendlyTime(startedAt),
+              display_title: deriveDisplayTitle(activeEvents, activeRunId),
             });
           }
         }
