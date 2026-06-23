@@ -248,7 +248,7 @@ export async function runOrchestrator(params: {
       // Phase 9 R1: resume continues the same durable event stream.
       eventBus = new EventBus(agentDir, runId);
       try {
-        await lockManager.acquire(runId);
+        await lockManager.acquireOrRecover(runId, config.runtime.lock_stale_seconds);
       } catch (err) {
         return makeBlockedResult(runId, projectRoot, `Lock acquisition failed on resume: ${err instanceof Error ? err.message : String(err)}`, 'STATE_CONFLICT');
       }
@@ -636,7 +636,7 @@ export async function runOrchestrator(params: {
       console.warn(`[event-bus] failed to archive previous run events: ${msg}`);
     }
     try {
-      await lockManager.acquire(runId);
+      await lockManager.acquireOrRecover(runId, config.runtime.lock_stale_seconds);
     } catch (err) {
       return makeBlockedResult(runId, projectRoot, `Lock acquisition failed: ${err instanceof Error ? err.message : String(err)}`, 'STATE_CONFLICT');
     }
