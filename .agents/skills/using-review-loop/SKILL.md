@@ -1,0 +1,157 @@
+---
+name: using-review-loop
+description: Use when operating review-loop CLI to run AI development tasks — covers starting runs, monitoring progress, switching models, cleaning up, and avoiding known pitfalls with opencode/claude/codex providers
+---
+
+# Using Review-Loop
+
+How to operate the `review-loop` CLI to run multi-agent AI development tasks.
+
+**Core workflow:** Clean → Start → Monitor → Verify → Merge.
+
+## Quick Start
+
+```bash
+review-loop clean                              # Clear stale run artifacts
+review-loop start --request "..." --parallel   # Start a task (parallel mode is default)
+review-loop dashboard                          # Browser: live output + events + cancel
+```
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `review-loop start --request "..." --task-slug "..."` | Start a development task |
+| `review-loop start --watch` | Start with inline terminal progress |
+| `review-loop status --watch` | Terminal event stream monitor |
+| `review-loop dashboard` | Browser dashboard (SSE live output + timeline + cancel) |
+| `review-loop resume` | Resume an interrupted run |
+| `review-loop cancel` | Cancel active run |
+| `review-loop clean` | Remove stale state.json/lock/worktrees |
+| `review-loop clean --dry-run` | Preview what would be cleaned |
+| `review-loop config agents` | Interactive: view/switch role→model |
+| `review-loop config agents --set planner=claude` | Non-interactive model switch |
+| `review-loop providers list` | List registered agent providers |
+
+## Switching Models
+
+Each role (planner/developer/auditor/final_auditor) can use a different AI CLI:
+
+```bash
+review-loop config agents --set planner=opencode/ownplan/deepseekv4pro
+review-loop config agents --set developer=claude
+review-loop config agents --set auditor=codex
+```
+
+## CRITICAL: Known Pitfalls
+
+### 1. opencode binary path
+
+**Never use `npx opencode-ai`** — the npm package ships only a Windows launcher, not a macOS binary.
+
+**Always use `~/.opencode/bin/opencode`** — the native binary installed by opencode's own installer.
+
+Verify before use:
+```bash
+file ~/.opencode/bin/opencode  # Should show: Mach-O 64-bit executable arm64
+```
+
+### 2. yargs flag parsing
+
+CLI agents that use yargs (opencode, possibly others) will parse `--foo` patterns inside prompt text as CLI flags. This causes immediate help output + exit 1.
+
+**Always add `--` before the prompt argument in agent commands:**
+```
+# WRONG:
+opencode run --model X --no-replay "$P"
+# RIGHT:
+opencode run --model X --no-replay -- "$P"
+```
+
+This is enforced in `src/cli/config.ts` for the opencode provider.
+
+### 3. Git worktree must be clean
+
+`review-loop start` requires a clean git worktree. If a previous run left uncommitted changes:
+
+```bash
+git checkout -- .
+git clean -fd
+review-loop clean
+review-loop start --request "..."
+```
+
+### 4. Stale run state blocks new runs
+
+If `state.json` has a non-terminal phase from a crashed/interrupted run, new runs will block:
+
+```bash
+review-loop clean  # Removes state.json, run.lock, cancel-request.json, worktrees/
+```
+
+### 5. events.jsonl is per-run isolated
+
+Each run gets a fresh `events.jsonl`. Previous runs are auto-archived to `.agent/history/events-<runId>.jsonl`. Do not manually delete `events.jsonl` — the orchestrator handles archival.
+
+### 6. review-loop.yaml is JSON-in-YAML
+
+The file has a `.yaml` extension but content may be JSON or YAML. The `config agents` command handles parsing/writing correctly. If editing manually, preserve the existing format.
+
+## Monitoring a Run
+
+### Browser Dashboard (recommended)
+
+```bash
+review-loop dashboard --port 8800
+# Open http://127.0.0.1:8800
+```
+
+Shows: current phase, agent status, stage progress bar, event timeline, live agent output (filtered), artifacts, run selector, cancel button.
+
+### Terminal
+
+```bash
+review-loop status --watch          # Human-readable
+review-loop status --watch --json   # JSON Lines (for external tools)
+```
+
+### What you'll see during a run
+
+Events fire at **phase boundaries**, not continuously:
+- `run.started` → `role.started planner` → [planner runs 2-5 min, heartbeat every 30s] → `role.exited` → `task.started` → [developer runs 5-10 min] → `task.completed` → `role.started auditor` → ... → `run.completed`
+
+Quiet periods between events are normal — the agent is working. Heartbeat events (every 30s) confirm the agent process is alive.
+
+## Parallel Execution
+
+Parallel mode is enabled by default (`parallel.enabled: true` in review-loop.yaml).
+
+Planner splits tasks into parallelizable groups. Independent tasks run concurrently in isolated git worktrees. Tasks with dependencies run sequentially after their prerequisites complete.
+
+```bash
+# Override worker count:
+review-loop start --request "..." --parallel --max-parallel-workers 4
+```
+
+## After a Run Completes
+
+```bash
+# Check the result
+git log --oneline -3                          # Review-loop commits to a feature branch
+
+# Independently verify (don't trust PASS blindly):
+git checkout agent/<run-id>-<task-slug>
+npm run typecheck && npm run lint && npm test -- --run
+
+# Merge to main:
+git checkout main
+git merge --no-ff agent/<branch> -m "..."
+git tag -a <phase>-reviewed -m "..."
+git branch -d agent/<branch>
+```
+
+## Reference
+
+- Requirements: `docs/superpowers/specs/2026-06-21-phase-9-review-loop-observability-requirements.md`
+- Dogfood lessons: `docs/superpowers/specs/2026-06-22-phase-9-dogfood-lessons.md`
+- Handoff: `docs/superpowers/handoffs/2026-06-22-phase-9-r3-and-beyond.md`
