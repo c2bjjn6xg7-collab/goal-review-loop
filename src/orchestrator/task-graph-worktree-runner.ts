@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 import fs from 'fs-extra';
 import { computeDigest } from '../runtime/digest.js';
 import { ArtifactStore } from '../artifacts/artifact-store.js';
@@ -12,6 +13,7 @@ import {
   runTaskGraphTaskSerial,
 } from './task-graph-loop.js';
 import {
+  appendLog,
   OrchestratorFileRegistry,
   registerDirectoryFiles,
 } from './run-orchestrator.js';
@@ -92,6 +94,9 @@ export async function runTaskInWorktree(
   const workerAgentDir = workerArtifactStore.agentDir;
   const workerStateStore = new StateStore(workerAgentDir);
   const workerRegistry = new OrchestratorFileRegistry();
+  // Scheduler-level artifact store for iteration-log entries visible to the
+  // orchestrator after the worker worktree is cleaned up (e.g. retry logs).
+  const schedulerArtifactStore = new ArtifactStore(projectRoot);
 
   await copySchedulerArtifacts(projectRoot, workerProjectRoot, params.taskGraph);
 
@@ -120,27 +125,60 @@ export async function runTaskInWorktree(
 
   try {
     const tgState = await readRequiredTaskGraphState(workerStateStore);
-    const taskExecution = await runTaskGraphTaskSerial({
-      projectRoot: workerProjectRoot,
-      agentDir: workerAgentDir,
-      runId: params.runId,
-      stateStore: workerStateStore,
-      artifactStore: workerArtifactStore,
-      orchestratorRegistry: workerRegistry,
-      config: params.config,
-      currentBranch: worktree.branch,
-      baseCommit,
-      taskGraph: params.taskGraph,
-      task: params.task,
-      taskIndex,
-      taskTotal,
-      tgState,
-      maxIterations,
-      combinedSignal,
-      goalPath,
-      handoffPath,
-      goalSuccessCriteria,
-    });
+    const maxRetries = params.config.loop.max_agent_retries ?? 0;
+    let taskExecution: Awaited<ReturnType<typeof runTaskGraphTaskSerial>> | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        await appendLog(
+          schedulerArtifactStore,
+          params.runId,
+          taskIndex + 1,
+          'DEVELOPING',
+          `task ${params.task.id} retry ${attempt}`,
+          'FAIL',
+          `Task ${params.task.id} developer failed with AGENT_ERROR, retrying (attempt ${attempt + 1})`,
+        );
+        resetWorktreeToBase(workerProjectRoot, baseCommit);
+      }
+
+      taskExecution = await runTaskGraphTaskSerial({
+        projectRoot: workerProjectRoot,
+        agentDir: workerAgentDir,
+        runId: params.runId,
+        stateStore: workerStateStore,
+        artifactStore: workerArtifactStore,
+        orchestratorRegistry: workerRegistry,
+        config: params.config,
+        currentBranch: worktree.branch,
+        baseCommit,
+        taskGraph: params.taskGraph,
+        task: params.task,
+        taskIndex,
+        taskTotal,
+        tgState,
+        maxIterations,
+        combinedSignal,
+        goalPath,
+        handoffPath,
+        goalSuccessCriteria,
+      });
+
+      // CANCELLED: terminal result set — never retry.
+      if (taskExecution.terminalResult) break;
+      // Passed: done.
+      if (taskExecution.passed) break;
+      // Failed: only retry on AGENT_ERROR (developer crash / non-zero exit).
+      // Scope violations, handoff invalid, verification failures, etc. are not retried.
+      const errStr = taskExecution.error ?? '';
+      const isAgentError = errStr.includes('AGENT_ERROR') || errStr.includes('exit');
+      if (!isAgentError) break;
+      // else: retry (loop continues, or exits if attempt === maxRetries)
+    }
+
+    if (!taskExecution) {
+      throw new Error('Task execution did not produce a result');
+    }
 
     if (taskExecution.terminalResult) {
       status = taskExecution.terminalResult.phase === PhaseEnum.BLOCKED ? 'blocked' : 'failed';
@@ -435,4 +473,12 @@ function assertGitOk(
   if (result.exit_code !== 0) {
     throw new Error(`${label} failed: ${result.stderr || result.stdout || `exit ${result.exit_code}`}`);
   }
+}
+
+function resetWorktreeToBase(worktreePath: string, baseCommit: string): void {
+  // Discard all changes from the failed attempt so the retry starts clean.
+  // stdio: 'pipe' keeps reset output out of the orchestrator's stdout/stderr.
+  execSync('git checkout -- .', { cwd: worktreePath, stdio: 'pipe' });
+  execSync('git clean -fd', { cwd: worktreePath, stdio: 'pipe' });
+  execSync(`git reset --hard ${baseCommit}`, { cwd: worktreePath, stdio: 'pipe' });
 }
