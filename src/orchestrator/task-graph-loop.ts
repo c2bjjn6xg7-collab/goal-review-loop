@@ -29,6 +29,7 @@ import {
 } from '../agents/prompt-builder.js';
 import { buildDeveloperInput, validateDeveloperOutput } from '../agents/developer-adapter.js';
 import { buildAuditorInput } from '../agents/auditor-adapter.js';
+import { buildReworkInstructions, writeReworkInstructions, buildReworkFindingsFromAudit } from './rework-instructions.js';
 import { orderedTasks, initialTaskStatuses, initialTaskAttempts } from '../scheduler/task-graph.js';
 import { runAgent, buildAgentLogPaths } from '../agents/agent-adapter.js';
 import { resolveCommandForAgent } from '../providers/provider-registry.js';
@@ -692,66 +693,73 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
   // ── Audit the full cumulative diff before finalization ──
   // runFinalization runs the Final Auditor, which requires audit-report.md to
   // exist. Run one Auditor pass over the integration diff to produce it.
-  const auditIteration = integrationIteration;
-  await stateStore.transition(PhaseEnum.AUDITING);
-  await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor start', 'PASS');
-  await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Auditor (integration)', registry: orchestratorRegistry });
-  await eventBus.emit({
-    kind: 'role.started',
-    phase: 'AUDITING',
-    level: 'info',
-    message: 'Integration Auditor starting',
-    role: 'auditor',
-    provider: config.agents.auditor.provider ?? 'codex',
-  });
+  // If auditor returns REWORK, re-run the last task's developer with rework
+  // instructions and re-audit, up to max_iterations.
+  for (let auditIteration = integrationIteration; auditIteration < integrationIteration + maxIterations; auditIteration++) {
+    // Transition to AUDITING — from VERIFYING (first pass) or DEVELOPING (rework)
+    const currentState = await stateStore.read();
+    if (currentState.phase !== PhaseEnum.AUDITING) {
+      await stateStore.transition(PhaseEnum.AUDITING);
+    }
+    await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor start', 'PASS');
+    await emitProgress({ projectRoot, stateStore, lastEvent: 'Starting Auditor (integration)', registry: orchestratorRegistry });
+    await eventBus.emit({
+      kind: 'role.started',
+      phase: 'AUDITING',
+      level: 'info',
+      message: 'Integration Auditor starting',
+      role: 'auditor',
+      provider: config.agents.auditor.provider ?? 'codex',
+    });
 
-  {
-    let auditorPromptFile: string | undefined;
     let auditorResult;
     let auditorCleanupResult: PromptCleanupResult | undefined;
-    try {
-      const iterStr = String(auditIteration).padStart(2, '0');
-      const taskGraphFeedbackNotes = await readFeedbackNotesForAudit(projectRoot);
-      const promptResult = await buildPrompt(
-        projectRoot,
-        'auditor.md',
-        (template) => buildAuditorPrompt(template, {
+    {
+      let auditorPromptFile: string | undefined;
+      try {
+        const iterStr = String(auditIteration).padStart(2, '0');
+        const taskGraphFeedbackNotes = await readFeedbackNotesForAudit(projectRoot);
+        const promptResult = await buildPrompt(
+          projectRoot,
+          'auditor.md',
+          (template) => buildAuditorPrompt(template, {
+            run_id: runId,
+            iteration: auditIteration,
+            project_root: projectRoot,
+            plan_path: join(projectRoot, '.agent/plan.md'),
+            goal_path: join(projectRoot, '.agent/GOAL.md'),
+            handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
+            verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
+            changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
+            untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
+            scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
+            tracked_diff_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'tracked.diff'),
+            diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
+            audit_report_path: join(projectRoot, '.agent/audit-report.md'),
+            goal_digest: goalDigest,
+            diff_digest: diffDigest,
+            feedback_notes: taskGraphFeedbackNotes,
+            feedback_notes_path: '.agent/feedback-notes.md',
+          }),
+          { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
+        );
+        auditorPromptFile = promptResult.prompt_file_path ?? undefined;
+
+        const auditorInput = buildAuditorInput({
           run_id: runId,
           iteration: auditIteration,
           project_root: projectRoot,
-          plan_path: join(projectRoot, '.agent/plan.md'),
-          goal_path: join(projectRoot, '.agent/GOAL.md'),
-          handoff_path: join(projectRoot, '.agent/developer-handoff.md'),
-          verification_manifest_path: join(agentDir, 'verification', 'manifest.json'),
-          changed_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'changed-files.json'),
-          untracked_files_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'untracked-files.json'),
-          scope_report_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'scope-report.json'),
-          tracked_diff_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'tracked.diff'),
-          diff_metadata_path: join(agentDir, 'evidence', `iteration-${iterStr}`, 'diff-metadata.json'),
-          audit_report_path: join(projectRoot, '.agent/audit-report.md'),
-          goal_digest: goalDigest,
-          diff_digest: diffDigest,
-          feedback_notes: taskGraphFeedbackNotes,
-          feedback_notes_path: '.agent/feedback-notes.md',
-        }),
-        { use_prompt_file: true, agent_dir: agentDir, run_id: runId, role: 'auditor' },
-      );
-      auditorPromptFile = promptResult.prompt_file_path ?? undefined;
-
-      const auditorInput = buildAuditorInput({
-        run_id: runId,
-        iteration: auditIteration,
-        project_root: projectRoot,
-        command_template: resolveCommandForAgent(config.agents.auditor.command, config.agents.auditor.provider, config),
-        timeout_seconds: config.agents.auditor.timeout_seconds,
-        prompt: promptResult.prompt,
-        prompt_file: auditorPromptFile,
-        signal: combinedSignal,
+          command_template: resolveCommandForAgent(config.agents.auditor.command, config.agents.auditor.provider, config),
+          timeout_seconds: config.agents.auditor.timeout_seconds,
+          prompt: promptResult.prompt,
+          prompt_file: auditorPromptFile,
+          signal: combinedSignal,
         eventBus: eventBus,
       });
       auditorResult = await runAgent(auditorInput, projectRoot);
-    } finally {
-      if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
+      } finally {
+        if (auditorPromptFile) auditorCleanupResult = await deletePromptFile(auditorPromptFile);
+      }
     }
 
     if (auditorResult) {
@@ -791,6 +799,23 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
       return makeBlockedResult(runId, projectRoot, `Auditor failed: ${auditorResult.error?.message ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
     }
 
+    // Parse audit decision (PASS vs REWORK/FAIL)
+    // Use validateAuditorOutput but only care about the decision field.
+    // Task-graph integration audit may have different digest formats than
+    // serial mode, so we don't enforce digest matching here.
+    const auditReportContent = existsSync(join(agentDir, 'audit-report.md'))
+      ? readFileSync(join(agentDir, 'audit-report.md'), 'utf8') : '';
+    let decision: string | null = null;
+    try {
+      const { parseAuditReport } = await import('../artifacts/artifact-schemas.js');
+      const { frontMatter } = parseAuditReport(auditReportContent, join(agentDir, 'audit-report.md'));
+      decision = frontMatter.decision;
+    } catch {
+      // If we can't parse, treat as REWORK to be safe
+      decision = 'FAIL';
+    }
+    const auditValidation = { decision, effectiveDecision: decision, errors: [] as string[], valid: true };
+
     // Register audit-report.md
     const auditReportPath = join(agentDir, 'audit-report.md');
     if (existsSync(auditReportPath)) {
@@ -799,14 +824,89 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     await eventBus.emit({
       kind: 'audit.decision',
       phase: 'AUDITING',
-      level: 'info',
-      message: `Integration Auditor decision: PASS (iter ${auditIteration})`,
+      level: decision === 'PASS' ? 'info' : 'warn',
+      message: `Integration Auditor decision: ${decision === 'PASS' ? 'PASS' : 'REWORK'} (iter ${auditIteration})`,
       role: 'auditor',
-      status: 'PASS',
+      status: decision === 'PASS' ? 'PASS' : 'FAIL',
       artifact_refs: [{ type: 'audit-report', path: '.agent/audit-report.md' }],
-      payload: { integration_audit: true, diff_digest: diffDigest },
+      payload: {
+        integration_audit: true,
+        diff_digest: diffDigest,
+        finding_count: auditValidation.errors.length,
+        ...(decision !== 'PASS' ? { rework_reason: '.agent/audit-report.md' } : {}),
+      },
     });
-    await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor completed', 'PASS');
+    await appendLog(artifactStore, runId, auditIteration, 'AUDITING', 'auditor completed', decision === 'PASS' ? 'PASS' : 'FAIL');
+
+    if (decision === 'PASS') {
+      break; // proceed to FINALIZING
+    }
+
+    // REWORK: write rework instructions and re-run last task's developer
+    if (auditIteration >= integrationIteration + maxIterations - 1) {
+      // Exhausted rework iterations
+      await transitionToBlocked(stateStore, `Integration audit REWORK after ${maxIterations} iterations`, eventBus);
+      return makeBlockedResult(runId, projectRoot, `Integration audit REWORK after ${maxIterations} iterations`, 'AGENT_ERROR', currentBranch);
+    }
+
+    // Write rework instructions from audit findings
+    const reworkFindings = buildReworkFindingsFromAudit(auditReportContent, auditIteration);
+    const reworkContent = buildReworkInstructions({
+      run_id: runId,
+      iteration: auditIteration,
+      source: 'audit',
+      findings: reworkFindings,
+      goal_path: join(projectRoot, '.agent/GOAL.md'),
+      evidence_paths: [],
+      verification_commands: [],
+      project_root: projectRoot,
+    });
+    await writeReworkInstructions(projectRoot, reworkContent);
+
+    await stateStore.transition(PhaseEnum.REWORKING);
+    await appendLog(artifactStore, runId, auditIteration, 'REWORKING', 'integration rework', 'PASS', `Auditor requested rework (iteration ${auditIteration})`);
+    await emitProgress({ projectRoot, stateStore, lastEvent: `Integration rework (iteration ${auditIteration})`, registry: orchestratorRegistry });
+
+    // Re-run the last task's developer with rework instructions
+    const lastTask = ordered[ordered.length - 1];
+    const tgState = await stateStore.read();
+    const reworkTaskExecution = await runTaskGraphTaskSerial({
+      projectRoot,
+      agentDir,
+      runId,
+      stateStore,
+      artifactStore,
+      orchestratorRegistry,
+      config,
+      currentBranch,
+      baseCommit,
+      taskGraph,
+      task: lastTask,
+      taskIndex: ordered.length - 1,
+      taskTotal: ordered.length,
+      tgState: tgState.task_graph_state!,
+      maxIterations: 1, // single rework attempt
+      combinedSignal,
+      goalPath: join(projectRoot, '.agent/GOAL.md'),
+      handoffPath: join(projectRoot, '.agent/developer-handoff.md'),
+      goalSuccessCriteria: parseGoalSuccessCriteria(join(projectRoot, '.agent/GOAL.md')),
+    });
+
+    if (reworkTaskExecution.terminalResult) {
+      return reworkTaskExecution.terminalResult;
+    }
+    if (!reworkTaskExecution.passed) {
+      await transitionToBlocked(stateStore, `Rework developer failed: ${reworkTaskExecution.error ?? 'unknown'}`, eventBus);
+      return makeBlockedResult(runId, projectRoot, `Rework developer failed: ${reworkTaskExecution.error ?? 'unknown'}`, 'AGENT_ERROR', currentBranch);
+    }
+
+    // Re-collect diff after rework, then go through VERIFYING → AUDITING
+    const reworkDiff = await collectDiff({ projectRoot, baseCommit, iteration: auditIteration + 1 });
+    await writeDiffArtifacts(projectRoot, auditIteration + 1, reworkDiff);
+    // REWORKING → DEVELOPING → VERIFYING (legal transitions)
+    await stateStore.transition(PhaseEnum.DEVELOPING);
+    await stateStore.transition(PhaseEnum.VERIFYING);
+    // Loop continues to re-audit (VERIFYING → AUDITING is legal)
   }
 
   // Transition to FINALIZING before delegating to the finalization pipeline.
