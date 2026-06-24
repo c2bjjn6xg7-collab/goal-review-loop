@@ -54,6 +54,8 @@ export interface DashboardUiSummary {
   updated_at?: string;
   elapsed_ms?: number;
   active_role?: string;
+  active_provider?: string;
+  active_model?: string;
   active_stage: 'initializing' | 'planning' | 'developing' | 'verifying' | 'auditing' | 'final_auditing' | 'complete' | 'blocked' | 'failed' | 'cancelled' | 'unknown';
   iteration?: number;
   max_iterations?: number;
@@ -202,13 +204,16 @@ export class DashboardEventSource {
 
     const latest = sorted.slice(-MAX_LATEST_EVENTS);
     const artifacts = dedupeArtifacts(sorted);
+    const iter = this.readIterFromState();
+    const uiSummary = buildUiSummary(runId, sorted, iter);
 
     return {
       run_id: runId,
       current_phase: currentPhase,
-      next_action: computeNextAction(currentPhase, this.readIterFromState().iteration, this.readIterFromState().maxIterations),
+      next_action: computeNextAction(currentPhase, iter.iteration, iter.maxIterations),
       latest_events: latest,
       artifacts,
+      ui_summary: uiSummary,
     };
   }
 
@@ -217,7 +222,11 @@ export class DashboardEventSource {
   }
 }
 
-function buildSnapshot(runId: string, events: ReviewLoopEvent[]): DashboardSnapshot {
+function buildSnapshot(
+  runId: string,
+  events: ReviewLoopEvent[],
+  iter: { iteration: number; maxIterations: number } = { iteration: 0, maxIterations: 0 },
+): DashboardSnapshot {
   if (events.length === 0) {
     return {
       run_id: runId,
@@ -233,11 +242,11 @@ function buildSnapshot(runId: string, events: ReviewLoopEvent[]): DashboardSnaps
   const currentPhase = terminal ? terminal.phase : last.phase;
   const latest = sorted.slice(-MAX_LATEST_EVENTS);
   const artifacts = dedupeArtifacts(sorted);
-  const uiSummary = buildUiSummary(runId, sorted);
+  const uiSummary = buildUiSummary(runId, sorted, iter);
   return {
     run_id: runId,
     current_phase: currentPhase,
-    next_action: computeNextAction(currentPhase, 0, 0),
+    next_action: computeNextAction(currentPhase, iter.iteration, iter.maxIterations),
     latest_events: latest,
     artifacts,
     ui_summary: uiSummary,
@@ -253,6 +262,32 @@ function deriveActiveStage(events: ReviewLoopEvent[]): DashboardUiSummary['activ
     if (terminal.kind === 'run.blocked') return 'blocked';
   }
   if (last.phase === 'CANCELLED') return 'cancelled';
+
+  let blockingIndex = -1;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const e = events[i];
+    if (
+      e.kind === 'task.blocked' ||
+      e.kind === 'integration.blocked' ||
+      e.kind === 'provider.failure' ||
+      e.kind === 'role.error' ||
+      e.level === 'error'
+    ) {
+      blockingIndex = i;
+      break;
+    }
+  }
+  if (blockingIndex !== -1) {
+    const recovered = events.slice(blockingIndex + 1).some((e) =>
+      e.kind === 'run.resumed' ||
+      e.kind === 'rework.requested' ||
+      e.kind === 'role.started' ||
+      e.kind === 'task.started' ||
+      e.kind === 'verification.started'
+    );
+    if (!recovered) return 'blocked';
+  }
+
   const phaseMap: Record<string, DashboardUiSummary['active_stage']> = {
     INITIALIZING: 'initializing', PLANNING: 'planning', DEVELOPING: 'developing',
     REWORKING: 'developing', VERIFYING: 'verifying', AUDITING: 'auditing',
@@ -273,15 +308,49 @@ function deriveAgentStatuses(events: ReviewLoopEvent[]): DashboardAgentStatus[] 
       const a = result[e.role as DashboardAgentStatus['role']];
       a.status = 'running'; a.started_at = e.ts;
       a.provider = e.provider; a.model = e.model;
+    } else if (e.kind === 'task.started') {
+      const a = result.developer;
+      a.status = 'running';
+      a.started_at = a.started_at ?? e.ts;
+      a.provider = e.provider ?? a.provider;
+      a.model = e.model ?? a.model;
+    } else if (e.kind === 'role.heartbeat' && e.role && result[e.role as DashboardAgentStatus['role']]) {
+      const a = result[e.role as DashboardAgentStatus['role']];
+      if (a.status === 'waiting') {
+        a.status = 'running';
+      }
+      const elapsed = typeof e.payload?.elapsed_ms === 'number' ? e.payload.elapsed_ms : undefined;
+      if (!a.started_at && elapsed !== undefined) {
+        a.started_at = new Date(new Date(e.ts).getTime() - elapsed).toISOString();
+      }
+      if (elapsed !== undefined) {
+        a.duration_ms = elapsed;
+      }
+      a.provider = e.provider ?? a.provider;
+      a.model = e.model ?? a.model;
     } else if (e.kind === 'role.exited' && e.role && result[e.role as DashboardAgentStatus['role']]) {
       const a = result[e.role as DashboardAgentStatus['role']];
       a.ended_at = e.ts;
       a.status = (e.status === 'success' || e.level !== 'error') ? 'completed' : 'failed';
       if (a.started_at && a.ended_at) a.duration_ms = new Date(a.ended_at).getTime() - new Date(a.started_at).getTime();
+      a.provider = e.provider ?? a.provider;
+      a.model = e.model ?? a.model;
     } else if (e.kind === 'role.error' && e.role && result[e.role as DashboardAgentStatus['role']]) {
       result[e.role as DashboardAgentStatus['role']].status = 'failed';
     } else if (e.kind === 'provider.failure' && e.role && result[e.role as DashboardAgentStatus['role']]) {
       result[e.role as DashboardAgentStatus['role']].status = 'failed';
+    } else if (e.kind === 'task.completed') {
+      const a = result.developer;
+      if (a.status !== 'failed' && a.status !== 'blocked') {
+        a.status = 'completed';
+        a.ended_at = e.ts;
+        if (a.started_at) a.duration_ms = new Date(e.ts).getTime() - new Date(a.started_at).getTime();
+      }
+    } else if (e.kind === 'task.blocked') {
+      const a = result.developer;
+      a.status = 'failed';
+      a.ended_at = e.ts;
+      if (a.started_at) a.duration_ms = new Date(e.ts).getTime() - new Date(a.started_at).getTime();
     }
   }
   // Terminal events override running roles
@@ -304,10 +373,29 @@ function deriveDisplayTitle(events: ReviewLoopEvent[], fallbackRunId: string): s
   return fallbackRunId;
 }
 
-function buildUiSummary(runId: string, events: ReviewLoopEvent[]): DashboardUiSummary {
+function buildUiSummary(
+  runId: string,
+  events: ReviewLoopEvent[],
+  iter: { iteration: number; maxIterations: number } = { iteration: 0, maxIterations: 0 },
+): DashboardUiSummary {
   const activeStage = deriveActiveStage(events);
   const roles = deriveAgentStatuses(events);
-  const activeRole = roles.find((r) => r.status === 'running')?.role;
+  let activeAgent = roles.find((r) => r.status === 'running');
+  if (!activeAgent && (activeStage === 'blocked' || activeStage === 'failed')) {
+    activeAgent = roles.find((r) => r.status === 'failed' || r.status === 'blocked');
+  }
+  if (!activeAgent) {
+    const fallbackRoleByStage: Partial<Record<DashboardUiSummary['active_stage'], DashboardAgentStatus['role']>> = {
+      planning: 'planner',
+      developing: 'developer',
+      auditing: 'auditor',
+      final_auditing: 'final-auditor',
+    };
+    const fallbackRole = fallbackRoleByStage[activeStage];
+    if (fallbackRole) {
+      activeAgent = roles.find((r) => r.role === fallbackRole);
+    }
+  }
   const started = events.find((e) => e.kind === 'run.started' || e.kind === 'run.resumed');
   const last = events[events.length - 1];
   return {
@@ -315,8 +403,12 @@ function buildUiSummary(runId: string, events: ReviewLoopEvent[]): DashboardUiSu
     started_at: started?.ts,
     updated_at: last?.ts,
     elapsed_ms: (started?.ts && last?.ts) ? new Date(last.ts).getTime() - new Date(started.ts).getTime() : undefined,
-    active_role: activeRole,
+    active_role: activeAgent?.role,
+    active_provider: activeAgent?.provider,
+    active_model: activeAgent?.model,
     active_stage: activeStage,
+    iteration: iter.iteration,
+    max_iterations: iter.maxIterations,
     last_event_kind: last?.kind,
     roles,
   };

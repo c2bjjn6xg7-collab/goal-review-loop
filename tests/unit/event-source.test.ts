@@ -78,6 +78,32 @@ describe('DashboardEventSource', () => {
     expect(snap.current_phase).toBe('PASSED');
   });
 
+  it('surfaces task-graph task.blocked as a blocked UI summary with the developer as active role', async () => {
+    const store = new EventStore(agentDir, 'run-1');
+    await store.append({ kind: 'run.started', phase: 'INITIALIZING', level: 'info', message: 'start' });
+    await store.append({
+      kind: 'task.started',
+      phase: 'DEVELOPING',
+      level: 'info',
+      message: 'task start',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4',
+    });
+    await store.append({ kind: 'role.heartbeat', phase: 'DEVELOPING', level: 'info', role: 'developer', message: 'developer still running (30s)', payload: { elapsed_ms: 30000 } });
+    await store.append({ kind: 'task.blocked', phase: 'DEVELOPING', level: 'error', message: 'task blocked' });
+    await store.append({ kind: 'wave.completed', phase: 'DEVELOPING', level: 'info', message: 'wave done' });
+
+    const src = new DashboardEventSource({ projectRoot: tmpDir });
+    const snap = await src.getSnapshot();
+
+    expect(snap.current_phase).toBe('DEVELOPING');
+    expect(snap.ui_summary?.active_stage).toBe('blocked');
+    expect(snap.ui_summary?.active_role).toBe('developer');
+    expect(snap.ui_summary?.active_provider).toBe('anthropic');
+    const developer = snap.ui_summary?.roles.find((r) => r.role === 'developer');
+    expect(developer?.status).toBe('failed');
+  });
+
   it('picks the LAST terminal event for a resumed history (run.blocked → run.resumed → run.completed)', async () => {
     // A resumed run's events.jsonl is append-only and can contain an earlier
     // run.blocked followed by run.resumed and run.completed. The dashboard

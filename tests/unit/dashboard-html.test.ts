@@ -173,7 +173,7 @@ describe('renderDashboardHtml', () => {
 
   it('contains connection status indicator', () => {
     expect(html).toContain('id="connection-status"');
-    expect(html).toContain('已连接');
+    expect(html).toContain('实时连接中');
     expect(html).toContain('已断开');
   });
 
@@ -339,20 +339,31 @@ describe('labelRole', () => {
 describe('labelEventKind', () => {
   it('returns Chinese labels for known event kinds', () => {
     expect(labelEventKind('run.started')).toBe('运行开始');
-    expect(labelEventKind('run.ended')).toBe('运行结束');
+    expect(labelEventKind('run.resumed')).toBe('恢复运行');
+    expect(labelEventKind('run.completed')).toBe('运行完成');
+    expect(labelEventKind('run.blocked')).toBe('运行阻塞');
+    expect(labelEventKind('run.failed')).toBe('运行失败');
     expect(labelEventKind('phase.changed')).toBe('阶段切换');
     expect(labelEventKind('role.started')).toBe('角色开始');
-    expect(labelEventKind('role.output')).toBe('角色输出');
+    expect(labelEventKind('role.output')).toBe('输出');
     expect(labelEventKind('role.heartbeat')).toBe('心跳');
-    expect(labelEventKind('role.exited')).toBe('角色退出');
+    expect(labelEventKind('role.exited')).toBe('角色结束');
     expect(labelEventKind('role.error')).toBe('角色错误');
-    expect(labelEventKind('tool.called')).toBe('工具调用');
-    expect(labelEventKind('tool.result')).toBe('工具结果');
-    expect(labelEventKind('artifact.created')).toBe('产物创建');
-    expect(labelEventKind('artifact.updated')).toBe('产物更新');
-    expect(labelEventKind('comment.added')).toBe('评论添加');
-    expect(labelEventKind('iteration.completed')).toBe('迭代完成');
-    expect(labelEventKind('iteration.started')).toBe('迭代开始');
+    expect(labelEventKind('verification.started')).toBe('本地验证开始');
+    expect(labelEventKind('verification.completed')).toBe('本地验证通过');
+    expect(labelEventKind('verification.failed')).toBe('本地验证失败');
+    expect(labelEventKind('audit.decision')).toBe('审计结论');
+    expect(labelEventKind('rework.requested')).toBe('请求返工');
+    expect(labelEventKind('task.started')).toBe('任务开始');
+    expect(labelEventKind('task.completed')).toBe('任务完成');
+    expect(labelEventKind('task.blocked')).toBe('任务阻塞');
+    expect(labelEventKind('wave.started')).toBe('开发波次开始');
+    expect(labelEventKind('wave.completed')).toBe('开发波次完成');
+    expect(labelEventKind('integration.started')).toBe('集成开始');
+    expect(labelEventKind('integration.completed')).toBe('集成完成');
+    expect(labelEventKind('integration.blocked')).toBe('集成阻塞');
+    expect(labelEventKind('provider.failure')).toBe('模型调用失败');
+    expect(labelEventKind('artifact.created')).toBe('产物生成');
   });
 
   it('falls back to raw value for unknown event kinds', () => {
@@ -367,16 +378,18 @@ describe('labelEventKind', () => {
 
 describe('labelProvider', () => {
   it('returns friendly labels for known providers', () => {
-    expect(labelProvider('openai')).toBe('OpenAI');
-    expect(labelProvider('anthropic')).toBe('Anthropic');
+    expect(labelProvider('openai')).toBe('Codex');
+    expect(labelProvider('codex')).toBe('Codex');
+    expect(labelProvider('anthropic')).toBe('Claude');
+    expect(labelProvider('claude')).toBe('Claude');
     expect(labelProvider('google')).toBe('Google');
     expect(labelProvider('local')).toBe('本地');
     expect(labelProvider('unknown')).toBe('未知');
   });
 
   it('is case-insensitive', () => {
-    expect(labelProvider('OpenAI')).toBe('OpenAI');
-    expect(labelProvider('ANTHROPIC')).toBe('Anthropic');
+    expect(labelProvider('OpenAI')).toBe('Codex');
+    expect(labelProvider('ANTHROPIC')).toBe('Claude');
   });
 
   it('falls back to raw value for unknown providers', () => {
@@ -396,12 +409,12 @@ describe('formatDuration', () => {
   });
 
   it('formats minutes and seconds', () => {
-    expect(formatDuration(65000)).toBe('1分 05秒');
-    expect(formatDuration(125000)).toBe('2分 05秒');
+    expect(formatDuration(65000)).toBe('1分05秒');
+    expect(formatDuration(125000)).toBe('2分05秒');
   });
 
   it('formats hours and minutes', () => {
-    expect(formatDuration(3661000)).toBe('1时 01分');
+    expect(formatDuration(3661000)).toBe('1时01分');
   });
 
   it('formats days and hours', () => {
@@ -537,7 +550,7 @@ describe('agent status derivation', () => {
     const plannerMatches = html.match(/data-role="planner"/g);
     const devMatches = html.match(/data-role="developer"/g);
     const auditorMatches = html.match(/data-role="auditor"/g);
-    const finalAuditorMatches = html.match(/data-role="final_auditor"/g);
+    const finalAuditorMatches = html.match(/data-role="final-auditor"/g);
     expect(plannerMatches).toHaveLength(1);
     expect(devMatches).toHaveLength(1);
     expect(auditorMatches).toHaveLength(1);
@@ -560,11 +573,11 @@ describe('duration formatting edge cases', () => {
   });
 
   it('handles exactly 60 seconds', () => {
-    expect(formatDuration(60000)).toBe('1分 00秒');
+    expect(formatDuration(60000)).toBe('1分00秒');
   });
 
   it('handles exactly 1 hour', () => {
-    expect(formatDuration(3600000)).toBe('1时 00分');
+    expect(formatDuration(3600000)).toBe('1时00分');
   });
 
   it('handles exactly 1 day', () => {
