@@ -162,13 +162,18 @@ describe('DeveloperIdleWatchdog', () => {
       h.watchdog.stop();
     });
 
-    it('resets the deadline on stderr growth alone', () => {
+    it('does NOT reset the deadline on stderr growth alone (heartbeat excluded)', () => {
       const h = makeHarness();
       h.watchdog.start();
-      h.setTime(2500);
+      h.setTime(1500);
       h.sizes.set('/tmp/stderr.log', 50);
       h.tick();
-      expect(h.watchdog.getResult().tripped).toBe(false);
+      // stderr growth alone should NOT count as activity — heartbeat
+      // messages on stderr would keep the watchdog alive forever.
+      expect(h.watchdog.getResult().tripped).toBe(false); // within 2s window
+      h.setTime(2500); // past the 2s idle window
+      h.tick();
+      expect(h.watchdog.getResult().tripped).toBe(true); // trips despite stderr growth
       h.watchdog.stop();
     });
 

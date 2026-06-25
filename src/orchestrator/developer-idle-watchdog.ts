@@ -94,7 +94,6 @@ export class DeveloperIdleWatchdog {
   private readonly clearIntervalFn: (id: unknown) => void;
 
   private lastStdout = -1;
-  private lastStderr = -1;
   private lastHandoff = -1;
   private deadline = 0;
   private timerId: unknown = null;
@@ -126,7 +125,6 @@ export class DeveloperIdleWatchdog {
     if (this.started) return;
     this.started = true;
     this.lastStdout = this.statSize(this.stdoutPath);
-    this.lastStderr = this.statSize(this.stderrPath);
     this.lastHandoff = this.statSize(this.handoffPath);
     this.deadline = this.now() + this.idleTimeoutMs;
     this.timerId = this.setIntervalFn(() => this.tick(), this.pollIntervalMs);
@@ -147,16 +145,17 @@ export class DeveloperIdleWatchdog {
       return;
     }
     const curStdout = this.statSize(this.stdoutPath);
-    const curStderr = this.statSize(this.stderrPath);
     const curHandoff = this.statSize(this.handoffPath);
 
+    // Only stdout and handoff growth count as real developer activity.
+    // stderr is excluded because heartbeat messages (written every 30s by
+    // the shell wrapper) would keep the watchdog alive forever even when
+    // the agent is actually stalled.
     const grew =
       curStdout > this.lastStdout ||
-      curStderr > this.lastStderr ||
       curHandoff > this.lastHandoff;
 
     this.lastStdout = curStdout;
-    this.lastStderr = curStderr;
     this.lastHandoff = curHandoff;
 
     if (grew) {

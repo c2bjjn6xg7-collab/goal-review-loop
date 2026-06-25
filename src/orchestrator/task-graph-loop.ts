@@ -687,7 +687,7 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
 
   await appendLog(artifactStore, runId, integrationIteration, 'VERIFYING', 'integration verification', 'PASS');
 
-  const diffDigest = `sha256:${integrationDiff.diffDigest}` as Digest;
+  let diffDigest = `sha256:${integrationDiff.diffDigest}` as Digest;
   await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
 
   // ── Audit the full cumulative diff before finalization ──
@@ -903,6 +903,9 @@ export async function runTaskGraphLoop(params: TaskGraphLoopParams): Promise<Orc
     // Re-collect diff after rework, then go through VERIFYING → AUDITING
     const reworkDiff = await collectDiff({ projectRoot, baseCommit, iteration: auditIteration + 1 });
     await writeDiffArtifacts(projectRoot, auditIteration + 1, reworkDiff);
+    // Update diffDigest so the next audit iteration uses the new diff
+    diffDigest = `sha256:${reworkDiff.diffDigest}` as Digest;
+    await stateStore.update(() => ({ audited_diff_digest: diffDigest }));
     // REWORKING → DEVELOPING → VERIFYING (legal transitions)
     await stateStore.transition(PhaseEnum.DEVELOPING);
     await stateStore.transition(PhaseEnum.VERIFYING);
