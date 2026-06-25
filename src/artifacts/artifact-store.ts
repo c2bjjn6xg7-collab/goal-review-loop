@@ -53,6 +53,9 @@ export const VERSIONED_ARTIFACTS = [
 
 /**
  * Files that are local-only (added to .gitignore) — Design doc §6.2
+ * Also includes a catch-all `.agent/**` to ensure ALL runtime artifacts
+ * (events.jsonl, task-results.json, task-runs/, integration/, worktrees/,
+ * cancel-request.json, etc.) are ignored, not just the listed ones.
  */
 export const LOCAL_ONLY_ARTIFACTS = [
   ARTIFACT_FILES.STATE,
@@ -66,6 +69,12 @@ export const LOCAL_ONLY_ARTIFACTS = [
   ARTIFACT_DIRS.DEBUG,
   ARTIFACT_DIRS.TRANSCRIPTS,
 ] as const;
+
+/** Catch-all: ignore everything under .agent/ except prompts (if any). */
+export const GITIGNORE_AGENT_ENTRIES = [
+  '.agent/**',
+  '!.agent/.gitkeep',
+];
 
 /**
  * Artifact Store — manages the .agent/ directory.
@@ -381,7 +390,10 @@ export class ArtifactStore {
    * Design doc §6.2
    */
   gitignoreEntries(): string[] {
-    const agentEntries = LOCAL_ONLY_ARTIFACTS.map((entry) => `.agent/${entry}`);
+    // Use catch-all .agent/** to ignore ALL runtime artifacts (events.jsonl,
+    // task-results.json, task-runs/, integration/, worktrees/,
+    // cancel-request.json, etc.), not just the listed LOCAL_ONLY_ARTIFACTS.
+    const agentEntries = GITIGNORE_AGENT_ENTRIES;
     // F-702: Common build/test artifact directories that trigger Scope Guard
     // if tracked by git. Only added when they don't already exist in .gitignore.
     const buildArtifacts = [

@@ -110,8 +110,8 @@ describe('Artifact Store', () => {
       expect(await fs.pathExists(gitignorePath)).toBe(true);
 
       const content = await fs.readFile(gitignorePath, 'utf8');
-      expect(content).toContain('.agent/state.json');
-      expect(content).toContain('.agent/verification');
+      // Catch-all .agent/** ignores all runtime artifacts
+      expect(content).toContain('.agent/**');
     });
 
     it('should append to existing .gitignore', async () => {
@@ -121,7 +121,7 @@ describe('Artifact Store', () => {
       await store.updateGitignore();
       const content = await fs.readFile(gitignorePath, 'utf8');
       expect(content).toContain('node_modules/');
-      expect(content).toContain('.agent/state.json');
+      expect(content).toContain('.agent/**');
     });
 
     it('should not duplicate entries', async () => {
@@ -129,8 +129,8 @@ describe('Artifact Store', () => {
       await store.updateGitignore(); // Second call
 
       const content = await fs.readFile(path.join(tmpDir, '.gitignore'), 'utf8');
-      // Count occurrences of .agent/state.json
-      const matches = content.match(/\.agent\/state\.json/g);
+      // Count occurrences of .agent/**
+      const matches = content.match(/\.agent\/\*\*/g);
       expect(matches).toHaveLength(1);
     });
   });
