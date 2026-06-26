@@ -8,6 +8,7 @@
     "review-loop": "dist/cli/main.js"
   },
   "files": [
+    ".agents/skills/using-review-loop/",
     "dist/",
     "prompts/",
     "plugin/",
