@@ -14,7 +14,7 @@
  */
 
 import { join, resolve, sep } from 'node:path';
-import { existsSync, readFileSync, writeFileSync, readdirSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, lstatSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { StateStore } from './state-store.js';
@@ -650,6 +650,17 @@ export async function runOrchestrator(params: {
 
     // 6. Generate task_slug
     const taskSlug = params.task_slug || sanitizeSlug(params.request ?? 'resume');
+
+    // 6.5 Clean stale audit artifacts from previous runs.
+    // These files (final-audit.md, audit-report.md, rework-instructions.md,
+    // developer-handoff.md) cause freshness check failures if they exist
+    // from a previous run but aren't overwritten by the new run's agents.
+    for (const staleFile of ['final-audit.md', 'audit-report.md', 'rework-instructions.md', 'developer-handoff.md']) {
+      const stalePath = join(agentDir, staleFile);
+      if (existsSync(stalePath)) {
+        try { rmSync(stalePath, { force: true }); } catch { /* best effort */ }
+      }
+    }
 
     // 7. Create initial state
     stateStore = new StateStore(agentDir);
