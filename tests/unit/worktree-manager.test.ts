@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { execSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, rmSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { WorktreeManager } from '../../src/scheduler/worktree-manager.js';
 import { runGit } from '../../src/git/git-manager.js';
+import { sameDirectory } from '../../src/runtime/path-identity.js';
 
 interface TestRepo {
   repoDir: string;
@@ -81,7 +82,10 @@ describe('WorktreeManager.createForTask', () => {
     const first = await mgr.createForTask(params);
     const second = await mgr.createForTask(params);
 
-    expect(realpathSync(second.worktreePath)).toBe(realpathSync(first.worktreePath));
+    // Compare by filesystem identity (stat dev+ino), not realpath string
+    // equality: on Windows realpath can return 8.3 short vs long forms
+    // (RUNNER~1 vs runneradmin) for the same directory.
+    expect(await sameDirectory(second.worktreePath, first.worktreePath)).toBe(true);
     expect(second.branch).toBe(first.branch);
     expect(existsSync(second.worktreePath)).toBe(true);
 
@@ -223,15 +227,18 @@ describe('WorktreeManager.prune', () => {
 
     rmSync(created.worktreePath, { recursive: true, force: true });
 
+    // Assert by the branch record (alias-independent), not by matching the
+    // worktree path string: Git porcelain may emit a different path spelling
+    // (8.3 short vs long name, / vs \) than the input path.
     const beforeList = await runGit(['worktree', 'list', '--porcelain'], repoDir);
     expect(beforeList.exit_code).toBe(0);
-    expect(beforeList.stdout).toContain(created.worktreePath);
+    expect(beforeList.stdout).toContain(created.branch);
 
     await mgr.prune();
 
     const afterList = await runGit(['worktree', 'list', '--porcelain'], repoDir);
     expect(afterList.exit_code).toBe(0);
-    expect(afterList.stdout).not.toContain(created.worktreePath);
+    expect(afterList.stdout).not.toContain(created.branch);
   });
 });
 
@@ -269,7 +276,12 @@ describe('WorktreeManager.listForRun', () => {
     for (const info of aList) {
       expect(info.branch.startsWith('agent/run-A/')).toBe(true);
       expect(info.baseCommit).toBe(baseSha);
-      expect(info.worktreePath).toContain(join('.agent', 'worktrees', 'run-A'));
+      // Verify the worktree lives under the run root by directory identity
+      // (stat dev+ino), not by string-containment of a join() path: Git may
+      // emit the path with a different separator or 8.3 alias on Windows.
+      const expectedRunRoot = join(repoDir, '.agent', 'worktrees', 'run-A');
+      const parentDir = dirname(info.worktreePath);
+      expect(await sameDirectory(parentDir, expectedRunRoot)).toBe(true);
     }
 
     const bList = await mgr.listForRun('run-B');
