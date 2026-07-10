@@ -1,14 +1,49 @@
 /**
  * Platform-aware command templates for the built-in interactive providers.
  *
- * POSIX keeps the existing shell-wrapper behavior. Windows
- * uses Windows PowerShell to read the prompt file and then invokes the
- * provider through PowerShell's native command resolution (including npm
- * `.cmd` shims).
+ * POSIX keeps the existing shell-wrapper behavior. Windows invokes a compiled
+ * Node wrapper (`windows-provider-wrapper.js`) that reads the prompt file and
+ * pipes it to the provider over stdin. This avoids PowerShell's `-Command`
+ * argv limitation (trailing tokens are command text, not `$args`), which made
+ * the prompt path unreachable and caused the provider to exit with status 1.
  */
+
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 export type AgentRole = 'planner' | 'developer' | 'auditor' | 'final_auditor';
 export type ClaudePermissionMode = 'acceptEdits' | 'bypassPermissions';
+
+/**
+ * Absolute path to the compiled Windows provider wrapper, resolved relative to
+ * this module so it is stable whether run from src (ts-node/tsx) or dist.
+ */
+function windowsWrapperPath(): string {
+  const here = typeof __dirname !== 'undefined'
+    ? __dirname
+    : path.dirname(fileURLToPath(import.meta.url));
+  return path.join(here, 'windows-provider-wrapper.js');
+}
+
+/**
+ * Build the argv that invokes the Node wrapper for a Windows provider. The
+ * prompt file placeholder `{prompt_file}` is a standalone argv element so the
+ * existing renderCommand whole-element substitution still applies.
+ */
+function windowsWrapperCommand(
+  provider: string,
+  flags: string[],
+): string[] {
+  return [
+    process.execPath,
+    windowsWrapperPath(),
+    '--prompt-file',
+    '{prompt_file}',
+    '--provider',
+    provider,
+    ...flags,
+  ];
+}
 
 function buildPosixHeartbeat(role: AgentRole): string {
   return [
@@ -24,19 +59,6 @@ function buildPosixHeartbeat(role: AgentRole): string {
   ].join('\n');
 }
 
-function windowsPowerShellCommand(script: string, extraArgs: string[] = []): string[] {
-  return [
-    'powershell.exe',
-    '-NoLogo',
-    '-NoProfile',
-    '-NonInteractive',
-    '-Command',
-    script,
-    '{prompt_file}',
-    ...extraArgs,
-  ];
-}
-
 /**
  * Built-in Claude provider command.
  *
@@ -48,18 +70,9 @@ export function buildBuiltinClaudeCommand(
   platform: NodeJS.Platform = process.platform,
 ): string[] {
   if (platform === 'win32') {
-    const script = [
-      "$ErrorActionPreference = 'Stop'",
-      '$promptPath = $args[0]',
-      'if ([string]::IsNullOrWhiteSpace($promptPath)) { throw "Missing prompt file path" }',
-      '$OutputEncoding = [Text.UTF8Encoding]::new($false)',
-      '$P = [IO.File]::ReadAllText($promptPath, [Text.Encoding]::UTF8)',
-      '$P | & claude -p --permission-mode acceptEdits',
-      '$status = $LASTEXITCODE',
-      'if ($null -eq $status) { exit 1 }',
-      'exit $status',
-    ].join('\n');
-    return windowsPowerShellCommand(script);
+    // Built-in Claude profile: accept edits, inherit environment, no turn
+    // limit, prompt delivered over stdin by the wrapper.
+    return windowsWrapperCommand('claude', ['--permission-mode', 'acceptEdits']);
   }
 
   return [
@@ -76,23 +89,11 @@ export function buildOpenCodeCommand(
   platform: NodeJS.Platform = process.platform,
 ): string[] {
   if (platform === 'win32') {
-    const script = [
-      "$ErrorActionPreference = 'Stop'",
-      '$promptPath = $args[0]',
-      '$model = $args[1]',
-      'if ([string]::IsNullOrWhiteSpace($promptPath)) { throw "Missing prompt file path" }',
-      '$OutputEncoding = [Text.UTF8Encoding]::new($false)',
-      '$P = [IO.File]::ReadAllText($promptPath, [Text.Encoding]::UTF8)',
-      'if ([string]::IsNullOrWhiteSpace($model)) {',
-      '  $P | & opencode run --dangerously-skip-permissions --no-replay',
-      '} else {',
-      '  $P | & opencode run --model $model --dangerously-skip-permissions --no-replay',
-      '}',
-      '$status = $LASTEXITCODE',
-      'if ($null -eq $status) { exit 1 }',
-      'exit $status',
-    ].join('\n');
-    return windowsPowerShellCommand(script, model ? [model] : []);
+    const flags: string[] = [];
+    if (model) {
+      flags.push('--model', model);
+    }
+    return windowsWrapperCommand('opencode', flags);
   }
 
   const modelFlag = model ? `--model ${model}` : '';
@@ -118,20 +119,13 @@ export function buildClaudeCommand(
   permissionMode: ClaudePermissionMode = 'bypassPermissions',
 ): string[] {
   if (platform === 'win32') {
-    const script = [
-      "$ErrorActionPreference = 'Stop'",
-      '$promptPath = $args[0]',
-      'if ([string]::IsNullOrWhiteSpace($promptPath)) { throw "Missing prompt file path" }',
-      "$proxyNames = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY')",
-      'foreach ($name in $proxyNames) { [Environment]::SetEnvironmentVariable($name, $null, "Process") }',
-      '$OutputEncoding = [Text.UTF8Encoding]::new($false)',
-      '$P = [IO.File]::ReadAllText($promptPath, [Text.Encoding]::UTF8)',
-      `$P | & claude -p --permission-mode ${permissionMode} --max-turns 160`,
-      '$status = $LASTEXITCODE',
-      'if ($null -eq $status) { exit 1 }',
-      'exit $status',
-    ].join('\n');
-    return windowsPowerShellCommand(script);
+    // Non-builtin Claude: clear proxy env, impose a turn limit, prompt over
+    // stdin. --clear-proxy makes the wrapper strip HTTP(S)_PROXY/ALL_PROXY.
+    return windowsWrapperCommand('claude', [
+      '--permission-mode', permissionMode,
+      '--max-turns', '160',
+      '--clear-proxy',
+    ]);
   }
 
   return [

@@ -23,33 +23,41 @@ describe('platform-aware provider commands', () => {
     expect(claude).toContain('{prompt_file}');
   });
 
-  it('uses Windows PowerShell and native command resolution on Windows', () => {
+  it('uses the Node provider wrapper on Windows (no PowerShell)', () => {
     const openCode = buildOpenCodeCommand('planner', 'model/name', 'win32');
     const claude = buildClaudeCommand('developer', 'win32');
 
-    expect(openCode[0]).toBe('powershell.exe');
-    expect(openCode).toContain('-NonInteractive');
+    // argv[0] is the Node executable; argv[1] points at the compiled wrapper.
+    expect(openCode[0]).toBe(process.execPath);
+    expect(openCode[1]).toContain('windows-provider-wrapper');
     expect(openCode).toContain('{prompt_file}');
+    expect(openCode).toContain('--provider');
+    expect(openCode).toContain('opencode');
+    expect(openCode).toContain('--model');
     expect(openCode).toContain('model/name');
-    expect(openCode.join('\n')).toContain('[IO.File]::ReadAllText');
-    expect(openCode.join('\n')).toContain('& opencode run');
-    expect(openCode.join('\n')).toContain('$P | & opencode run');
-    expect(openCode.join('\n')).not.toContain('-- $P');
-    expect(openCode).not.toContain('sh');
+    // No PowerShell anywhere — the -Command argv trap is gone.
+    expect(openCode.some((p) => p.includes('powershell'))).toBe(false);
 
-    expect(claude[0]).toBe('powershell.exe');
+    expect(claude[0]).toBe(process.execPath);
+    expect(claude[1]).toContain('windows-provider-wrapper');
     expect(claude).toContain('{prompt_file}');
-    expect(claude.join('\n')).toContain('$P | & claude -p');
-    expect(claude.join('\n')).toContain('SetEnvironmentVariable');
-    expect(claude.join('\n')).toContain('--permission-mode bypassPermissions');
-    expect(claude.join('\n')).toContain('--max-turns 160');
+    expect(claude).toContain('--provider');
+    expect(claude).toContain('claude');
+    expect(claude).toContain('--permission-mode');
+    expect(claude).toContain('bypassPermissions');
+    expect(claude).toContain('--max-turns');
+    expect(claude).toContain('--clear-proxy');
+    expect(claude.some((p) => p.includes('powershell'))).toBe(false);
   });
 
   it('keeps the built-in Claude profile equivalent across Windows and POSIX', () => {
-    const windowsClaude = buildBuiltinClaudeCommand('win32').join('\n');
-    expect(windowsClaude).toContain('$P | & claude -p --permission-mode acceptEdits');
-    expect(windowsClaude).not.toContain('SetEnvironmentVariable');
+    const windowsClaude = buildBuiltinClaudeCommand('win32');
+    // Built-in profile: acceptEdits, no turn limit, no proxy clearing.
+    expect(windowsClaude).toContain('--permission-mode');
+    expect(windowsClaude).toContain('acceptEdits');
     expect(windowsClaude).not.toContain('--max-turns');
+    expect(windowsClaude).not.toContain('--clear-proxy');
+    expect(windowsClaude.some((p) => p.includes('powershell'))).toBe(false);
 
     expect(buildBuiltinClaudeCommand('darwin')).toEqual([
       'sh', '-lc',
@@ -59,17 +67,18 @@ describe('platform-aware provider commands', () => {
     ]);
   });
 
-  it('passes a Windows model name as an argument instead of interpolating it into the script', () => {
+  it('passes a Windows model name as a wrapper flag, not interpolated into a script', () => {
     const model = 'model; Write-Error injected';
     const command = buildOpenCodeCommand('planner', model, 'win32');
-    const scriptIndex = command.indexOf('-Command') + 1;
 
-    expect(command.at(-1)).toBe(model);
-    expect(command[scriptIndex]).not.toContain(model);
+    // The model is a standalone --model flag value, never embedded in a script.
+    expect(command).toContain('--model');
+    const modelIdx = command.indexOf('--model');
+    expect(command[modelIdx + 1]).toBe(model);
   });
 
   it.skipIf(process.platform !== 'win32')(
-    'executes the generated PowerShell command through a Windows .cmd provider shim',
+    'executes the generated command through a Windows .cmd provider shim',
     async () => {
       const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'platform-command-win-'));
       try {
@@ -163,6 +172,7 @@ describe('platform-aware provider commands', () => {
         expect(probe.argv).toContain('acceptEdits');
         expect(probe.argv).not.toContain('--max-turns');
         expect(probe.stdin).toContain(marker);
+        // Built-in profile inherits the proxy (no --clear-proxy).
         expect(probe.proxy).toBe(proxy);
       } finally {
         await fs.remove(tmpDir);
