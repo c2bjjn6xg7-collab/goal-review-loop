@@ -214,9 +214,13 @@ describe('resolveCommandForAgent', () => {
     expect(result).not.toContain('sh');
     expect(result).toContain('--provider');
     expect(result).toContain('claude');
-    expect(result.join('\n')).toContain('--permission-mode acceptEdits');
-    expect(result.join('\n')).not.toContain('--permission-mode bypassPermissions');
-    expect(result.join('\n')).not.toContain('--max-turns');
+    // --permission-mode and its value are separate argv elements (the wrapper
+    // passes them as flags), so check them individually rather than as a
+    // space-joined substring.
+    expect(result).toContain('--permission-mode');
+    expect(result).toContain('acceptEdits');
+    expect(result).not.toContain('bypassPermissions');
+    expect(result).not.toContain('--max-turns');
   });
 
   it('returns fallback when provider is disabled', () => {
