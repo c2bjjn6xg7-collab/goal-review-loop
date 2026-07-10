@@ -86,8 +86,8 @@ describe('Phase 8E R3 integration finalization', () => {
 
   it('creates the final commit on integration/{run_id} with business files and R3 artifacts', async () => {
     fixture = await prepareR2Passed('r3-commit');
-    // The fixture's original branch (main) must not move during R3.
-    const originalBranchSha = git(fixture.repoDir, ['rev-parse', 'main']);
+    // The fixture's original branch must not move during R3.
+    const originalBranchSha = git(fixture.repoDir, ['rev-parse', fixture.mainBranch]);
     const preIntegrationHead = git(fixture.repoDir, ['rev-parse', fixture.integrationBranch]);
 
     const result = await runR3(fixture);
@@ -106,7 +106,7 @@ describe('Phase 8E R3 integration finalization', () => {
     expect(result.final_commit_sha).not.toBe(preIntegrationHead);
 
     // Original branch is NOT moved.
-    expect(git(fixture.repoDir, ['rev-parse', 'main'])).toBe(originalBranchSha);
+    expect(git(fixture.repoDir, ['rev-parse', fixture.mainBranch])).toBe(originalBranchSha);
 
     // Committed tree includes the business file and R3 artifacts.
     const tree = commitTreeFiles(fixture.repoDir, fixture.integrationBranch);

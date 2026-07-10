@@ -102,7 +102,7 @@ describe('platform-aware provider commands', () => {
           env: { ...process.env, PATH: `${tmpDir}${path.delimiter}${process.env.PATH ?? ''}` },
         });
 
-        expect(result.error).toBeUndefined();
+        expect(result.error).toBeFalsy();
         expect(result.status).toBe(0);
         const probe = JSON.parse(String(result.stdout)) as { argv: string[]; stdin: string };
         expect(probe.argv).toContain('model/name');
@@ -153,7 +153,7 @@ describe('platform-aware provider commands', () => {
           },
         });
 
-        expect(result.error).toBeUndefined();
+        expect(result.error).toBeFalsy();
         expect(result.status).toBe(0);
         const probe = JSON.parse(String(result.stdout)) as {
           argv: string[];

@@ -84,7 +84,7 @@ function createTestRepo(
 ): string {
   const repoDir = join(tmpdir(), `task-graph-test-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email test@test.com', { cwd: repoDir });
   execSync('git config user.name test', { cwd: repoDir });
   // Seed a package.json with a no-op test script so verification commands can run.

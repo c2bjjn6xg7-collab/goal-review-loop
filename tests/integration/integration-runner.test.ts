@@ -19,7 +19,7 @@ function git(repoDir: string, args: string[]): string {
 
 function createRepo(prefix: string): { repoDir: string; baseCommit: string; mainBranch: string } {
   const repoDir = mkdtempSync(path.join(tmpdir(), `integration-runner-${prefix}-`));
-  execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repoDir });
   git(repoDir, ['config', 'user.email', 'test@test.com']);
   git(repoDir, ['config', 'user.name', 'Test']);
   writeFile(repoDir, 'README.md', '# Test\n');

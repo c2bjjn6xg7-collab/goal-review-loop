@@ -82,7 +82,7 @@ function copyPrompts(repoDir: string): void {
 function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = {}): string {
   const repoDir = join(tmpdir(), `no-commit-bypass-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email test@test.com', { cwd: repoDir });
   execSync('git config user.name test', { cwd: repoDir });
 

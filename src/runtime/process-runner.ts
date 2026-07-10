@@ -465,7 +465,10 @@ export async function runProcess(input: ProcessRunnerInput, projectRoot?: string
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
-    detached: true,
+    detached: process.platform !== 'win32',
+    // Hide the child's console window on Windows so spawned providers/git do
+    // not steal focus or flash a console. No-op on POSIX.
+    windowsHide: true,
   });
 
   const killTree = async (signal: NodeJS.Signals): Promise<boolean> => {
@@ -735,7 +738,10 @@ export async function runProcessRaw(input: ProcessRunnerInput, projectRoot?: str
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
-    detached: true,
+    detached: process.platform !== 'win32',
+    // Hide the child's console window on Windows so spawned providers/git do
+    // not steal focus or flash a console. No-op on POSIX.
+    windowsHide: true,
   });
 
   const killTree = async (signal: NodeJS.Signals): Promise<boolean> => {

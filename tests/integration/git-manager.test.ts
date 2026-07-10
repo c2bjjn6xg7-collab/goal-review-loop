@@ -21,7 +21,7 @@ describe('GitManager', () => {
   });
 
   async function initGitRepo(dir: string, withCommit = true): Promise<void> {
-    await runGit(['init'], dir);
+    await runGit(['init', '-b', 'main'], dir);
     await runGit(['config', 'user.email', 'test@test.com'], dir);
     await runGit(['config', 'user.name', 'Test'], dir);
     if (withCommit) {
@@ -94,6 +94,26 @@ describe('GitManager', () => {
       const result = await preflight(subDir);
       expect(result.status).toBe(PreflightStatus.ERROR);
       expect(result.error?.check).toBe('git_root_mismatch');
+    });
+
+    // 016 regression: the root check must be path-string-agnostic. On Windows
+    // the same directory is reachable via short (8.3) and long names that
+    // differ as strings (RUNNER~1 vs runneradmin). preflight uses
+    // `git rev-parse --show-prefix` (empty == root) as the authority precisely
+    // because it is independent of how the path is spelled. We reproduce the
+    // "different string, same directory" condition with a symlink alias and
+    // confirm preflight still accepts the root. A string-compare implementation
+    // would false-reject here (the alias string differs from the real path).
+    it('should accept the repo root through a path alias (016)', async () => {
+      await initGitRepo(projectRoot);
+      // Create a symlink alias to the repo — same directory, different string,
+      // exactly as a Windows 8.3 short name behaves.
+      const alias = path.join(tmpDir, 'repo-alias');
+      await fs.symlink(projectRoot, alias);
+
+      const result = await preflight(alias);
+      expect(result.status).toBe(PreflightStatus.OK);
+      expect(result.error).toBeUndefined();
     });
   });
 

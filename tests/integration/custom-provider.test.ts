@@ -14,7 +14,7 @@ function createCustomProviderRepo(suffix: string): string {
   const repoDir = join(tmpdir(), `review-loop-p6-provider-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
 
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
 

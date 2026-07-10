@@ -91,7 +91,7 @@ function createTestRepo(
   mkdirSync(repoDir, { recursive: true });
 
   // Init git repo
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
 

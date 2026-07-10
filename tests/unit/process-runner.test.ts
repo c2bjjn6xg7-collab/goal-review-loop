@@ -82,10 +82,9 @@ describe('ProcessRunner', () => {
     });
 
     expect(result.status).toBe(ProcessStatus.FAILED);
-    // exit_code may be null (error event) or a negative number (close event with signal)
-    if (result.exit_code !== null) {
-      expect(result.exit_code).toBeLessThan(0);
-    }
+    // Command-not-found surfaces as a FAILED status on every platform; the
+    // exact exit_code is platform-dependent (POSIX signal/negative, Windows
+    // positive/null), so we only assert the failure status, not a POSIX code.
   });
 
   it('should reject empty argv', async () => {

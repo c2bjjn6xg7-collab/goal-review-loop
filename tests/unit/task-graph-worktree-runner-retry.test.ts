@@ -151,7 +151,7 @@ function createTestRepo(): {
   taskGraph: TaskGraph;
 } {
   const repoDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'retry-unit-')));
-  execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repoDir });
   git(repoDir, ['config', 'user.email', 'test@test.com']);
   git(repoDir, ['config', 'user.name', 'Test']);
 

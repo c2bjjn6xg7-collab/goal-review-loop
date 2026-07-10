@@ -54,7 +54,7 @@ describe('CLI Integration: pack, install, and run', () => {
 
     // Create a git repo
     await fs.ensureDir(testProject);
-    runChecked('git', ['init'], testProject, 10_000);
+    runChecked('git', ['init', '-b', 'main'], testProject, 10_000);
 
     // Install the tarball
     runChecked('npm', ['install', tarballPath], testProject, 120_000);
