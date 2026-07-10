@@ -12,7 +12,7 @@
  * - Mechanical check failure overrides Auditor PASS
  */
 
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { parseAuditReport } from '../artifacts/artifact-schemas.js';
 import { createHash } from 'node:crypto';
@@ -127,12 +127,20 @@ export async function validateAuditorOutput(
   // Exclude orchestrator-managed paths (.agent/debug/, .agent/evidence/,
   // .agent/verification/, .agent/history/) since the orchestrator writes these,
   // not the Auditor.
+  // Orchestrator-managed directories whose contents the orchestrator itself
+  // writes (debug logs, evidence, verification, history, transcripts). The
+  // boundary MUST use the platform separator: join() yields backslashes on
+  // Windows, so a literal '/' suffix never matches and the auditor's own
+  // debug/transcript files get misflagged as "created new file", flipping PASS
+  // to FAILED. Using sep keeps the boundary tight — only true children of these
+  // directories are excluded, so an auditor creating a business file elsewhere
+  // is still rejected.
   const orchestratorManagedPrefixes = [
-    join(projectRoot, '.agent', 'debug') + '/',
-    join(projectRoot, '.agent', 'evidence') + '/',
-    join(projectRoot, '.agent', 'verification') + '/',
-    join(projectRoot, '.agent', 'history') + '/',
-    join(projectRoot, '.agent', 'transcripts') + '/',
+    join(projectRoot, '.agent', 'debug') + sep,
+    join(projectRoot, '.agent', 'evidence') + sep,
+    join(projectRoot, '.agent', 'verification') + sep,
+    join(projectRoot, '.agent', 'history') + sep,
+    join(projectRoot, '.agent', 'transcripts') + sep,
   ];
 
   const orchestratorManagedFiles = new Set([

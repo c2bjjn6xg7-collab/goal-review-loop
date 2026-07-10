@@ -48,6 +48,10 @@ describe('CLI Integration: pack, install, and run', () => {
     expect(fs.pathExistsSync(tarballPath)).toBe(true);
   });
 
+  // This test packs the tarball, runs `npm install`, and launches the CLI —
+  // heavy work that can exceed the default 30s vitest timeout on a loaded
+  // Windows CI runner. The inner runChecked calls keep their own timeouts;
+  // this 180s outer timeout only bounds the whole test.
   it('should install and run review-loop init in a temp git repo', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'review-loop-integ-'));
     const testProject = path.join(tmpDir, 'test-project');
@@ -78,5 +82,5 @@ describe('CLI Integration: pack, install, and run', () => {
     const gitignore = await fs.readFile(path.join(testProject, '.gitignore'), 'utf8');
     expect(gitignore).toContain('.agent/**');
     expect(gitignore).toContain('!.agent/.gitkeep');
-  });
+  }, 180_000);
 });

@@ -137,9 +137,11 @@ describe('Artifact Store', () => {
 
   describe('verificationDir / evidenceDir', () => {
     it('should return correct paths', () => {
-      expect(store.verificationDir(1)).toMatch(/verification\/iteration-01$/);
-      expect(store.verificationDir(10)).toMatch(/verification\/iteration-10$/);
-      expect(store.evidenceDir(1)).toMatch(/evidence\/iteration-01$/);
+      // Compare against path.join suffixes so the expected separator matches
+      // the platform (backslash on Windows, forward slash elsewhere).
+      expect(store.verificationDir(1).endsWith(path.join('verification', 'iteration-01'))).toBe(true);
+      expect(store.verificationDir(10).endsWith(path.join('verification', 'iteration-10'))).toBe(true);
+      expect(store.evidenceDir(1).endsWith(path.join('evidence', 'iteration-01'))).toBe(true);
     });
   });
 });

@@ -192,5 +192,53 @@ audited_diff_digest: "${diffDigest}"
       expect(result.valid).toBe(false);
       expect(result.errors.some(e => e.includes('non-audit file'))).toBe(true);
     });
+
+    // 022 regression: the orchestrator-managed directory boundary must use the
+    // platform separator. On Windows, join() yields backslashes, so a literal
+    // '/' suffix in the prefix never matched and the auditor's own
+    // debug/transcript files were misflagged as modified, flipping PASS→FAIL.
+    // These files are written by the orchestrator (process-runner logs,
+    // transcript-writer), not the auditor, and must be excluded. A genuine
+    // business file modification must still be caught.
+    it('excludes .agent/debug and .agent/transcripts files from the modification check (022)', async () => {
+      writeFileSync(join(agentDir, 'audit-report.md'), `---
+schema_version: 1
+run_id: "run-001"
+iteration: 1
+author_role: "auditor"
+decision: "PASS"
+audited_goal_digest: "${goalDigest}"
+audited_diff_digest: "${diffDigest}"
+---
+`);
+
+      // Orchestrator-managed files that change every run (debug logs, transcript).
+      const debugLog = join(agentDir, 'debug', 'run-001-auditor-iter1.stderr.log');
+      const transcript = join(agentDir, 'transcripts', 'iteration-01-auditor.md');
+      mkdirSync(join(agentDir, 'debug'), { recursive: true });
+      mkdirSync(join(agentDir, 'transcripts'), { recursive: true });
+      writeFileSync(debugLog, 'log content');
+      writeFileSync(transcript, 'transcript content');
+
+      // Record pre-audit digests, then simulate the orchestrator updating them.
+      const preAuditDigests = new Map<string, string>();
+      preAuditDigests.set(debugLog, computeDigest('old log'));
+      preAuditDigests.set(transcript, computeDigest('old transcript'));
+      // A real business file that the auditor should NOT touch.
+      const businessPath = join(testDir, 'src', 'index.ts');
+      mkdirSync(join(testDir, 'src'), { recursive: true });
+      writeFileSync(businessPath, 'original');
+      preAuditDigests.set(businessPath, computeDigest('original'));
+      // Auditor tampers with the business file.
+      writeFileSync(businessPath, 'tampered');
+
+      const result = await validateAuditorOutput(testDir, 'run-001', 1, goalDigest, diffDigest, preAuditDigests);
+      // The business-file tampering is still caught.
+      expect(result.valid).toBe(false);
+      expect(result.errors.some(e => e.includes('non-audit file') && e.includes('index.ts'))).toBe(true);
+      // The debug/transcript files are NOT flagged despite changing.
+      expect(result.errors.some(e => e.includes('debug'))).toBe(false);
+      expect(result.errors.some(e => e.includes('transcripts'))).toBe(false);
+    });
   });
 });

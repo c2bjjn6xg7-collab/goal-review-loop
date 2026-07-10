@@ -99,7 +99,7 @@ describe('feedback-dispatcher', () => {
     await dispatchFeedbackBlocks({
       projectRoot: tmp, runId: 'r1', role: 'auditor', artifactPath: artifact, config: defaultConfig(), registry,
     });
-    expect(registered.some((p) => p.endsWith('.agent/feedback-notes.md'))).toBe(true);
+    expect(registered.some((p) => p.endsWith(path.join('.agent', 'feedback-notes.md')))).toBe(true);
   });
 
   it('readClarificationsForPlanner returns empty string when absent', async () => {
