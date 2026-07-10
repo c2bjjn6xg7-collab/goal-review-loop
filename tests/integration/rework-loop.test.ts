@@ -84,7 +84,7 @@ function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = 
   mkdirSync(repoDir, { recursive: true });
 
   // Init git repo
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
 
@@ -108,6 +108,25 @@ function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = 
   execSync('git commit -m "initial"', { cwd: repoDir });
 
   return repoDir;
+}
+
+async function waitForState(
+  repoDir: string,
+  predicate: (state: Record<string, unknown>) => boolean,
+  timeoutMs = 10_000,
+): Promise<Record<string, unknown>> {
+  const statePath = join(repoDir, '.agent', 'state.json');
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(statePath)) {
+      try {
+        const state = JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>;
+        if (predicate(state)) return state;
+      } catch { /* state is written atomically, retry if a platform races the rename */ }
+    }
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error(`Timed out waiting for orchestrator state after ${timeoutMs}ms`);
 }
 
 describe('Phase 4 Rework Loop integration', () => {
@@ -437,6 +456,49 @@ describe('Phase 4 Rework Loop integration', () => {
     expect(existsSync(join(repoDir, '.agent', 'GOAL.md'))).toBe(true);
   });
 
+  it.skipIf(process.platform !== 'win32')(
+    '13b: durable cancel request interrupts an active developer without relying on SIGTERM',
+    async () => {
+      repoDir = createTestRepo('s13b', { developer: 'slow-developer' }, 3);
+      writeFileSync(join(repoDir, '.gitignore'), '.agent/\n', 'utf8');
+      execSync('git add .gitignore && git commit -m "add gitignore"', { cwd: repoDir });
+
+      const fallbackAbort = new AbortController();
+      const runPromise = runOrchestrator({
+        project_root: repoDir,
+        request: 'Add feature',
+        max_iterations: 3,
+        signal: fallbackAbort.signal,
+      });
+
+      try {
+        const developingState = await waitForState(
+          repoDir,
+          (state) => state.phase === 'DEVELOPING' && typeof state.run_id === 'string',
+        );
+        const cancelRequest = {
+          schema_version: 1,
+          run_id: developingState.run_id,
+          requested_at: new Date().toISOString(),
+          requested_by: 'test:durable-cancel',
+        };
+        writeFileSync(
+          join(repoDir, '.agent', 'cancel-request.json'),
+          JSON.stringify(cancelRequest),
+          'utf8',
+        );
+
+        const result = await runPromise;
+        expect(result.phase).toBe('CANCELLED');
+        expect(result.exit_code).toBe(4);
+      } finally {
+        fallbackAbort.abort();
+        await runPromise.catch(() => undefined);
+      }
+    },
+    20_000,
+  );
+
   // ─── Scenario 14: status --json output stable and parseable ──
   it('14: status --json produces stable parseable output', async () => {
     repoDir = createTestRepo('s14');
@@ -602,13 +664,13 @@ describe('Phase 4 Rework Loop integration', () => {
 
     // Override the package.json test script to sleep for a long time
     const pkg = JSON.parse(readFileSync(join(repoDir, 'package.json'), 'utf8'));
-    pkg.scripts.test = 'sleep 60';
+    pkg.scripts.test = 'node -e "setTimeout(() => {}, 60000)"';
     writeFileSync(join(repoDir, 'package.json'), JSON.stringify(pkg, null, 2));
 
     execSync('git add -A && git commit -m "slow test"', { cwd: repoDir });
 
     // Create an AbortController and schedule abort after 3 seconds
-    // (verification will be running `sleep 60`, so 3s catches it mid-run)
+    // (verification will be running the portable Node timer, so 3s catches it mid-run)
     const abortController = new AbortController();
     setTimeout(() => abortController.abort(), 3000);
 

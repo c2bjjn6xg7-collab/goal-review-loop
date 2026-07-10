@@ -9,6 +9,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import os from 'os';
 import { runProcess } from '../../src/runtime/process-runner.js';
+import { nodeEval, nodeStdout } from '../helpers/node-command.js';
 
 describe('runProcess onOutput', () => {
   let tmpDir: string;
@@ -29,7 +30,7 @@ describe('runProcess onOutput', () => {
   it('delivers filtered stdout text to onOutput', async () => {
     const received: { stream: 'stdout' | 'stderr'; text: string }[] = [];
     await runProcess({
-      argv: ['bash', '-c', 'printf "Editing src/foo.ts\\n"'],
+      argv: nodeStdout('Editing src/foo.ts\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -43,10 +44,9 @@ describe('runProcess onOutput', () => {
 
   it('does not deliver thinking blocks to onOutput', async () => {
     const received: { stream: 'stdout' | 'stderr'; text: string }[] = [];
-    const script =
-      'printf "<thinking>secret reasoning</thinking>Visible line\\n"';
+    const script = '<thinking>secret reasoning</thinking>Visible line\n';
     await runProcess({
-      argv: ['bash', '-c', script],
+      argv: nodeStdout(script),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -62,10 +62,9 @@ describe('runProcess onOutput', () => {
 
   it('does not deliver JSON tool_use lines to onOutput', async () => {
     const received: { stream: 'stdout' | 'stderr'; text: string }[] = [];
-    const script =
-      'printf "Doing work\\n{\\"type\\":\\"tool_use\\",\\"name\\":\\"edit\\"}\\n"';
+    const script = 'Doing work\n{"type":"tool_use","name":"edit"}\n';
     await runProcess({
-      argv: ['bash', '-c', script],
+      argv: nodeStdout(script),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -80,10 +79,9 @@ describe('runProcess onOutput', () => {
 
   it('writes raw content to stdout file even when filtered for onOutput', async () => {
     const received: { stream: 'stdout' | 'stderr'; text: string }[] = [];
-    const script =
-      'printf "<thinking>hidden</thinking>Editing src/foo.ts\\n{\\"type\\":\\"tool_use\\",\\"name\\":\\"x\\"}\\n"';
+    const script = '<thinking>hidden</thinking>Editing src/foo.ts\n{"type":"tool_use","name":"x"}\n';
     await runProcess({
-      argv: ['bash', '-c', script],
+      argv: nodeStdout(script),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -106,7 +104,7 @@ describe('runProcess onOutput', () => {
     // then advance fake time past the 500ms flush interval so the
     // coalesced accumulator drains in one delivery before cleanup.
     const promise = runProcess({
-      argv: ['bash', '-c', 'printf "burst1\\n"; printf "burst2\\n"'],
+      argv: nodeEval("process.stdout.write('burst1\\n'); process.stdout.write('burst2\\n')"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -134,9 +132,9 @@ describe('runProcess onOutput', () => {
     // at least one flush happened (the threshold was hit) rather than total
     // length (which is now capped).
     const chunk = 'b'.repeat(450) + '\n';
-    const script = `for i in 1 2 3 4 5; do printf '${chunk}'; sleep 0.05; done`;
+    const script = `(async () => { for (let i = 0; i < 5; i++) { process.stdout.write(${JSON.stringify(chunk)}); await new Promise((resolve) => setTimeout(resolve, 50)); } })()`;
     await runProcess({
-      argv: ['bash', '-c', script],
+      argv: nodeEval(script),
       cwd: tmpDir,
       timeout_ms: 10000,
       stdout_path: stdoutPath,

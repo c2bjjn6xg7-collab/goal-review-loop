@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs-extra';
 import { runGit } from '../git/git-manager.js';
+import { sameDirectory } from '../runtime/path-identity.js';
 
 export interface WorktreeInfo {
   taskId: string;
@@ -94,17 +95,6 @@ function parseWorktreePorcelain(output: string): ParsedWorktreeRecord[] {
   return records;
 }
 
-async function pathsEqual(a: string, b: string): Promise<boolean> {
-  if (a === b) return true;
-  try {
-    const realA = await fs.realpath(a);
-    const realB = await fs.realpath(b);
-    return realA === realB;
-  } catch {
-    return path.resolve(a) === path.resolve(b);
-  }
-}
-
 export class WorktreeManager {
   private readonly projectRoot: string;
 
@@ -133,7 +123,7 @@ export class WorktreeManager {
     const existingRecords = parseWorktreePorcelain(listResult.stdout);
 
     for (const record of existingRecords) {
-      if (await pathsEqual(record.worktreePath, worktreePath)) {
+      if (await sameDirectory(record.worktreePath, worktreePath)) {
         const existingBranch = record.branch ?? '';
         if (existingBranch !== branch) {
           throw new WorktreeManagerError(
@@ -212,21 +202,26 @@ export class WorktreeManager {
 
     const records = parseWorktreePorcelain(listResult.stdout);
     const runRoot = buildRunWorktreeRoot(this.projectRoot, runId);
-    const runRootResolved = path.resolve(runRoot);
     const infos: WorktreeInfo[] = [];
 
     for (const record of records) {
-      const resolved = path.resolve(record.worktreePath);
-      const rel = path.relative(runRootResolved, resolved);
-      if (rel.startsWith('..') || path.isAbsolute(rel) || rel.length === 0) {
+      // Worktree paths are created as <runRoot>/<taskId> (one level deep).
+      // Determine membership by comparing the worktree's PARENT directory to
+      // runRoot via filesystem identity (stat dev+ino), which is independent of
+      // path aliasing (8.3 short vs long names, slash direction). A string
+      // prefix check would split RUNNER~1 vs runneradmin and omit the worktree;
+      // stat resolves any spelling to the same file-id. The taskId is then the
+      // final path segment (basename) of the worktree path.
+      const parentDir = path.dirname(record.worktreePath.replace(/\//g, path.sep));
+      const isChildOfRunRoot = await sameDirectory(parentDir, runRoot);
+      if (!isChildOfRunRoot) {
         continue;
       }
 
-      const segments = rel.split(path.sep).filter((segment) => segment.length > 0);
-      if (segments.length === 0) {
+      const taskId = path.basename(record.worktreePath.replace(/\//g, path.sep));
+      if (taskId.length === 0) {
         continue;
       }
-      const taskId = segments[0];
 
       infos.push({
         taskId,

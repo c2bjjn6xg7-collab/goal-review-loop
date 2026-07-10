@@ -12,6 +12,7 @@ import { resolve } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { createInterface } from 'node:readline';
+import { buildClaudeCommand, buildOpenCodeCommand } from '../providers/platform-commands.js';
 
 const ROLES = ['planner', 'developer', 'auditor', 'final_auditor'] as const;
 type Role = typeof ROLES[number];
@@ -24,47 +25,16 @@ interface AgentConfig {
 
 /** Command templates for each provider + optional model. */
 function buildCommand(role: Role, provider: string, model?: string): { command: string[]; providerLabel: string } {
-  const heartbeatName = `${provider}-${role}`;
-  const heartbeatLine = buildHeartbeatLine(role);
-
   if (provider === 'opencode') {
-    const modelFlag = model ? `--model ${model}` : '';
     return {
-      command: [
-        'sh', '-c',
-        [
-          'P=$(cat "$1")',
-          heartbeatLine,
-          `~/.opencode/bin/opencode run ${modelFlag} --dangerously-skip-permissions --no-replay -- "$P"`,
-          'status=$?',
-          'kill "$heartbeat_pid" 2>/dev/null || true',
-          'wait "$heartbeat_pid" 2>/dev/null || true',
-          'exit "$status"',
-        ].join('\n'),
-        heartbeatName,
-        '{prompt_file}',
-      ],
+      command: buildOpenCodeCommand(role, model),
       providerLabel: model ? `${provider}/${model}` : provider,
     };
   }
 
   if (provider === 'claude') {
     return {
-      command: [
-        'sh', '-c',
-        [
-          'P=$(cat "$1")',
-          heartbeatLine,
-          'env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \\',
-          '  claude -p --permission-mode bypassPermissions --max-turns 160 -- "$P"',
-          'status=$?',
-          'kill "$heartbeat_pid" 2>/dev/null || true',
-          'wait "$heartbeat_pid" 2>/dev/null || true',
-          'exit "$status"',
-        ].join('\n'),
-        heartbeatName,
-        '{prompt_file}',
-      ],
+      command: buildClaudeCommand(role),
       providerLabel: 'claude',
     };
   }
@@ -81,20 +51,6 @@ function buildCommand(role: Role, provider: string, model?: string): { command: 
     command: [provider, '{prompt_file}'],
     providerLabel: provider,
   };
-}
-
-function buildHeartbeatLine(role: string): string {
-  return [
-    `heartbeat_interval="\${REVIEW_LOOP_${role.toUpperCase().replace(/-/g, '_')}_HEARTBEAT_SECONDS:-30}"`,
-    '(',
-    '  while :; do',
-    '    sleep "$heartbeat_interval"',
-    `    printf '[review-loop heartbeat] ${role} still running (%%ss idle heartbeat)\\n' "$heartbeat_interval" >&2`,
-    '  done',
-    ' ) &',
-    'heartbeat_pid=$!',
-    "trap 'kill \"$heartbeat_pid\" 2>/dev/null || true' EXIT INT TERM",
-  ].join('\n');
 }
 
 function readConfig(projectRoot: string): Record<string, unknown> | null {

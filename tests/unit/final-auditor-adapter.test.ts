@@ -6,10 +6,11 @@ import { buildFinalAuditorInput, validateFinalAuditorOutput } from '../../src/ag
 
 describe('buildFinalAuditorInput', () => {
   it('builds input with role final-auditor', () => {
+    const projectRoot = join(tmpdir(), 'test');
     const input = buildFinalAuditorInput({
       run_id: 'run-001',
       iteration: 1,
-      project_root: '/tmp/test',
+      project_root: projectRoot,
       command_template: ['node', 'agent.mjs'],
       timeout_seconds: 600,
       prompt: 'test prompt',
@@ -17,7 +18,7 @@ describe('buildFinalAuditorInput', () => {
     expect(input.role).toBe('final-auditor');
     expect(input.run_id).toBe('run-001');
     expect(input.iteration).toBe(1);
-    expect(input.expected_artifacts).toContain('/tmp/test/.agent/final-audit.md');
+    expect(input.expected_artifacts).toContain(join(projectRoot, '.agent', 'final-audit.md'));
   });
 });
 

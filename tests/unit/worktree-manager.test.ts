@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { execSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, writeFileSync, rmSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { WorktreeManager } from '../../src/scheduler/worktree-manager.js';
 import { runGit } from '../../src/git/git-manager.js';
+import { sameDirectory } from '../../src/runtime/path-identity.js';
 
 interface TestRepo {
   repoDir: string;
@@ -18,7 +19,7 @@ function createTestRepo(suffix: string): TestRepo {
   );
   mkdirSync(rawRepoDir, { recursive: true });
   const repoDir = realpathSync(rawRepoDir);
-  execSync('git init -q', { cwd: repoDir });
+  execSync('git init -q -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   writeFileSync(join(repoDir, 'README.md'), '# Test\n');
@@ -81,7 +82,10 @@ describe('WorktreeManager.createForTask', () => {
     const first = await mgr.createForTask(params);
     const second = await mgr.createForTask(params);
 
-    expect(realpathSync(second.worktreePath)).toBe(realpathSync(first.worktreePath));
+    // Compare by filesystem identity (stat dev+ino), not realpath string
+    // equality: on Windows realpath can return 8.3 short vs long forms
+    // (RUNNER~1 vs runneradmin) for the same directory.
+    expect(await sameDirectory(second.worktreePath, first.worktreePath)).toBe(true);
     expect(second.branch).toBe(first.branch);
     expect(existsSync(second.worktreePath)).toBe(true);
 
@@ -223,15 +227,18 @@ describe('WorktreeManager.prune', () => {
 
     rmSync(created.worktreePath, { recursive: true, force: true });
 
+    // Assert by the branch record (alias-independent), not by matching the
+    // worktree path string: Git porcelain may emit a different path spelling
+    // (8.3 short vs long name, / vs \) than the input path.
     const beforeList = await runGit(['worktree', 'list', '--porcelain'], repoDir);
     expect(beforeList.exit_code).toBe(0);
-    expect(beforeList.stdout).toContain(created.worktreePath);
+    expect(beforeList.stdout).toContain(created.branch);
 
     await mgr.prune();
 
     const afterList = await runGit(['worktree', 'list', '--porcelain'], repoDir);
     expect(afterList.exit_code).toBe(0);
-    expect(afterList.stdout).not.toContain(created.worktreePath);
+    expect(afterList.stdout).not.toContain(created.branch);
   });
 });
 
@@ -269,7 +276,12 @@ describe('WorktreeManager.listForRun', () => {
     for (const info of aList) {
       expect(info.branch.startsWith('agent/run-A/')).toBe(true);
       expect(info.baseCommit).toBe(baseSha);
-      expect(info.worktreePath).toContain(join('.agent', 'worktrees', 'run-A'));
+      // Verify the worktree lives under the run root by directory identity
+      // (stat dev+ino), not by string-containment of a join() path: Git may
+      // emit the path with a different separator or 8.3 alias on Windows.
+      const expectedRunRoot = join(repoDir, '.agent', 'worktrees', 'run-A');
+      const parentDir = dirname(info.worktreePath);
+      expect(await sameDirectory(parentDir, expectedRunRoot)).toBe(true);
     }
 
     const bList = await mgr.listForRun('run-B');
@@ -280,5 +292,39 @@ describe('WorktreeManager.listForRun', () => {
     // Excludes the original repo (which is not under .agent/worktrees/{runId}/).
     const cList = await mgr.listForRun('run-does-not-exist');
     expect(cList.length).toBe(0);
+  });
+
+  // 017 regression: the same physical directory must not be split into two
+  // identities by path aliasing. On Windows this happens via short (8.3) vs
+  // long names (RUNNER~1 vs runneradmin); on POSIX we reproduce the same
+  // "different string, same directory" condition with a symlink alias. A pure
+  // string-prefix check would see the aliased path as outside the run root and
+  // omit the worktree; the stat-based (dev+ino) directory identity comparison
+  // must include it.
+  it('lists worktrees through a path alias (symlink) without omission (017)', async () => {
+    const { repoDir, baseSha } = createTestRepo('alias');
+    cleanupDirs.push(repoDir);
+
+    // Create a symlink alias to the repo root — same physical directory,
+    // different path string, exactly as a Windows 8.3 short name behaves.
+    const aliasDir = join(tmpdir(), `wt-alias-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    symlinkSync(repoDir, aliasDir);
+    cleanupDirs.push(aliasDir);
+    cleanupDirs.push(realpathSync(aliasDir));
+
+    // Manage worktrees via the aliased path. Git records worktree paths
+    // relative to where it was invoked, so the run root is under the alias.
+    const mgr = new WorktreeManager(aliasDir);
+    await mgr.createForTask({
+      runId: 'run-alias',
+      taskId: 't1',
+      slug: 'demo',
+      baseCommit: baseSha,
+    });
+
+    const list = await mgr.listForRun('run-alias');
+    expect(list.length).toBe(1);
+    expect(list[0].taskId).toBe('t1');
+    expect(list[0].branch).toBe('agent/run-alias/t1-demo');
   });
 });

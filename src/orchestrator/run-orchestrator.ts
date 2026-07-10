@@ -27,6 +27,7 @@ import {
 import { resolveTaskGraphResumeDecision } from './task-graph-resume.js';
 import { recordSoftFailure, recordSoftFailurePass } from './failure-guard.js';
 import { LockManager } from '../runtime/lock-manager.js';
+import { supportsGracefulSigterm } from '../runtime/platform-signals.js';
 import { ArtifactStore, ARTIFACT_FILES } from '../artifacts/artifact-store.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
 import {
@@ -186,6 +187,28 @@ export async function runOrchestrator(params: {
   };
 
   process.on('SIGTERM', sigtermHandler);
+
+  // Windows cannot deliver a catchable SIGTERM. Poll the durable cancel
+  // request so CLI/dashboard cancellation can abort the active Agent and let
+  // the normal state-machine path transition to CANCELLED on every platform.
+  let cancelPollTimer: ReturnType<typeof setInterval> | undefined;
+  if (!supportsGracefulSigterm()) {
+    let cancelPollInFlight = false;
+    cancelPollTimer = setInterval(() => {
+      if (!runId || combinedSignal.aborted || cancelPollInFlight) return;
+      cancelPollInFlight = true;
+      void checkCancelRequest(agentDir)
+        .then((request) => {
+          if (request?.run_id === runId && !combinedSignal.aborted) {
+            abortController.abort(`Cancel requested at ${request.requested_at}`);
+          }
+        })
+        .finally(() => {
+          cancelPollInFlight = false;
+        });
+    }, 250);
+    cancelPollTimer.unref();
+  }
 
   try {
     // ═══════════════════════════════════════════════════════════
@@ -1035,6 +1058,7 @@ export async function runOrchestrator(params: {
   } finally {
     // F-402: Remove SIGTERM handler to avoid leaking listeners
     process.off('SIGTERM', sigtermHandler);
+    if (cancelPollTimer) clearInterval(cancelPollTimer);
 
     if (lockManager) {
       try {

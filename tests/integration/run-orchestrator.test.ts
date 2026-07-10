@@ -90,7 +90,7 @@ function createTestRepo(
   mkdirSync(repoDir, { recursive: true });
 
   // Init git repo
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
 
@@ -494,7 +494,7 @@ describe('Run Orchestrator integration', () => {
   // enters BLOCKED rather than continuing silently. The Developer agent makes
   // the .agent/debug directory read-only so deletePromptFile() cannot unlink
   // the prompt file.
-  it('blocks when prompt cleanup fails', async () => {
+  it.skipIf(process.platform === 'win32')('blocks when prompt cleanup fails', async () => {
     repoDir = createTestRepo('prompt-cleanup-fail', { developer: 'break-prompt-cleanup' });
 
     const result = await runOrchestrator({

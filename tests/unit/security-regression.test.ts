@@ -141,7 +141,7 @@ describe('F-303R1 regression: Auditor staging bypass', () => {
     // Create a temp git repo
     const repoDir = join(tmpdir(), `f303-test-${Date.now()}`);
     mkdirSync(repoDir, { recursive: true });
-    execSync('git init', { cwd: repoDir });
+    execSync('git init -b main', { cwd: repoDir });
     execSync('git config user.email "test@test.com"', { cwd: repoDir });
     execSync('git config user.name "Test"', { cwd: repoDir });
     writeFileSync(join(repoDir, 'README.md'), '# test');
@@ -300,7 +300,7 @@ describe('F-306R1 regression: prompt file cleanup', () => {
     expect(existsSync(promptPath)).toBe(false);
   });
 
-  it('creates prompt file with restrictive permissions', async () => {
+  it.skipIf(process.platform === 'win32')('creates prompt file with restrictive permissions', async () => {
     const promptPath = await writePromptFile(
       join(testDir, '.agent'),
       'secret content',

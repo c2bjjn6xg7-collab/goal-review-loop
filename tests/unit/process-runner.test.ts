@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import { runProcess, runProcessRaw, ProcessRunnerError, KillResult } from '../../src/runtime/process-runner.js';
 import { ProcessStatus } from '../../src/types.js';
+import { nodeEval, nodeExit, nodeSleep, nodeStderr, nodeStdout } from '../helpers/node-command.js';
 
 describe('ProcessRunner', () => {
   let tmpDir: string;
@@ -22,7 +23,7 @@ describe('ProcessRunner', () => {
 
   it('should execute a simple command successfully', async () => {
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -42,9 +43,25 @@ describe('ProcessRunner', () => {
     expect(stdout.trim()).toBe('hello');
   });
 
+  it.skipIf(process.platform !== 'win32')('should execute a Windows .cmd shim', async () => {
+    const shimPath = path.join(tmpDir, 'fixture.cmd');
+    await fs.writeFile(shimPath, '@echo off\r\necho windows-shim-ok\r\n', 'utf8');
+
+    const result = await runProcess({
+      argv: [shimPath],
+      cwd: tmpDir,
+      timeout_ms: 5000,
+      stdout_path: stdoutPath,
+      stderr_path: stderrPath,
+    });
+
+    expect(result.status).toBe(ProcessStatus.SUCCESS);
+    expect(await fs.readFile(stdoutPath, 'utf8')).toContain('windows-shim-ok');
+  });
+
   it('should return failed for non-zero exit code', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'exit 42'],
+      argv: nodeExit(42),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -65,10 +82,9 @@ describe('ProcessRunner', () => {
     });
 
     expect(result.status).toBe(ProcessStatus.FAILED);
-    // exit_code may be null (error event) or a negative number (close event with signal)
-    if (result.exit_code !== null) {
-      expect(result.exit_code).toBeLessThan(0);
-    }
+    // Command-not-found surfaces as a FAILED status on every platform; the
+    // exact exit_code is platform-dependent (POSIX signal/negative, Windows
+    // positive/null), so we only assert the failure status, not a POSIX code.
   });
 
   it('should reject empty argv', async () => {
@@ -85,7 +101,7 @@ describe('ProcessRunner', () => {
 
   it('should capture stdout and stderr separately', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'echo stdout; echo stderr >&2'],
+      argv: nodeEval("console.log('stdout'); console.error('stderr')"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -101,7 +117,7 @@ describe('ProcessRunner', () => {
 
   it('should timeout a long-running command', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 100,
       stdout_path: stdoutPath,
@@ -118,7 +134,7 @@ describe('ProcessRunner', () => {
     setTimeout(() => controller.abort(), 100);
 
     const result = await runProcess({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 30000,
       stdout_path: stdoutPath,
@@ -135,7 +151,7 @@ describe('ProcessRunner', () => {
     controller.abort();
 
     const result = await runProcess({
-      argv: ['bash', '-c', 'echo hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -150,7 +166,7 @@ describe('ProcessRunner', () => {
 
   it('should truncate logs when exceeding max_log_bytes', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'for i in $(seq 1 1000); do echo "line $i"; done'],
+      argv: nodeEval("for (let i = 1; i <= 1000; i++) console.log('line ' + i)"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -167,7 +183,7 @@ describe('ProcessRunner', () => {
 
   it('should pass real env to child but sanitize logs', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'echo $MY_TOKEN; echo $SAFE_VAR'],
+      argv: nodeEval("console.log(process.env.MY_TOKEN); console.log(process.env.SAFE_VAR)"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -188,7 +204,7 @@ describe('ProcessRunner', () => {
   it('should sanitize repeated secrets', async () => {
     const secret = 'bb';
     const result = await runProcess({
-      argv: ['echo', '-n', 'bbbb'],
+      argv: nodeStdout('bbbb'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -209,7 +225,7 @@ describe('ProcessRunner', () => {
 
     await expect(
       runProcess({
-        argv: ['echo', 'hello'],
+        argv: nodeStdout('hello\n'),
         cwd: outsideDir,
         timeout_ms: 5000,
         stdout_path: stdoutPath,
@@ -222,7 +238,7 @@ describe('ProcessRunner', () => {
 
   it('should allow immediate file read after return', async () => {
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -244,7 +260,7 @@ describe('ProcessRunner', () => {
     const logStderr = path.join(logDir, 'stderr.log');
 
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: logStdout,
@@ -267,7 +283,7 @@ describe('ProcessRunner', () => {
     const logStderr = path.join(logDir, 'stderr.log');
 
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: logStdout,
@@ -293,7 +309,7 @@ describe('ProcessRunner', () => {
     const badPath = logDir; // this is a directory, not a file
 
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: badPath,
@@ -312,7 +328,7 @@ describe('ProcessRunner', () => {
     const badPath = logDir;
 
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -330,7 +346,7 @@ describe('ProcessRunner', () => {
 
     // This should not throw — the error should be captured in log_io_error
     const result = await runProcess({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: logDir, // directory, not file
@@ -347,7 +363,7 @@ describe('ProcessRunner', () => {
 
   it('should include kill_result on timeout', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 100,
       stdout_path: stdoutPath,
@@ -367,7 +383,7 @@ describe('ProcessRunner', () => {
     setTimeout(() => controller.abort(), 100);
 
     const result = await runProcess({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 30000,
       stdout_path: stdoutPath,
@@ -386,7 +402,7 @@ describe('ProcessRunner', () => {
 
   it('should sanitize prefix-related secrets correctly', async () => {
     const result = await runProcess({
-      argv: ['echo', '-n', 'abcdef'],
+      argv: nodeStdout('abcdef'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -412,7 +428,7 @@ describe('ProcessRunner', () => {
     setTimeout(() => controller.abort(), 50);
 
     const result = await runProcess({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 30000,
       stdout_path: stdoutPath,
@@ -430,7 +446,7 @@ describe('ProcessRunner', () => {
 
   it('should not re-kill after timeout when child closes before grace timer', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 100,
       stdout_path: stdoutPath,
@@ -454,7 +470,7 @@ describe('ProcessRunner', () => {
       const logStderr = path.join(logDir, 'stderr.log');
 
       const result = await runProcess({
-        argv: ['echo', 'hello'],
+        argv: nodeStdout('hello\n'),
         cwd: tmpDir,
         timeout_ms: 5000,
         stdout_path: logStdout,
@@ -472,7 +488,7 @@ describe('ProcessRunner', () => {
   // Phase 8F: delete_env support
   it('should delete env keys specified in delete_env', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'echo "HTTP_PROXY=$HTTP_PROXY"; echo "HOME=$HOME"'],
+      argv: nodeEval("console.log('HTTP_PROXY=' + (process.env.HTTP_PROXY ?? '')); console.log('HOME=' + (process.env.HOME ?? ''))"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -493,7 +509,7 @@ describe('ProcessRunner', () => {
 
   it('should handle empty delete_env array', async () => {
     const result = await runProcess({
-      argv: ['bash', '-c', 'echo $MY_VAR'],
+      argv: nodeEval("console.log(process.env.MY_VAR ?? '')"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -511,7 +527,7 @@ describe('ProcessRunner', () => {
 
   it('should handle delete_env with keys that do not exist in env', async () => {
     const result = await runProcess({
-      argv: ['echo', 'ok'],
+      argv: nodeStdout('ok\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -540,7 +556,7 @@ describe('runProcessRaw', () => {
 
   it('should not sanitize stdout', async () => {
     const result = await runProcessRaw({
-      argv: ['bash', '-c', 'echo $MY_TOKEN'],
+      argv: nodeEval("console.log(process.env.MY_TOKEN ?? '')"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -557,7 +573,7 @@ describe('runProcessRaw', () => {
 
   it('should still sanitize stderr', async () => {
     const result = await runProcessRaw({
-      argv: ['bash', '-c', 'echo $MY_TOKEN >&2'],
+      argv: nodeStderr('secret123\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -575,7 +591,7 @@ describe('runProcessRaw', () => {
 
   it('should allow immediate file read after return', async () => {
     const result = await runProcessRaw({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,
@@ -597,7 +613,7 @@ describe('runProcessRaw', () => {
     const logStderr = path.join(logDir, 'stderr.log');
 
     const result = await runProcessRaw({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: logStdout,
@@ -616,7 +632,7 @@ describe('runProcessRaw', () => {
     const logDir = await fs.mkdtemp(path.join(os.tmpdir(), 'raw-log-err-'));
 
     const result = await runProcessRaw({
-      argv: ['echo', 'hello'],
+      argv: nodeStdout('hello\n'),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: logDir,
@@ -636,7 +652,7 @@ describe('runProcessRaw', () => {
     setTimeout(() => controller.abort(), 50);
 
     const result = await runProcessRaw({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 30000,
       stdout_path: stdoutPath,
@@ -653,7 +669,7 @@ describe('runProcessRaw', () => {
 
   it('should not re-kill after timeout when child closes before grace timer', async () => {
     const result = await runProcessRaw({
-      argv: ['bash', '-c', 'sleep 30'],
+      argv: nodeSleep(),
       cwd: tmpDir,
       timeout_ms: 100,
       stdout_path: stdoutPath,

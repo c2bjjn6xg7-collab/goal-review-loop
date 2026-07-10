@@ -19,9 +19,13 @@ function git(repoDir: string, args: string[]): string {
 
 function createRepo(prefix: string): { repoDir: string; baseCommit: string; mainBranch: string } {
   const repoDir = mkdtempSync(path.join(tmpdir(), `integration-runner-${prefix}-`));
-  execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repoDir });
   git(repoDir, ['config', 'user.email', 'test@test.com']);
   git(repoDir, ['config', 'user.name', 'Test']);
+  // Isolate from the host's line-ending policy: GitHub's Windows runner defaults
+  // to core.autocrlf=true, which expands committed LF to CRLF in the working
+  // tree and breaks exact-equality assertions on file contents.
+  git(repoDir, ['config', 'core.autocrlf', 'false']);
   writeFile(repoDir, 'README.md', '# Test\n');
   git(repoDir, ['add', 'README.md']);
   git(repoDir, ['commit', '-q', '-m', 'initial']);

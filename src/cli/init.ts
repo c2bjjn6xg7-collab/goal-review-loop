@@ -5,6 +5,7 @@
 import { Command } from 'commander';
 import fs from 'fs-extra';
 import path from 'path';
+import crossSpawn from 'cross-spawn';
 import { ArtifactStore } from '../artifacts/artifact-store.js';
 import { generateSampleConfig } from '../artifacts/config.js';
 import { getBundledTemplatesDir } from '../agents/prompt-builder.js';
@@ -109,8 +110,6 @@ export async function executeInit(
  * Warns the user if the default config references tools that aren't installed.
  */
 async function checkProviderAvailability(): Promise<void> {
-  const { execFileSync } = await import('child_process');
-
   const providers = [
     { name: 'claude', role: 'Developer', installHint: 'https://docs.anthropic.com/en/docs/claude-code' },
     { name: 'codex', role: 'Planner/Auditor/Final Auditor', installHint: 'https://platform.openai.com/docs/codex' },
@@ -120,11 +119,13 @@ async function checkProviderAvailability(): Promise<void> {
 
   for (const provider of providers) {
     try {
-      execFileSync(provider.name, ['--version'], {
+      const result = crossSpawn.sync(provider.name, ['--version'], {
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe'],
         timeout: 5000,
       });
+      if (result.error) throw result.error;
+      if (result.status !== 0) throw new Error(`Exited with code ${result.status}`);
     } catch {
       missing.push(provider);
     }

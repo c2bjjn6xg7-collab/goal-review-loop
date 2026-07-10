@@ -6,7 +6,7 @@
  *   GET  /                  -> inline HTML page
  *   GET  /api/events        -> JSON snapshot built from events.jsonl
  *   GET  /api/events/stream -> text/event-stream push of new events
- *   POST /api/cancel        -> writes .agent/cancel-request.json and SIGTERMs PID
+ *   POST /api/cancel        -> writes .agent/cancel-request.json and wakes POSIX PID
  *   *                       -> 404 / 405 JSON
  *
  * Bound to 127.0.0.1 only.
@@ -22,6 +22,7 @@ import { EventStore } from '../runtime/event-store.js';
 import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { atomicWriteJSON } from '../runtime/atomic-file.js';
+import { supportsGracefulSigterm } from '../runtime/platform-signals.js';
 import type { CancelRequest } from '../types.js';
 
 export interface DashboardServerOptions {
@@ -358,11 +359,17 @@ async function handleCancel(res: http.ServerResponse, agentDir: string): Promise
     return;
   }
 
-  // Best-effort SIGTERM to orchestrator PID via existing LockManager.
+  // Best-effort POSIX SIGTERM to wake the orchestrator. Windows SIGTERM is
+  // unconditional termination, so Windows relies on the durable watcher.
   try {
     const lockManager = new LockManager(agentDir);
     const lock = await lockManager.readLock();
-    if (lock && lock.pid > 0 && lockManager.isProcessAlive(lock.pid)) {
+    if (
+      supportsGracefulSigterm()
+      && lock
+      && lock.pid > 0
+      && lockManager.isProcessAlive(lock.pid)
+    ) {
       try {
         process.kill(lock.pid, 'SIGTERM');
       } catch {

@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from 'child_process';
+import { type ChildProcess } from 'child_process';
+import crossSpawn from 'cross-spawn';
 import { StringDecoder } from 'string_decoder';
 import fs from 'fs-extra';
 import path from 'path';
@@ -194,7 +195,7 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): Promise<K
         resolve(result);
       };
 
-      const killer = spawn('taskkill', ['/pid', String(child.pid!), '/T', '/F'], { stdio: 'ignore' });
+      const killer = crossSpawn('taskkill', ['/pid', String(child.pid!), '/T', '/F'], { stdio: 'ignore' });
 
       // Timeout for taskkill itself to prevent hanging
       const taskkillTimer = setTimeout(() => {
@@ -459,12 +460,15 @@ export async function runProcess(input: ProcessRunnerInput, projectRoot?: string
   let inFlightKill: Promise<KillResult> | undefined;
   let childClosed = false;
 
-  const child: ChildProcess = spawn(input.argv[0], input.argv.slice(1), {
+  const child: ChildProcess = crossSpawn(input.argv[0], input.argv.slice(1), {
     cwd: resolvedCwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
-    detached: true,
+    detached: process.platform !== 'win32',
+    // Hide the child's console window on Windows so spawned providers/git do
+    // not steal focus or flash a console. No-op on POSIX.
+    windowsHide: true,
   });
 
   const killTree = async (signal: NodeJS.Signals): Promise<boolean> => {
@@ -729,12 +733,15 @@ export async function runProcessRaw(input: ProcessRunnerInput, projectRoot?: str
   let inFlightKill: Promise<KillResult> | undefined;
   let childClosed = false;
 
-  const child: ChildProcess = spawn(input.argv[0], input.argv.slice(1), {
+  const child: ChildProcess = crossSpawn(input.argv[0], input.argv.slice(1), {
     cwd: resolvedCwd,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: false,
-    detached: true,
+    detached: process.platform !== 'win32',
+    // Hide the child's console window on Windows so spawned providers/git do
+    // not steal focus or flash a console. No-op on POSIX.
+    windowsHide: true,
   });
 
   const killTree = async (signal: NodeJS.Signals): Promise<boolean> => {

@@ -22,7 +22,7 @@ describe('DiffCollector', () => {
   });
 
   async function initGitRepo(dir: string): Promise<void> {
-    await runGit(['init'], dir);
+    await runGit(['init', '-b', 'main'], dir);
     await runGit(['config', 'user.email', 'test@test.com'], dir);
     await runGit(['config', 'user.name', 'Test'], dir);
     await fs.writeFile(path.join(dir, 'README.md'), '# Test');

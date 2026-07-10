@@ -76,7 +76,7 @@ function copyPrompts(repoDir: string): void {
 
 function createTestRepo(suffix: string, roleBehaviors: Record<string, string> = {}): string {
   const repoDir = mkdtempSync(join(tmpdir(), `task-graph-parallel-wave-${suffix}-`));
-  execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repoDir });
   git(repoDir, ['config', 'user.email', 'test@test.com']);
   git(repoDir, ['config', 'user.name', 'Test']);
 

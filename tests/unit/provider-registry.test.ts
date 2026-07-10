@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'fs-extra';
+import os from 'node:os';
+import path from 'node:path';
 import { createProviderRegistry, resolveCommandForAgent } from '../../src/providers/provider-registry.js';
 import { BUILTIN_PROVIDERS, getBuiltinProvider } from '../../src/providers/builtin-providers.js';
 import type { ReviewLoopConfig } from '../../src/types.js';
@@ -48,6 +51,44 @@ describe('ProviderRegistry', () => {
   it('returns null for unknown provider', () => {
     const registry = createProviderRegistry();
     expect(registry.resolve('nonexistent')).toBeNull();
+  });
+
+  it('runs a provider health check without a shell', () => {
+    const config = {
+      providers: {
+        probe: {
+          enabled: true,
+          command_template: [process.execPath, '-e', ''],
+          health_check: [process.execPath, '--version'],
+        },
+      },
+    } as unknown as ReviewLoopConfig;
+    const result = createProviderRegistry(config).healthCheck('probe');
+    expect(result.available).toBe(true);
+    expect(result.output).toMatch(/^v\d+/);
+  });
+
+  it.skipIf(process.platform !== 'win32')('runs a Windows .cmd provider health check', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'provider-health-win-'));
+    try {
+      const shimPath = path.join(tmpDir, 'provider-health.cmd');
+      await fs.writeFile(shimPath, '@echo off\r\necho provider-health-ok\r\n', 'utf8');
+      const config = {
+        providers: {
+          probe: {
+            enabled: true,
+            command_template: [shimPath, '{prompt_file}'],
+            health_check: [shimPath, '--version'],
+          },
+        },
+      } as unknown as ReviewLoopConfig;
+
+      const result = createProviderRegistry(config).healthCheck('probe');
+      expect(result.available).toBe(true);
+      expect(result.output).toContain('provider-health-ok');
+    } finally {
+      await fs.remove(tmpDir);
+    }
   });
 
   it('merges config overrides for builtin providers', () => {
@@ -162,6 +203,24 @@ describe('resolveCommandForAgent', () => {
     const result = resolveCommandForAgent(fallback, 'claude');
     expect(result).not.toBe(fallback);
     expect(result.length).toBeGreaterThan(0);
+  });
+
+  it.skipIf(process.platform !== 'win32')('uses a Windows-native Claude provider command', () => {
+    const result = resolveCommandForAgent(['fallback'], 'claude');
+    // Windows uses the Node provider wrapper (not PowerShell), launched via the
+    // Node executable with the built-in Claude profile (acceptEdits, no turns).
+    expect(result[0]).toBe(process.execPath);
+    expect(result[1]).toContain('windows-provider-wrapper');
+    expect(result).not.toContain('sh');
+    expect(result).toContain('--provider');
+    expect(result).toContain('claude');
+    // --permission-mode and its value are separate argv elements (the wrapper
+    // passes them as flags), so check them individually rather than as a
+    // space-joined substring.
+    expect(result).toContain('--permission-mode');
+    expect(result).toContain('acceptEdits');
+    expect(result).not.toContain('bypassPermissions');
+    expect(result).not.toContain('--max-turns');
   });
 
   it('returns fallback when provider is disabled', () => {

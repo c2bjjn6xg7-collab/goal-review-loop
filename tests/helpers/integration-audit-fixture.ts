@@ -26,6 +26,8 @@ export interface IntegrationAuditFixture {
   baseCommit: string;
   integrationBranch: string;
   integrationHead: string;
+  /** The original branch the fixture repo was created on (e.g. 'main'). */
+  mainBranch: string;
   stateStore: StateStore;
   artifactStore: ArtifactStore;
   registry: OrchestratorFileRegistry;
@@ -48,7 +50,7 @@ export async function createIntegrationAuditFixture(options: {
   const runId = INTEGRATION_AUDIT_RUN_ID;
   const integrationBranch = `integration/${runId}`;
 
-  git(repoDir, ['init', '-q']);
+  git(repoDir, ['init', '-q', '-b', 'main']);
   git(repoDir, ['config', 'user.email', 'test@test.com']);
   git(repoDir, ['config', 'user.name', 'Test']);
   writeFile(repoDir, '.gitignore', '.agent/**\nnode_modules/**\n');
@@ -194,6 +196,7 @@ export async function createIntegrationAuditFixture(options: {
     baseCommit,
     integrationBranch,
     integrationHead,
+    mainBranch,
     stateStore,
     artifactStore,
     registry,

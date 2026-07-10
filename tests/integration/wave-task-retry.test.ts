@@ -151,7 +151,7 @@ function copyPrompts(repoDir: string): void {
 
 function createTestRepo(maxAgentRetries: number): string {
   const repoDir = mkdtempSync(join(tmpdir(), 'wave-task-retry-'));
-  execFileSync('git', ['init', '-q'], { cwd: repoDir });
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repoDir });
   git(repoDir, ['config', 'user.email', 'test@test.com']);
   git(repoDir, ['config', 'user.name', 'Test']);
 

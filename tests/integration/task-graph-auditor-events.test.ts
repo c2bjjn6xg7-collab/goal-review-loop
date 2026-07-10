@@ -21,7 +21,7 @@ import { EventStore } from '../../src/runtime/event-store.js';
 function makeRepo(suffix: string): string {
   const dir = join(tmpdir(), `rl-tg-audit-${suffix}-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
-  execSync('git init', { cwd: dir });
+  execSync('git init -b main', { cwd: dir });
   execSync('git config user.email "t@t.com"', { cwd: dir });
   execSync('git config user.name "T"', { cwd: dir });
   writeFileSync(join(dir, 'README.md'), '# T\n');

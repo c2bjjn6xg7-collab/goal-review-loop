@@ -1,8 +1,22 @@
 import { describe, it, expect, afterAll } from 'vitest';
-import { execFileSync } from 'child_process';
+import crossSpawn from 'cross-spawn';
 import fs from 'fs-extra';
 import path from 'path';
 import os from 'os';
+
+function runChecked(command: string, args: string[], cwd: string, timeout: number): string {
+  const result = crossSpawn.sync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    timeout,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(String(result.stderr ?? `Command exited with ${result.status}`));
+  }
+  return String(result.stdout ?? '');
+}
 
 /**
  * Integration test: pack, install, and run the real CLI binary.
@@ -13,12 +27,11 @@ describe('CLI Integration: pack, install, and run', () => {
   const projectRoot = path.resolve(import.meta.dirname, '../..');
   let tmpDir: string;
   // Build and pack before tests
-  const packResult = execFileSync('npm', ['pack', '--pack-destination=/tmp'], {
-    cwd: projectRoot,
-    encoding: 'utf8',
-    timeout: 60000,
-  });
-  const tarballPath = path.join('/tmp', packResult.trim().split('\n').pop()!);
+  const packDestination = os.tmpdir();
+  const packResult = runChecked(
+    'npm', ['pack', '--pack-destination', packDestination], projectRoot, 60_000,
+  );
+  const tarballPath = path.join(packDestination, packResult.trim().split(/\r?\n/).pop()!);
 
   afterAll(async () => {
     // Cleanup
@@ -35,28 +48,25 @@ describe('CLI Integration: pack, install, and run', () => {
     expect(fs.pathExistsSync(tarballPath)).toBe(true);
   });
 
+  // This test packs the tarball, runs `npm install`, and launches the CLI —
+  // heavy work that can exceed the default 30s vitest timeout on a loaded
+  // Windows CI runner. The inner runChecked calls keep their own timeouts;
+  // this 180s outer timeout only bounds the whole test.
   it('should install and run review-loop init in a temp git repo', async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'review-loop-integ-'));
     const testProject = path.join(tmpDir, 'test-project');
 
     // Create a git repo
     await fs.ensureDir(testProject);
-    execFileSync('git', ['init'], { cwd: testProject, timeout: 10000 });
+    runChecked('git', ['init', '-b', 'main'], testProject, 10_000);
 
     // Install the tarball
-    execFileSync('npm', ['install', tarballPath], {
-      cwd: testProject,
-      encoding: 'utf8',
-      timeout: 120000,
-    });
+    runChecked('npm', ['install', tarballPath], testProject, 120_000);
 
     // Run review-loop init
-    const binPath = path.join(testProject, 'node_modules', '.bin', 'review-loop');
-    const result = execFileSync(binPath, ['init'], {
-      cwd: testProject,
-      encoding: 'utf8',
-      timeout: 30000,
-    });
+    const binName = process.platform === 'win32' ? 'review-loop.cmd' : 'review-loop';
+    const binPath = path.join(testProject, 'node_modules', '.bin', binName);
+    const result = runChecked(binPath, ['init'], testProject, 30_000);
 
     // Verify output
     expect(result).toContain('Goal Review Loop initialized successfully');
@@ -70,7 +80,7 @@ describe('CLI Integration: pack, install, and run', () => {
 
     // Verify .gitignore content (init adds .agent local runtime files)
     const gitignore = await fs.readFile(path.join(testProject, '.gitignore'), 'utf8');
-    expect(gitignore).toContain('.agent/state.json');
-    expect(gitignore).toContain('.agent/verification');
-  });
+    expect(gitignore).toContain('.agent/**');
+    expect(gitignore).toContain('!.agent/.gitkeep');
+  }, 180_000);
 });

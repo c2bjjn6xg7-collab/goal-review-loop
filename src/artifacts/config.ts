@@ -7,6 +7,7 @@ import yaml from 'js-yaml';
 import { Ajv } from 'ajv';
 import path from 'path';
 import type { ReviewLoopConfig, ProviderNetworkConfig, ProviderConfig, FeedbackRole, FeedbackType } from '../types.js';
+import { buildClaudeCommand, buildOpenCodeCommand } from '../providers/platform-commands.js';
 
 
 /**
@@ -201,22 +202,12 @@ export const DEFAULT_CONFIG: ReviewLoopConfig = {
   version: 1,
   agents: {
     planner: {
-      command: [
-        'sh', '-c',
-        'P=$(cat "$1")\nheartbeat_interval="${REVIEW_LOOP_PLANNER_HEARTBEAT_SECONDS:-30}"\n(\n  while :; do\n    sleep "$heartbeat_interval"\n    printf \'[review-loop heartbeat] planner still running (%ss idle heartbeat)\\n\' "$heartbeat_interval" >&2\n  done\n) &\nheartbeat_pid=$!\ntrap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM\n~/.opencode/bin/opencode run --model ownplan/deepseekv4pro --dangerously-skip-permissions --no-replay -- "$P"\nstatus=$?\nkill "$heartbeat_pid" 2>/dev/null || true\nwait "$heartbeat_pid" 2>/dev/null || true\nexit "$status"',
-        'opencode-planner',
-        '{prompt_file}',
-      ],
+      command: buildOpenCodeCommand('planner', 'ownplan/deepseekv4pro'),
       timeout_seconds: 3600,
       provider: 'opencode',
     },
     developer: {
-      command: [
-        'sh', '-c',
-        'P=$(cat "$1")\nheartbeat_interval="${REVIEW_LOOP_DEVELOPER_HEARTBEAT_SECONDS:-30}"\n(\n  while :; do\n    sleep "$heartbeat_interval"\n    printf \'[review-loop heartbeat] developer still running (%ss idle heartbeat)\\n\' "$heartbeat_interval" >&2\n  done\n) &\nheartbeat_pid=$!\ntrap \'kill "$heartbeat_pid" 2>/dev/null || true\' EXIT INT TERM\nenv -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \\\n  claude -p --permission-mode bypassPermissions --max-turns 160 -- "$P"\nstatus=$?\nkill "$heartbeat_pid" 2>/dev/null || true\nwait "$heartbeat_pid" 2>/dev/null || true\nexit "$status"',
-        'claude-developer',
-        '{prompt_file}',
-      ],
+      command: buildClaudeCommand('developer'),
       timeout_seconds: 3600,
     },
     auditor: {

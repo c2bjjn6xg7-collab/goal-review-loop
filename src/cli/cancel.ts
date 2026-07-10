@@ -4,7 +4,7 @@
  *
  * Cancel works by:
  * 1. Writing `.agent/cancel-request.json`
- * 2. Sending SIGTERM to the orchestrator PID
+ * 2. Sending SIGTERM on POSIX; Windows observes the durable request by polling
  * 3. Waiting up to cancel_grace_seconds for the process to exit
  */
 
@@ -15,6 +15,7 @@ import { StateStore } from '../orchestrator/state-store.js';
 import { LockManager } from '../runtime/lock-manager.js';
 import { atomicWriteJSON } from '../runtime/atomic-file.js';
 import { loadConfigWithDefaults } from '../artifacts/config.js';
+import { supportsGracefulSigterm } from '../runtime/platform-signals.js';
 import type { CancelRequest } from '../types.js';
 
 export function createCancelCommand(): Command {
@@ -101,11 +102,17 @@ export async function executeCancel(params: {
   await atomicWriteJSON(cancelPath, cancelRequest);
   console.log(`Cancel request written for run ${state.run_id}`);
 
-  // Send SIGTERM to the orchestrator process
+  // POSIX uses catchable SIGTERM for immediate wake-up. On Windows SIGTERM
+  // forcibly terminates the process, so the orchestrator's cancel watcher
+  // observes cancel-request.json instead.
   if (lock) {
     try {
-      process.kill(lock.pid, 'SIGTERM');
-      console.log(`SIGTERM sent to process ${lock.pid}`);
+      if (supportsGracefulSigterm()) {
+        process.kill(lock.pid, 'SIGTERM');
+        console.log(`SIGTERM sent to process ${lock.pid}`);
+      } else {
+        console.log(`Windows cancellation request queued for process ${lock.pid}.`);
+      }
 
       // Load config for grace period
       const config = await loadConfigWithDefaults(projectRoot, params.config_path);
@@ -130,7 +137,7 @@ export async function executeCancel(params: {
       console.log(`Process ${lock.pid} did not exit within ${graceSeconds}s grace period.`);
       console.log('The cancel request file is still in place — the orchestrator will check it on next iteration.');
     } catch (err) {
-      console.error(`Failed to send SIGTERM: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(`Failed to complete cancellation request: ${err instanceof Error ? err.message : String(err)}`);
       console.log('The cancel request file is still in place — the orchestrator will check it on next iteration.');
     }
   }

@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 function createTestRepo(suffix: string): string {
   const repoDir = join(tmpdir(), `commit-mgr-test-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   writeFileSync(join(repoDir, 'README.md'), '# Test\n');
@@ -222,7 +222,7 @@ describe('createCommit', () => {
     expect(exists).toBe(true);
   });
 
-  it('returns failure when git commit fails', async () => {
+  it.skipIf(process.platform === 'win32')('returns failure when git commit fails', async () => {
     const repoDir = createTestRepo('cc-fail');
     cleanupDirs.push(repoDir);
 
@@ -357,7 +357,7 @@ describe('isIntegrationVersionedArtifact', () => {
 function createTestRepoWithAgentIgnore(suffix: string): string {
   const repoDir = join(tmpdir(), `commit-mgr-force-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   writeFileSync(join(repoDir, '.gitignore'), '.agent/**\nnode_modules/**\ndist/**\n', 'utf8');

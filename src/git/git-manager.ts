@@ -106,9 +106,23 @@ export async function preflight(projectRoot: string): Promise<PreflightResult> {
     return error('git_root', 'Not a git repository');
   }
 
-  const gitRoot = await fs.realpath(gitRootResult.stdout);
-  if (gitRoot !== realProjectRoot) {
-    return error('git_root_mismatch', `Git root (${gitRoot}) does not match project root (${realProjectRoot})`);
+  // AUTHORITATIVE root check: `git rev-parse --show-prefix` is empty ONLY when
+  // the cwd is the repository root. This is Git's own answer to "is this the
+  // repo root?", and — critically — it is independent of path aliasing: short
+  // (8.3) vs long names, slash direction, and drive case all collapse to the
+  // same prefix result. A genuine subdirectory yields a non-empty prefix and is
+  // rejected here, so the security boundary is not weakened.
+  //
+  // We deliberately do NOT follow this with a strict physical-identity
+  // (realpath string) compare. On Windows, fs.realpath does not expand 8.3
+  // short names to long names, so realpath(projectRoot) and realpath(gitRoot)
+  // can return different alias strings for the SAME directory — a strict
+  // compare would false-reject a valid root (the original 016 failure).
+  // show-prefix is the verifiable, alias-independent authority.
+  const prefixResult = await runGit(['rev-parse', '--show-prefix'], projectRoot);
+  if (prefixResult.exit_code !== 0 || prefixResult.stdout.length > 0) {
+    const gitRoot = gitRootResult.stdout;
+    return error('git_root_mismatch', `Git root (${gitRoot}) does not match project root (${projectRoot})`);
   }
 
   const headResult = await runGit(['rev-parse', '--verify', 'HEAD'], projectRoot);

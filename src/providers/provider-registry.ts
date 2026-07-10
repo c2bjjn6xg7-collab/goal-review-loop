@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import crossSpawn from 'cross-spawn';
 import type { ProviderProfile, ProviderConfig, ReviewLoopConfig } from '../types.js';
 import { BUILTIN_PROVIDERS } from './builtin-providers.js';
 
@@ -44,12 +44,21 @@ export function createProviderRegistry(config?: ReviewLoopConfig): ProviderRegis
       }
       const start = Date.now();
       try {
-        const output = execFileSync(
+        const result = crossSpawn.sync(
           provider.health_check[0],
           provider.health_check.slice(1),
           { encoding: 'utf8', timeout: 10_000, stdio: ['pipe', 'pipe', 'pipe'] },
         );
-        return { available: true, output: output.trim(), duration_ms: Date.now() - start };
+        if (result.error) throw result.error;
+        if (result.status !== 0) {
+          const detail = String(result.stderr ?? '').trim();
+          throw new Error(detail || `Health check exited with code ${result.status}`);
+        }
+        return {
+          available: true,
+          output: String(result.stdout ?? '').trim(),
+          duration_ms: Date.now() - start,
+        };
       } catch (err) {
         return {
           available: false,

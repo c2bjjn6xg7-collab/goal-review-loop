@@ -209,8 +209,8 @@ describe('Phase 10 risk_note audit visibility', () => {
       registry,
     });
 
-    expect(registered.some((p) => p.endsWith('.agent/feedback-notes.md'))).toBe(true);
-    expect(registered.some((p) => p.endsWith('.agent/followups.md'))).toBe(false);
+    expect(registered.some((p) => p.endsWith(path.join('.agent', 'feedback-notes.md')))).toBe(true);
+    expect(registered.some((p) => p.endsWith(path.join('.agent', 'followups.md')))).toBe(false);
   });
 });
 

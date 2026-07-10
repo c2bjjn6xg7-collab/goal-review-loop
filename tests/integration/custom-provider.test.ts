@@ -14,7 +14,7 @@ function createCustomProviderRepo(suffix: string): string {
   const repoDir = join(tmpdir(), `review-loop-p6-provider-${suffix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
 
-  execSync('git init', { cwd: repoDir });
+  execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
 
@@ -29,46 +29,43 @@ function createCustomProviderRepo(suffix: string): string {
   mkdirSync(join(repoDir, 'tests'), { recursive: true });
   writeFileSync(join(repoDir, 'tests', 'index.test.ts'), 'test("hello", () => {});\n');
 
-  // Create per-role wrapper scripts that set REVIEW_LOOP_ROLE
-  const scriptsDir = join(repoDir, '.test-scripts');
-  mkdirSync(scriptsDir, { recursive: true });
   const fakeAgentPath = resolve(join(process.cwd(), 'tests', 'fixtures', 'fake-agent.mjs'));
 
-  for (const [role, behavior] of [['planner', 'success'], ['developer', 'success'], ['auditor', 'audit-pass'], ['final-auditor', 'audit-pass']]) {
-    const script = `#!/bin/sh\nREVIEW_LOOP_ROLE=${role} REVIEW_LOOP_BEHAVIOR=${behavior} exec node "${fakeAgentPath}" --role ${role} --run-id "$1" --iteration "$2" --project-root "$3" --prompt-file "$4" --behavior ${behavior}\n`;
-    writeFileSync(join(scriptsDir, `${role}.sh`), script, { mode: 0o755 });
-  }
-
-  // Config: custom provider per role, each using a wrapper script
-  const plannerScript = join(scriptsDir, 'planner.sh');
-  const developerScript = join(scriptsDir, 'developer.sh');
-  const auditorScript = join(scriptsDir, 'auditor.sh');
-  const finalAuditorScript = join(scriptsDir, 'final-auditor.sh');
+  const providerCommand = (role: string, behavior: string): string[] => [
+    process.execPath,
+    fakeAgentPath,
+    '--role', role,
+    '--run-id', '{run_id}',
+    '--iteration', '{iteration}',
+    '--project-root', '{project_root}',
+    '--prompt-file', '{prompt_file}',
+    '--behavior', behavior,
+  ];
 
   const config = {
     version: 1,
     providers: {
       'custom-planner': {
         enabled: true,
-        command_template: ['sh', plannerScript, '{run_id}', '{iteration}', '{project_root}', '{prompt_file}'],
+        command_template: providerCommand('planner', 'success'),
         prompt_transport: 'prompt_file',
         transcript_mode: 'stdout_stderr',
       },
       'custom-developer': {
         enabled: true,
-        command_template: ['sh', developerScript, '{run_id}', '{iteration}', '{project_root}', '{prompt_file}'],
+        command_template: providerCommand('developer', 'success'),
         prompt_transport: 'prompt_file',
         transcript_mode: 'stdout_stderr',
       },
       'custom-auditor': {
         enabled: true,
-        command_template: ['sh', auditorScript, '{run_id}', '{iteration}', '{project_root}', '{prompt_file}'],
+        command_template: providerCommand('auditor', 'audit-pass'),
         prompt_transport: 'prompt_file',
         transcript_mode: 'stdout_stderr',
       },
       'custom-final-auditor': {
         enabled: true,
-        command_template: ['sh', finalAuditorScript, '{run_id}', '{iteration}', '{project_root}', '{prompt_file}'],
+        command_template: providerCommand('final-auditor', 'audit-pass'),
         prompt_transport: 'prompt_file',
         transcript_mode: 'stdout_stderr',
       },
