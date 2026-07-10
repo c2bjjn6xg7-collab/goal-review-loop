@@ -112,6 +112,12 @@ describe('platform-aware provider commands', () => {
         });
 
         expect(result.error).toBeFalsy();
+        // DIAGNOSTIC: surface wrapper output on failure (remove once green).
+        if (result.status !== 0) {
+          console.error('PROBE opencode status:', result.status);
+          console.error('PROBE opencode stdout:', String(result.stdout).slice(0, 500));
+          console.error('PROBE opencode stderr:', String(result.stderr).slice(0, 500));
+        }
         expect(result.status).toBe(0);
         const probe = JSON.parse(String(result.stdout)) as { argv: string[]; stdin: string };
         expect(probe.argv).toContain('model/name');
@@ -163,6 +169,12 @@ describe('platform-aware provider commands', () => {
         });
 
         expect(result.error).toBeFalsy();
+        // DIAGNOSTIC: surface wrapper output on failure (remove once green).
+        if (result.status !== 0) {
+          console.error('PROBE claude status:', result.status);
+          console.error('PROBE claude stdout:', String(result.stdout).slice(0, 500));
+          console.error('PROBE claude stderr:', String(result.stderr).slice(0, 500));
+        }
         expect(result.status).toBe(0);
         const probe = JSON.parse(String(result.stdout)) as {
           argv: string[];
