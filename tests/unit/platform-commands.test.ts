@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import crossSpawn from 'cross-spawn';
 import fs from 'fs-extra';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -27,9 +28,11 @@ describe('platform-aware provider commands', () => {
     const openCode = buildOpenCodeCommand('planner', 'model/name', 'win32');
     const claude = buildClaudeCommand('developer', 'win32');
 
-    // argv[0] is the Node executable; argv[1] points at the compiled wrapper.
+    // argv[0] is the Node executable; argv[1] points at the compiled wrapper,
+    // which MUST exist on disk (otherwise the provider cannot be launched).
     expect(openCode[0]).toBe(process.execPath);
     expect(openCode[1]).toContain('windows-provider-wrapper');
+    expect(existsSync(openCode[1])).toBe(true);
     expect(openCode).toContain('{prompt_file}');
     expect(openCode).toContain('--provider');
     expect(openCode).toContain('opencode');
@@ -58,6 +61,8 @@ describe('platform-aware provider commands', () => {
     expect(windowsClaude).not.toContain('--max-turns');
     expect(windowsClaude).not.toContain('--clear-proxy');
     expect(windowsClaude.some((p) => p.includes('powershell'))).toBe(false);
+    // The wrapper path must resolve to a real file.
+    expect(existsSync(windowsClaude[1])).toBe(true);
 
     expect(buildBuiltinClaudeCommand('darwin')).toEqual([
       'sh', '-lc',

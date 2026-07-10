@@ -207,11 +207,15 @@ describe('resolveCommandForAgent', () => {
 
   it.skipIf(process.platform !== 'win32')('uses a Windows-native Claude provider command', () => {
     const result = resolveCommandForAgent(['fallback'], 'claude');
-    expect(result[0]).toBe('powershell.exe');
+    // Windows uses the Node provider wrapper (not PowerShell), launched via the
+    // Node executable with the built-in Claude profile (acceptEdits, no turns).
+    expect(result[0]).toBe(process.execPath);
+    expect(result[1]).toContain('windows-provider-wrapper');
     expect(result).not.toContain('sh');
+    expect(result).toContain('--provider');
+    expect(result).toContain('claude');
     expect(result.join('\n')).toContain('--permission-mode acceptEdits');
     expect(result.join('\n')).not.toContain('--permission-mode bypassPermissions');
-    expect(result.join('\n')).not.toContain('SetEnvironmentVariable');
     expect(result.join('\n')).not.toContain('--max-turns');
   });
 

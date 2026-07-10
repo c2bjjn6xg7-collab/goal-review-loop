@@ -9,20 +9,34 @@
  */
 
 import path from 'path';
+import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 
 export type AgentRole = 'planner' | 'developer' | 'auditor' | 'final_auditor';
 export type ClaudePermissionMode = 'acceptEdits' | 'bypassPermissions';
 
 /**
- * Absolute path to the compiled Windows provider wrapper, resolved relative to
- * this module so it is stable whether run from src (ts-node/tsx) or dist.
+ * Absolute path to the compiled Windows provider wrapper.
+ *
+ * In production this module runs from dist/providers/ (compiled), and the
+ * wrapper sits beside it. Under Vitest the module runs from src/providers/
+ * (TypeScript source), where only the .ts file exists — the runnable .js is
+ * produced by `npm run build` into dist/providers/. So: prefer the sibling
+ * .js (production), and fall back to the dist copy relative to the repo root
+ * (test environment).
  */
 function windowsWrapperPath(): string {
   const here = typeof __dirname !== 'undefined'
     ? __dirname
     : path.dirname(fileURLToPath(import.meta.url));
-  return path.join(here, 'windows-provider-wrapper.js');
+  const sibling = path.join(here, 'windows-provider-wrapper.js');
+  if (existsSync(sibling)) {
+    return sibling;
+  }
+  // Test environment: this module is at <root>/src/providers, wrapper is at
+  // <root>/dist/providers/windows-provider-wrapper.js.
+  const repoRoot = path.resolve(here, '..', '..');
+  return path.join(repoRoot, 'dist', 'providers', 'windows-provider-wrapper.js');
 }
 
 /**
