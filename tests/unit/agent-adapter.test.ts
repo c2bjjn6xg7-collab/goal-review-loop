@@ -70,26 +70,26 @@ describe('agent-adapter', () => {
   });
 
   describe('buildAgentLogPaths (F-8D-T-001)', () => {
-    const debugDir = '/tmp/dbg';
+    const debugDir = join(tmpdir(), 'dbg');
     const runId = '20260617-abc';
 
     it('omits attempt suffix when attempt is undefined (back-compat)', () => {
       const r = buildAgentLogPaths(debugDir, runId, 'developer', 3);
-      expect(r.stdoutPath).toBe('/tmp/dbg/20260617-abc-developer-iter3.stdout.log');
-      expect(r.stderrPath).toBe('/tmp/dbg/20260617-abc-developer-iter3.stderr.log');
+      expect(r.stdoutPath).toBe(join(debugDir, '20260617-abc-developer-iter3.stdout.log'));
+      expect(r.stderrPath).toBe(join(debugDir, '20260617-abc-developer-iter3.stderr.log'));
     });
 
     it('omits attempt suffix when attempt === 1 (back-compat)', () => {
       const r = buildAgentLogPaths(debugDir, runId, 'developer', 3, 1);
-      expect(r.stdoutPath).toBe('/tmp/dbg/20260617-abc-developer-iter3.stdout.log');
+      expect(r.stdoutPath).toBe(join(debugDir, '20260617-abc-developer-iter3.stdout.log'));
     });
 
     it('appends -attempt${N} when attempt >= 2', () => {
       const r2 = buildAgentLogPaths(debugDir, runId, 'developer', 3, 2);
       const r5 = buildAgentLogPaths(debugDir, runId, 'developer', 3, 5);
-      expect(r2.stdoutPath).toBe('/tmp/dbg/20260617-abc-developer-iter3-attempt2.stdout.log');
-      expect(r2.stderrPath).toBe('/tmp/dbg/20260617-abc-developer-iter3-attempt2.stderr.log');
-      expect(r5.stdoutPath).toBe('/tmp/dbg/20260617-abc-developer-iter3-attempt5.stdout.log');
+      expect(r2.stdoutPath).toBe(join(debugDir, '20260617-abc-developer-iter3-attempt2.stdout.log'));
+      expect(r2.stderrPath).toBe(join(debugDir, '20260617-abc-developer-iter3-attempt2.stderr.log'));
+      expect(r5.stdoutPath).toBe(join(debugDir, '20260617-abc-developer-iter3-attempt5.stdout.log'));
     });
 
     it('produces distinct paths across attempts within the same iteration', () => {
@@ -102,7 +102,7 @@ describe('agent-adapter', () => {
 
     it('applies the same rule to other roles (auditor)', () => {
       const r = buildAgentLogPaths(debugDir, runId, 'auditor', 1, 2);
-      expect(r.stdoutPath).toBe('/tmp/dbg/20260617-abc-auditor-iter1-attempt2.stdout.log');
+      expect(r.stdoutPath).toBe(join(debugDir, '20260617-abc-auditor-iter1-attempt2.stdout.log'));
     });
   });
 });

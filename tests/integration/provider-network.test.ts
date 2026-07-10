@@ -12,6 +12,7 @@ import os from 'os';
 import { runProcess } from '../../src/runtime/process-runner.js';
 import { resolveProviderEnv } from '../../src/providers/network-env.js';
 import type { ProviderProfile, ProviderNetworkConfig } from '../../src/types.js';
+import { nodeEval } from '../helpers/node-command.js';
 
 function makeProfile(network?: ProviderNetworkConfig): ProviderProfile {
   return {
@@ -51,7 +52,7 @@ describe('Provider network env isolation', () => {
     const codexStdout = path.join(tmpDir, 'codex-stdout.log');
     const codexStderr = path.join(tmpDir, 'codex-stderr.log');
     const codexResult = await runProcess({
-      argv: ['bash', '-c', 'echo "HTTP_PROXY=$HTTP_PROXY"; echo "HTTPS_PROXY=$HTTPS_PROXY"; echo "NO_PROXY=$NO_PROXY"'],
+      argv: nodeEval("for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY']) console.log(key + '=' + (process.env[key] ?? ''))"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: codexStdout,
@@ -64,7 +65,7 @@ describe('Provider network env isolation', () => {
     const claudeStdout = path.join(tmpDir, 'claude-stdout.log');
     const claudeStderr = path.join(tmpDir, 'claude-stderr.log');
     const claudeResult = await runProcess({
-      argv: ['bash', '-c', 'echo "HTTP_PROXY=$HTTP_PROXY"; echo "HTTPS_PROXY=$HTTPS_PROXY"; echo "NO_PROXY=$NO_PROXY"'],
+      argv: nodeEval("for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY']) console.log(key + '=' + (process.env[key] ?? ''))"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: claudeStdout,
@@ -109,7 +110,7 @@ describe('Provider network env isolation', () => {
     const stderrPath = path.join(tmpDir, 'inherit-stderr.log');
 
     const result = await runProcess({
-      argv: ['bash', '-c', 'echo "HTTP_PROXY=$HTTP_PROXY"'],
+      argv: nodeEval("console.log('HTTP_PROXY=' + (process.env.HTTP_PROXY ?? ''))"),
       cwd: tmpDir,
       timeout_ms: 5000,
       stdout_path: stdoutPath,

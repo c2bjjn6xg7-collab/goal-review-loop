@@ -1,15 +1,11 @@
 import type { ProviderProfile } from '../types.js';
+import { buildBuiltinClaudeCommand } from './platform-commands.js';
 
 export const BUILTIN_PROVIDERS: ReadonlyArray<ProviderProfile> = [
   {
     provider_id: 'claude',
     display_name: 'Claude Code CLI',
-    command_template: [
-      'sh', '-lc',
-      'exec claude -p --permission-mode acceptEdits < "$1"',
-      'claude-developer',
-      '{prompt_file}',
-    ],
+    command_template: buildBuiltinClaudeCommand(),
     prompt_transport: 'prompt_file',
     health_check: ['claude', '--version'],
     permission_modes: ['acceptEdits', 'bypassPermissions', 'dangerously-skip-permissions'],

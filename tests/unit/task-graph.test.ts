@@ -107,6 +107,59 @@ describe('task-graph validation', () => {
     expect(r.errors.some((e) => e.includes('Duplicate'))).toBe(true);
   });
 
+  it('rejects case-only duplicate task ids on Windows', () => {
+    const g = makeGraph([
+      makeTask({ id: 'Task-1' }),
+      makeTask({ id: 'task-1', allowed_changes: ['src/b/**'] }),
+    ]);
+    const r = validateTaskGraph(g, 'win32');
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes('Duplicate'))).toBe(true);
+  });
+
+  it.each(['CON', 'nul', 'COM1.txt', 'safe.'])('rejects Windows-unsafe task id %s', (id) => {
+    const r = validateTaskGraph(makeGraph(makeTask({ id })), 'win32');
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes('Windows directory name'))).toBe(true);
+  });
+
+  it('accepts a normal task id on Windows', () => {
+    expect(validateTaskGraph(makeGraph(makeTask({ id: 'task-01' })), 'win32').valid).toBe(true);
+  });
+
+  it('does not silently resolve dependency ids with different casing on Windows', () => {
+    const g = makeGraph([
+      makeTask({ id: 'Task-1' }),
+      makeTask({ id: 'Task-2', depends_on: ['task-1'], allowed_changes: ['src/b/**'] }),
+    ]);
+    const r = validateTaskGraph(g, 'win32');
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes('unknown task'))).toBe(true);
+  });
+
+  it('rejects a Windows-reserved verification command id', () => {
+    const task = makeTask({
+      verification_commands: [
+        { id: 'NUL', command: ['npm', 'test'], cwd: '.', required: true, timeout_seconds: 60 },
+      ],
+    });
+    const r = validateTaskGraph(makeGraph(task), 'win32');
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes('safe Windows file name'))).toBe(true);
+  });
+
+  it('rejects case-only duplicate verification command ids on Windows', () => {
+    const task = makeTask({
+      verification_commands: [
+        { id: 'Check', command: ['npm', 'test'], cwd: '.', required: true, timeout_seconds: 60 },
+        { id: 'check', command: ['npm', 'test'], cwd: '.', required: true, timeout_seconds: 60 },
+      ],
+    });
+    const r = validateTaskGraph(makeGraph(task), 'win32');
+    expect(r.valid).toBe(false);
+    expect(r.errors.some((e) => e.includes('duplicate verification command id'))).toBe(true);
+  });
+
   it('rejects self-dependency', () => {
     const g = makeGraph([
       makeTask({ id: 't1', depends_on: ['t1'] }),

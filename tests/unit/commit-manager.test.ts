@@ -222,7 +222,7 @@ describe('createCommit', () => {
     expect(exists).toBe(true);
   });
 
-  it('returns failure when git commit fails', async () => {
+  it.skipIf(process.platform === 'win32')('returns failure when git commit fails', async () => {
     const repoDir = createTestRepo('cc-fail');
     cleanupDirs.push(repoDir);
 

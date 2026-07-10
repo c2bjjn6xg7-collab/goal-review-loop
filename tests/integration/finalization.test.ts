@@ -751,7 +751,7 @@ describe('Phase 5 Finalization integration', () => {
 
   // ─── Scenario 21: Real commit failure → BLOCKED, lock released ──
   // F-504R1: Simulate a real git commit failure by making .git/objects read-only.
-  it('21: real commit failure results in BLOCKED with lock released', async () => {
+  it.skipIf(process.platform === 'win32')('21: real commit failure results in BLOCKED with lock released', async () => {
     repoDir = createTestRepo('s21');
 
     // Add .agent to .gitignore so pre-writing files doesn't dirty the worktree

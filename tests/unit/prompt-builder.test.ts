@@ -385,7 +385,7 @@ describe('prompt-builder', () => {
       expect(result.error).toBeNull();
     });
 
-    it('returns structured failure result when deletion fails', async () => {
+    it.skipIf(process.platform === 'win32')('returns structured failure result when deletion fails', async () => {
       // Create a prompt file in a read-only directory so unlink fails
       const debugDir = join(testDir, '.agent', 'debug');
       const promptPath = await writePromptFile(

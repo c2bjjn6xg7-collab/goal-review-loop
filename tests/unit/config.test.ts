@@ -12,6 +12,7 @@ import {
   DEFAULT_CONFIG,
   ConfigError,
 } from '../../src/artifacts/config.js';
+import { buildClaudeCommand } from '../../src/providers/platform-commands.js';
 
 describe('Configuration', () => {
   let tmpDir: string;
@@ -196,13 +197,10 @@ runtime:
       // Must use {prompt_file} (stdin-based), not {prompt} (positional argv)
       expect(devCmd).toContain('{prompt_file}');
       expect(devCmd).not.toContain('{prompt}');
-      // Must use sh wrapper
-      expect(devCmd[0]).toBe('sh');
-      expect(devCmd[1]).toBe('-c');
-      // The shell command must invoke claude
-      expect(String(devCmd[2])).toContain('claude');
-      expect(devCmd[2]).toContain('--permission-mode');
-      expect(devCmd[2]).toContain('"$P"');
+      expect(devCmd).toEqual(buildClaudeCommand('developer'));
+      // The platform wrapper must invoke claude with the required permission mode.
+      expect(devCmd.join('\n')).toContain('claude');
+      expect(devCmd.join('\n')).toContain('--permission-mode');
     });
 
     it('planner and auditor commands should use {prompt_file}', () => {
@@ -222,9 +220,7 @@ runtime:
       // Developer command must use prompt_file
       expect(config.agents.developer.command).toContain('{prompt_file}');
       expect(config.agents.developer.command).not.toContain('{prompt}');
-      // Must be a valid sh wrapper
-      expect(config.agents.developer.command[0]).toBe('sh');
-      expect(config.agents.developer.command[1]).toBe('-c');
+      expect(config.agents.developer.command).toEqual(buildClaudeCommand('developer'));
     });
 
     it('custom model command can still be loaded', async () => {

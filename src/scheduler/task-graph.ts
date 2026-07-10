@@ -8,11 +8,15 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Ajv } from 'ajv';
 import type { TaskGraph, TaskNode, TaskStatus } from '../types.js';
+import { isWindowsUnsafeFileName, windowsFileNameKey } from '../runtime/windows-file-name.js';
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 
 const SAFE_ID_PATTERN = '^[A-Za-z0-9][A-Za-z0-9._-]*$';
 const SAFE_GLOB_PATTERN = '^[^\\\\]+$';
+export function isWindowsUnsafeTaskIdentifier(id: string): boolean {
+  return isWindowsUnsafeFileName(id);
+}
 
 const taskVerificationCommandSchema = {
   type: 'object',
@@ -82,7 +86,10 @@ export interface TaskGraphValidationResult {
  * - allowed_changes is non-empty for each task.
  * - Safe paths (no absolute, no ..).
  */
-export function validateTaskGraph(input: unknown): TaskGraphValidationResult {
+export function validateTaskGraph(
+  input: unknown,
+  platform: NodeJS.Platform = process.platform,
+): TaskGraphValidationResult {
   const errors: string[] = [];
 
   if (!validateTaskGraphSchema(input)) {
@@ -96,15 +103,22 @@ export function validateTaskGraph(input: unknown): TaskGraphValidationResult {
 
   // Duplicate IDs
   const seenIds = new Set<string>();
+  const seenComparisonIds = new Set<string>();
   for (const task of graph.tasks) {
-    if (seenIds.has(task.id)) {
+    const comparisonId = platform === 'win32' ? windowsFileNameKey(task.id) : task.id;
+    if (seenComparisonIds.has(comparisonId)) {
       errors.push(`Duplicate task id: ${task.id}`);
     }
+    seenComparisonIds.add(comparisonId);
     seenIds.add(task.id);
+    if (platform === 'win32' && isWindowsUnsafeTaskIdentifier(task.id)) {
+      errors.push(`Task id "${task.id}" is not a safe Windows directory name`);
+    }
   }
 
   // depends_on references + safe paths
   for (const task of graph.tasks) {
+    const seenVerificationIds = new Set<string>();
     for (const dep of task.depends_on) {
       if (!seenIds.has(dep)) {
         errors.push(`Task "${task.id}" depends on unknown task "${dep}"`);
@@ -124,6 +138,16 @@ export function validateTaskGraph(input: unknown): TaskGraphValidationResult {
       }
     }
     for (const vc of task.verification_commands) {
+      const verificationId = platform === 'win32' ? windowsFileNameKey(vc.id) : vc.id;
+      if (seenVerificationIds.has(verificationId)) {
+        errors.push(`Task "${task.id}" has duplicate verification command id: ${vc.id}`);
+      }
+      seenVerificationIds.add(verificationId);
+      if (platform === 'win32' && isWindowsUnsafeTaskIdentifier(vc.id)) {
+        errors.push(
+          `Task "${task.id}" verification command id "${vc.id}" is not a safe Windows file name`,
+        );
+      }
       if (vc.cwd.startsWith('/') || vc.cwd.includes('..')) {
         errors.push(`Task "${task.id}" verification command "${vc.id}" has unsafe cwd: "${vc.cwd}"`);
       }

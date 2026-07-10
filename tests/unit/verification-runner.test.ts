@@ -2,9 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs-extra';
 import path from 'path';
 import os from 'os';
-import { runVerification, VerificationRunnerError } from '../../src/verification/verification-runner.js';
+import {
+  runVerification,
+  toPortableVerificationPath,
+  VerificationRunnerError,
+} from '../../src/verification/verification-runner.js';
 import { ProcessStatus } from '../../src/types.js';
 import type { VerificationCommand } from '../../src/types.js';
+import { nodeExit, nodeSleep, nodeStdout } from '../helpers/node-command.js';
 
 describe('VerificationRunner', () => {
   let tmpDir: string;
@@ -21,11 +26,16 @@ describe('VerificationRunner', () => {
 
   const createCommand = (overrides: Partial<VerificationCommand> = {}): VerificationCommand => ({
     id: 'test-cmd',
-    argv: ['echo', 'hello'],
+    argv: nodeStdout('hello\n'),
     cwd: '.',
     required: true,
     timeout_seconds: 10,
     ...overrides,
+  });
+
+  it('normalizes Windows manifest paths to portable forward slashes', () => {
+    expect(toPortableVerificationPath('.agent\\verification\\iteration-01\\test.stdout.log'))
+      .toBe('.agent/verification/iteration-01/test.stdout.log');
   });
 
   it('should run a successful command', async () => {
@@ -48,7 +58,7 @@ describe('VerificationRunner', () => {
       projectRoot,
       runId: 'run-1',
       iteration: 1,
-      commands: [createCommand({ argv: ['bash', '-c', 'exit 1'] })],
+      commands: [createCommand({ argv: nodeExit(1) })],
     });
 
     expect(result.passed).toBe(false);
@@ -68,7 +78,7 @@ describe('VerificationRunner', () => {
         createCommand({
           id: 'optional-cmd',
           required: false,
-          argv: ['bash', '-c', 'exit 1'],
+          argv: nodeExit(1),
         }),
       ],
     });
@@ -86,7 +96,7 @@ describe('VerificationRunner', () => {
       runId: 'run-1',
       iteration: 1,
       commands: [createCommand({
-        argv: ['bash', '-c', 'sleep 30'],
+        argv: nodeSleep(),
         timeout_seconds: 1,
       })],
     });
@@ -105,8 +115,8 @@ describe('VerificationRunner', () => {
       runId: 'run-1',
       iteration: 1,
       commands: [
-        createCommand({ argv: ['bash', '-c', 'sleep 30'] }),
-        createCommand({ id: 'cmd-2', argv: ['echo', 'hello'] }),
+        createCommand({ argv: nodeSleep() }),
+        createCommand({ id: 'cmd-2', argv: nodeStdout('hello\n') }),
       ],
       signal: controller.signal,
     });
@@ -127,6 +137,36 @@ describe('VerificationRunner', () => {
       }),
     ).rejects.toThrow(VerificationRunnerError);
   });
+
+  it('should reject case-only duplicate command ids on Windows', async () => {
+    await expect(
+      runVerification({
+        projectRoot,
+        runId: 'run-1',
+        iteration: 1,
+        platform: 'win32',
+        commands: [
+          createCommand({ id: 'Check' }),
+          createCommand({ id: 'check' }),
+        ],
+      }),
+    ).rejects.toThrow(/Duplicate command id/);
+  });
+
+  it.each(['NUL', 'con', 'COM1.txt', 'safe.'])(
+    'should reject Windows-reserved command id %s',
+    async (id) => {
+      await expect(
+        runVerification({
+          projectRoot,
+          runId: 'run-1',
+          iteration: 1,
+          platform: 'win32',
+          commands: [createCommand({ id })],
+        }),
+      ).rejects.toThrow(/safe Windows file name/);
+    },
+  );
 
   it('should reject command id with path separators', async () => {
     await expect(
@@ -223,8 +263,8 @@ describe('VerificationRunner', () => {
       runId: 'run-1',
       iteration: 1,
       commands: [
-        createCommand({ id: 'cmd-1', argv: ['echo', 'first'] }),
-        createCommand({ id: 'cmd-2', argv: ['bash', '-c', 'exit 1'] }),
+        createCommand({ id: 'cmd-1', argv: nodeStdout('first\n') }),
+        createCommand({ id: 'cmd-2', argv: nodeExit(1) }),
       ],
     });
 
@@ -235,8 +275,8 @@ describe('VerificationRunner', () => {
       runId: 'run-1',
       iteration: 2,
       commands: [
-        createCommand({ id: 'cmd-1', argv: ['echo', 'first'] }),
-        createCommand({ id: 'cmd-2', argv: ['echo', 'second'] }),
+        createCommand({ id: 'cmd-1', argv: nodeStdout('first\n') }),
+        createCommand({ id: 'cmd-2', argv: nodeStdout('second\n') }),
       ],
     });
 
@@ -257,7 +297,7 @@ describe('VerificationRunner', () => {
       projectRoot,
       runId: 'run-1',
       iteration: 1,
-      commands: [createCommand({ id: 'eisdir-cmd', argv: ['echo', 'hello'] })],
+      commands: [createCommand({ id: 'eisdir-cmd', argv: nodeStdout('hello\n') })],
     });
 
     // Command must be failed in manifest

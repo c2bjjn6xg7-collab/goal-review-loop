@@ -4,6 +4,7 @@ import { runProcess } from '../runtime/process-runner.js';
 import { atomicWriteJSON } from '../runtime/atomic-file.js';
 import { validateVerificationManifest } from '../artifacts/json-schemas.js';
 import { ProcessStatus } from '../types.js';
+import { isWindowsUnsafeFileName, windowsFileNameKey } from '../runtime/windows-file-name.js';
 import type {
   VerificationCommand,
   VerificationManifest,
@@ -20,12 +21,17 @@ export class VerificationRunnerError extends Error {
 
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+/** Persist artifact paths with the platform-neutral forward-slash contract. */
+export function toPortableVerificationPath(filePath: string): string {
+  return filePath.replace(/\\/g, '/');
+}
+
 function isPathSafe(filePath: string, projectRoot: string): boolean {
   const resolved = path.resolve(projectRoot, filePath);
   return resolved.startsWith(projectRoot + path.sep) || resolved === projectRoot;
 }
 
-function validateCommandId(id: string): void {
+function validateCommandId(id: string, platform: NodeJS.Platform): void {
   if (!id || id.trim().length === 0) {
     throw new VerificationRunnerError('Command id must be non-empty');
   }
@@ -33,6 +39,9 @@ function validateCommandId(id: string): void {
     throw new VerificationRunnerError(
       `Command id "${id}" contains invalid characters. Must match ${SAFE_ID_PATTERN}`,
     );
+  }
+  if (platform === 'win32' && isWindowsUnsafeFileName(id)) {
+    throw new VerificationRunnerError(`Command id "${id}" is not a safe Windows file name`);
   }
 }
 
@@ -46,8 +55,12 @@ function validateLogPath(logPath: string, projectRoot: string, cmdId: string): v
   }
 }
 
-function validateCommand(cmd: VerificationCommand, projectRoot: string): void {
-  validateCommandId(cmd.id);
+function validateCommand(
+  cmd: VerificationCommand,
+  projectRoot: string,
+  platform: NodeJS.Platform,
+): void {
+  validateCommandId(cmd.id, platform);
 
   if (!cmd.argv || cmd.argv.length === 0) {
     throw new VerificationRunnerError(`Command ${cmd.id}: argv must be non-empty`);
@@ -72,6 +85,8 @@ export interface RunVerificationOptions {
   iteration: number;
   commands: VerificationCommand[];
   signal?: AbortSignal;
+  /** Testable platform override; production defaults to process.platform. */
+  platform?: NodeJS.Platform;
 }
 
 export interface RunVerificationResult {
@@ -82,14 +97,16 @@ export interface RunVerificationResult {
 
 export async function runVerification(options: RunVerificationOptions): Promise<RunVerificationResult> {
   const { projectRoot, runId, iteration, commands, signal } = options;
+  const platform = options.platform ?? process.platform;
 
   const seenIds = new Set<string>();
   for (const cmd of commands) {
-    if (seenIds.has(cmd.id)) {
+    const comparisonId = platform === 'win32' ? windowsFileNameKey(cmd.id) : cmd.id;
+    if (seenIds.has(comparisonId)) {
       throw new VerificationRunnerError(`Duplicate command id: ${cmd.id}`);
     }
-    seenIds.add(cmd.id);
-    validateCommand(cmd, projectRoot);
+    seenIds.add(comparisonId);
+    validateCommand(cmd, projectRoot, platform);
   }
 
   const logDir = path.join(
@@ -111,8 +128,12 @@ export async function runVerification(options: RunVerificationOptions): Promise<
     }
 
     if (cancelled) {
-      const relStdout = path.relative(projectRoot, path.join(logDir, `${cmd.id}.stdout.log`));
-      const relStderr = path.relative(projectRoot, path.join(logDir, `${cmd.id}.stderr.log`));
+      const relStdout = toPortableVerificationPath(
+        path.relative(projectRoot, path.join(logDir, `${cmd.id}.stdout.log`)),
+      );
+      const relStderr = toPortableVerificationPath(
+        path.relative(projectRoot, path.join(logDir, `${cmd.id}.stderr.log`)),
+      );
       results.push({
         id: cmd.id,
         argv: cmd.argv,
@@ -168,8 +189,8 @@ export async function runVerification(options: RunVerificationOptions): Promise<
       exit_code: processResult.exit_code,
       timed_out: processResult.timed_out,
       duration_ms: processResult.duration_ms,
-      stdout_path: path.relative(projectRoot, stdoutPath),
-      stderr_path: path.relative(projectRoot, stderrPath),
+      stdout_path: toPortableVerificationPath(path.relative(projectRoot, stdoutPath)),
+      stderr_path: toPortableVerificationPath(path.relative(projectRoot, stderrPath)),
       log_io_error: processResult.log_io_error,
     };
 
