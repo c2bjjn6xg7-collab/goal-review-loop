@@ -99,13 +99,39 @@ async function executeRetry(params: {
     }
   }
 
-  // Recover lock if needed
+  // Recover lock if needed.
+  //
+  // Like `resume`, we do NOT acquire the lock here - the orchestrator owns lock
+  // acquisition. Acquiring at the CLI layer would cause a spurious self-conflict
+  // when the orchestrator re-acquires the same lock (the process would see its
+  // own PID and bail out with "Another run is active"). Instead we only release
+  // a stale lock left behind by a crashed previous run, then let the orchestrator
+  // take a fresh lock.
   const lockManager = new LockManager(agentDir);
-  try {
-    await lockManager.acquireOrRecover(state.run_id, 86400);
-  } catch (err) {
-    console.error(`Lock recovery failed: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
+  const lock = await lockManager.readLock();
+  if (lock) {
+    let isAlive = false;
+    try {
+      process.kill(lock.pid, 0);
+      isAlive = true;
+    } catch {
+      isAlive = false;
+    }
+
+    if (isAlive && !params.recover_lock) {
+      console.error(`Run is locked by active process (PID ${lock.pid}). Use --recover-lock to override.`);
+      process.exit(1);
+    }
+
+    if (!isAlive || params.recover_lock) {
+      try {
+        await lockManager.release(lock.run_id);
+        console.log('Released stale lock.');
+      } catch {
+        console.error('Failed to release lock. Try removing .agent/run.lock manually.');
+        process.exit(1);
+      }
+    }
   }
 
   // Reset failed tasks to pending in task_graph_state
