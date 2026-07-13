@@ -34,7 +34,7 @@ import {
   resolveParallelExecution,
   ParallelExecutionConfigError,
 } from '../scheduler/parallel-execution.js';
-import type { ReviewLoopConfig, ReworkFinding, CancelRequest } from '../types.js';
+import type { ReviewLoopConfig, ReworkFinding, CancelRequest, TaskGraphState } from '../types.js';
 import { preflight, createTaskBranch, runGit } from '../git/git-manager.js';
 import { collectDiff, writeDiffArtifacts } from '../git/diff-collector.js';
 import { checkScope, writeScopeReport } from '../scope/scope-guard.js';
@@ -397,19 +397,26 @@ export async function runOrchestrator(params: {
         // sees pending (not failed) statuses.
         let effectiveTaskGraphState = tgState.task_graph_state;
         if (resume.is_retry && tgState.task_graph_state) {
-          const tgs = { ...tgState.task_graph_state };
-          if (tgs.task_statuses) {
-            for (const [taskId, status] of Object.entries(tgs.task_statuses)) {
-              if (status === 'failed' || status === 'blocked') {
-                tgs.task_statuses[taskId] = 'pending';
-              }
+          // Deep-copy the nested maps: a shallow spread ({ ...task_graph_state })
+          // would share the same task_statuses / task_attempts object references,
+          // so modifying tgs.task_statuses would also mutate the original and
+          // the subsequent attempt-reset loop would see 'pending' instead of
+          // 'failed', never zeroing task_attempts.
+          const originalStatuses = { ...tgState.task_graph_state.task_statuses };
+          const originalAttempts = { ...tgState.task_graph_state.task_attempts };
+          const tgs: TaskGraphState = {
+            current_task_index: tgState.task_graph_state.current_task_index,
+            task_statuses: { ...originalStatuses },
+            task_attempts: { ...originalAttempts },
+          };
+          for (const [taskId, status] of Object.entries(originalStatuses)) {
+            if (status === 'failed' || status === 'blocked') {
+              tgs.task_statuses[taskId] = 'pending';
             }
           }
-          if (tgs.task_attempts) {
-            for (const [taskId, status] of Object.entries(tgState.task_graph_state.task_statuses ?? {})) {
-              if (status === 'failed' || status === 'blocked') {
-                tgs.task_attempts[taskId] = 0;
-              }
+          for (const [taskId, status] of Object.entries(originalStatuses)) {
+            if (status === 'failed' || status === 'blocked') {
+              tgs.task_attempts[taskId] = 0;
             }
           }
           await stateStore.update(() => ({

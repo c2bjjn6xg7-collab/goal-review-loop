@@ -243,16 +243,18 @@ describe('executeRetry lock handling and state-reset safety', () => {
     await assertStateUntouched(env.statePath);
   });
 
-  it('dead-process lock: releases stale lock and proceeds, state untouched by CLI', async () => {
+  it('dead-process lock: left for orchestrator to recover, state untouched by CLI', async () => {
     env = await createTestEnv({ withTaskGraph: true });
     writeLock(env.lockPath, { pid: 999999 }); // reliably dead
     mockProcessExitNoop();
 
     await executeRetry({ project_root: env.projectRoot, force: true });
 
-    // Stale lock was removed.
-    expect(await fs.pathExists(env.lockPath)).toBe(false);
-    // Orchestrator was called.
+    // Dead lock is NOT released by the CLI - it is left for the orchestrator's
+    // acquireOrRecover to handle atomically (read -> dead PID -> unlink ->
+    // re-acquire). This eliminates the release->reacquire race window.
+    expect(await fs.pathExists(env.lockPath)).toBe(true);
+    // Orchestrator was still called (its acquireOrRecover will recover the lock).
     expect(orchestratorCalls).toHaveLength(1);
     expect(orchestratorCalls[0].resume_from?.is_retry).toBe(true);
 

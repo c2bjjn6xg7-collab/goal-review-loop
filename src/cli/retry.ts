@@ -99,14 +99,24 @@ export async function executeRetry(params: {
     }
   }
 
-  // Recover lock if needed.
+  // Lock precheck.
   //
-  // Like `resume`, we do NOT acquire the lock here - the orchestrator owns lock
-  // acquisition. Acquiring at the CLI layer would cause a spurious self-conflict
-  // when the orchestrator re-acquires the same lock (the process would see its
-  // own PID and bail out with "Another run is active"). Instead we only release
-  // a stale lock left behind by a crashed previous run, then let the orchestrator
-  // take a fresh lock.
+  // We do NOT acquire the lock here - the orchestrator owns lock acquisition.
+  // Acquiring at the CLI layer would cause a spurious self-conflict when the
+  // orchestrator re-acquires the same lock.
+  //
+  // For a DEAD lock: do nothing. The orchestrator's acquireOrRecover handles
+  // dead-PID recovery atomically (read lock -> dead PID -> unlink -> re-acquire
+  // in one call). Releasing it here would create a handoff race: another retry
+  // could acquire a new lock for the same run_id between our release and the
+  // orchestrator's acquisition, and our release (which only checks run_id) would
+  // delete the other process's lock.
+  //
+  // For a LIVE lock without --recover-lock: reject (the run is genuinely active).
+  //
+  // For a LIVE lock with --recover-lock: release with identity verification -
+  // re-read the lock immediately before unlinking and confirm the PID has not
+  // changed, so we don't delete a lock that a different process now owns.
   const lockManager = new LockManager(agentDir);
   const lock = await lockManager.readLock();
   if (lock) {
@@ -127,10 +137,21 @@ export async function executeRetry(params: {
       process.exit(1);
     }
 
-    if (!isAlive || params.recover_lock) {
+    // Only release for the --recover-lock case (live lock, explicit override).
+    // Dead locks are left for the orchestrator's acquireOrRecover to handle
+    // atomically, eliminating the release->reacquire race window.
+    if (isAlive && params.recover_lock) {
+      // Identity-checked release: re-read the lock and confirm the PID matches
+      // what we checked. If another process replaced the lock between our
+      // initial read and now, we must not delete it.
+      const rechecked = await lockManager.readLock();
+      if (!rechecked || rechecked.pid !== lock.pid) {
+        console.error('Lock changed between check and release - another process may have taken over. Aborting.');
+        process.exit(1);
+      }
       try {
         await lockManager.release(lock.run_id);
-        console.log('Released stale lock.');
+        console.log('Released lock (--recover-lock).');
       } catch {
         console.error('Failed to release lock. Try removing .agent/run.lock manually.');
         process.exit(1);
