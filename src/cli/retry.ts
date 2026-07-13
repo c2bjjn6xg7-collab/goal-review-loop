@@ -37,7 +37,7 @@ export function createRetryCommand(): Command {
   return cmd;
 }
 
-async function executeRetry(params: {
+export async function executeRetry(params: {
   project_root: string;
   force?: boolean;
   recover_lock?: boolean;
@@ -111,11 +111,15 @@ async function executeRetry(params: {
   const lock = await lockManager.readLock();
   if (lock) {
     let isAlive = false;
-    try {
-      process.kill(lock.pid, 0);
-      isAlive = true;
-    } catch {
-      isAlive = false;
+    // Skip liveness check for malformed/corrupted locks (pid <= 0) to avoid
+    // calling process.kill(-1, 0), which would signal the entire process group.
+    if (lock.pid > 0) {
+      try {
+        process.kill(lock.pid, 0);
+        isAlive = true;
+      } catch {
+        isAlive = false;
+      }
     }
 
     if (isAlive && !params.recover_lock) {
@@ -134,36 +138,13 @@ async function executeRetry(params: {
     }
   }
 
-  // Reset failed tasks to pending in task_graph_state
-  if (state.task_graph_state) {
-    const tgs = { ...state.task_graph_state };
-    if (tgs.task_statuses) {
-      for (const [taskId, status] of Object.entries(tgs.task_statuses)) {
-        if (status === 'failed' || status === 'blocked') {
-          tgs.task_statuses[taskId] = 'pending';
-        }
-      }
-    }
-    // Reset attempt counters for failed tasks
-    if (tgs.task_attempts) {
-      for (const [taskId, status] of Object.entries(state.task_graph_state.task_statuses ?? {})) {
-        if (status === 'failed' || status === 'blocked') {
-          tgs.task_attempts[taskId] = 0;
-        }
-      }
-    }
-    await stateStore.update(() => ({
-      task_graph_state: tgs,
-      last_error: null,
-    }));
-  } else {
-    // Non-task-graph BLOCKED: clear last_error so resume can proceed
-    await stateStore.update(() => ({ last_error: null }));
-  }
-
   console.log('Retrying...\n');
 
-  // Resume the run — orchestrator will skip passed tasks and re-run pending ones
+  // Resume the run. The orchestrator acquires the lock, runs F-403 consistency
+  // checks, and only THEN resets failed/blocked tasks (is_retry: true). This
+  // ensures state.json is never modified without holding the lock, eliminating
+  // the race where a concurrent run grabs the lock between our precheck and the
+  // orchestrator's acquisition.
   const result = await runOrchestrator({
     project_root: projectRoot,
     resume_from: {
@@ -174,6 +155,7 @@ async function executeRetry(params: {
       base_commit: state.base_commit,
       task_slug: state.task_slug ?? '',
       goal_digest: state.goal_digest ?? null,
+      is_retry: true,
     },
     config_path: params.config_path,
   });

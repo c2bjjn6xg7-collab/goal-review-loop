@@ -123,6 +123,16 @@ export interface ResumeContext {
   base_commit: string;
   task_slug: string;
   goal_digest: string | null;
+  /**
+   * When true, the orchestrator resets failed/blocked tasks (statuses ->
+   * pending, attempts -> 0, last_error -> null) before resuming. This is the
+   * "retry" semantic, as opposed to "resume" which preserves task state.
+   *
+   * The reset is performed AFTER lock acquisition and AFTER all F-403
+   * consistency checks, so a concurrent run cannot interleave and a failed
+   * consistency check leaves state untouched.
+   */
+  is_retry?: boolean;
 }
 
 export async function runOrchestrator(params: {
@@ -378,13 +388,48 @@ export async function runOrchestrator(params: {
       // saved task index instead of the monolithic iteration loop.
       if (goalValidation.taskGraph) {
         const tgState = await stateStore.read();
+
+        // Retry: reset failed/blocked tasks so they get a fresh attempt count.
+        // This runs AFTER lock acquisition (line ~274) and AFTER all F-403
+        // consistency checks (lines ~290-337), so a concurrent run cannot
+        // interleave, and a failed consistency check leaves state untouched.
+        // The reset must precede resolveTaskGraphResumeDecision so the decision
+        // sees pending (not failed) statuses.
+        let effectiveTaskGraphState = tgState.task_graph_state;
+        if (resume.is_retry && tgState.task_graph_state) {
+          const tgs = { ...tgState.task_graph_state };
+          if (tgs.task_statuses) {
+            for (const [taskId, status] of Object.entries(tgs.task_statuses)) {
+              if (status === 'failed' || status === 'blocked') {
+                tgs.task_statuses[taskId] = 'pending';
+              }
+            }
+          }
+          if (tgs.task_attempts) {
+            for (const [taskId, status] of Object.entries(tgState.task_graph_state.task_statuses ?? {})) {
+              if (status === 'failed' || status === 'blocked') {
+                tgs.task_attempts[taskId] = 0;
+              }
+            }
+          }
+          await stateStore.update(() => ({
+            task_graph_state: tgs,
+            last_error: null,
+          }));
+          // Update the in-memory view so downstream logic (resume decision,
+          // R3 checks, etc.) sees the reset state.
+          tgState.task_graph_state = tgs;
+          tgState.last_error = null;
+          effectiveTaskGraphState = tgs;
+        }
+
         // Phase 8D P7: derive the resume index from per-task statuses instead
         // of trusting raw `current_task_index`. A failed/running/blocked task
         // restarts, otherwise the earliest pending task continues, otherwise
         // the task loop is skipped so integration verification/finalization runs.
         const resumeDecision = resolveTaskGraphResumeDecision(
           goalValidation.taskGraph,
-          tgState.task_graph_state,
+          effectiveTaskGraphState,
         );
         await appendLog(
           artifactStore,
